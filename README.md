@@ -102,7 +102,10 @@ On Fedora/CentOS/Rhel: kernel-headers, accel-config-devel, libuuid-devel, libnum
 On Ubuntu/Debian: linux-libc-dev, libaccel-config-dev, uuid-dev, libnuma-dev
 
 ```bash
-make libdto
+mkdir build
+cd build
+cmake ..
+make
 make install
 ```
 
