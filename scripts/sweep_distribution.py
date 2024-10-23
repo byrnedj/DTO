@@ -41,7 +41,7 @@ perf_command = ['perf', 'stat']
 #    dto_command = perf_command + ' ' + dto_command
 
 
-name = 'test_distribution_5B_iterations'
+name = 'test_distribution_5B_iterations_withstatsenabled'
 #name = 'sweeptxsize_nostatscomp_waitsleep_cpufract0.1_minsize8K'
 #name = 'sweeptxsize_nostatscomp_nodsa_minsize8K'
 #name = 'test'
@@ -50,7 +50,7 @@ base_env = os.environ.copy()
 dto_env = os.environ.copy()
 
 #dto_env['DTO_USESTDC_CALLS']='0'
-dto_env['DTO_COLLECT_STATS']='0'
+dto_env['DTO_COLLECT_STATS']='1'
 dto_env['DTO_WAIT_METHOD']='yield' # 'sleep' #   
 #dto_env['DTO_MIN_BYTES']='8192'  #'65536'#    
 #dto_env['DTO_CPU_SIZE_FRACTION']= '0.1' # '0.33' #
@@ -107,6 +107,7 @@ for min_size in min_sizes:
 
     time.sleep(1)
 
+    """
     out_fn= 'results_{}_{}K_nodsa_summary.txt'.format(name, min_size)
     with open(os.path.join(results_dir,fn), "r") as origin_file:
         with open(os.path.join(results_dir,out_fn), "w") as out:
@@ -118,7 +119,7 @@ for min_size in min_sizes:
                     line1 = re.findall(r'cycles', line)
                     if line1:
                         out.write(line)
-
+    """
 
     dto_env['DTO_USESTDC_CALLS']='0'
     for perc in percentages:
@@ -147,6 +148,7 @@ for min_size in min_sizes:
                     
         time.sleep(1)
 
+        """
         with open(os.path.join(results_dir,fn), "r") as origin_file:
             with open(os.path.join(results_dir,out_fn), "w") as out:
                 for line in origin_file:
@@ -157,7 +159,7 @@ for min_size in min_sizes:
                         line1 = re.findall(r'cycles', line)
                         if line1:
                             out.write(line)
-
+        """
 
 
 

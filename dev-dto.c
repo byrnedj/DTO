@@ -39,7 +39,7 @@
 #define USE_ORIG_FUNC(n, use_dsa) (use_std_lib_calls == 1 || !use_dsa || n < dsa_min_size)
 #define TS_NS(s, e) (((e.tv_sec*1000000000) + e.tv_nsec) - ((s.tv_sec*1000000000) + s.tv_nsec))
 
-//#define DTO_STATS_SUPPORT 1
+#define DTO_STATS_SUPPORT 1
 
 /* Maximum WQs that DTO will use. It is rather an arbitrary limit
  * to keep things simple and avoid having to dynamically allocate memory.
@@ -213,7 +213,8 @@ static int log_fd = -1;
 //static struct timespec dsa_end_time;
 
 enum update_type { 
-	NO_CHANGE = 0x0,
+	INVALID_UPDATE_TYPE = 0x0,
+	NO_CHANGE,
  	INCR_FRACT,
 	INCR_MIN_SIZE,
 	DECR_FRACT,
@@ -275,13 +276,17 @@ static atomic_ullong lat_counter[HIST_NO_BUCKETS][MAX_STAT_GROUP][MAX_MEMOP];
 static atomic_int fail_counter[HIST_NO_BUCKETS][MAX_FAILURES];
 
 //update stats collection - JJS
-static atomic_ullong avg_waits_counter[HIST_AVG_WAIT_BUCKETS];
+static atomic_ullong avg_waits_counter[HIST_NO_BUCKETS][HIST_AVG_WAIT_BUCKETS];
 static atomic_ullong avg_waits_lt_counter[HIST_AVG_WAIT_BUCKETS];
 static atomic_ullong avg_waits_diff_counter[HIST_AVG_WAIT_DIFF_BUCKETS];
 static atomic_ullong cpu_fract_counter[HIST_CPU_FRACT_BUCKETS];
 static atomic_ullong min_size_counter[HIST_MIN_SIZE_BUCKETS];
 static atomic_ullong update_type_counter[MAX_UPDATE_TYPE];
 static atomic_ullong num_adjustment_ops;
+
+#define NUM_LATEST_UPDATES 100000
+
+static atomic_uint_fast8_t latest_updates[NUM_LATEST_UPDATES];
 
 enum stats_output_type {
 	STATS_TEXT = 0,
@@ -748,12 +753,18 @@ static void update_stats(int op, size_t n, size_t bytes_completed, size_t bytes_
 
 }
 
-static void update_alg_stats(double avg_num_waits, double avg_num_waits_lt, double avg_waits_diff, int update_type, int cpu_size_fraction, int dsa_min_size)
+static void update_alg_stats(double avg_num_waits, double avg_num_waits_lt, double avg_waits_diff, int update_type, int cpu_size_fraction, int dsa_min_size, size_t n)
 {
+
+	int size_bucket = (n / HIST_BUCKET_SIZE);
+
+	if (size_bucket >= HIST_NO_BUCKETS)  /* last bucket includes remaining sizes */
+		size_bucket = HIST_NO_BUCKETS-1;
+
 	int bucket = (avg_num_waits / HIST_AVG_WAIT_BUCKET_SIZE);
 	if (bucket >= HIST_AVG_WAIT_BUCKETS)  /* last bucket includes remaining sizes */
 		bucket = HIST_AVG_WAIT_BUCKETS-1;
-	++avg_waits_counter[bucket];
+	++avg_waits_counter[size_bucket][bucket];
 
 	bucket = (avg_num_waits_lt / HIST_AVG_WAIT_BUCKET_SIZE);
 	if (bucket >= HIST_AVG_WAIT_BUCKETS)  /* last bucket includes remaining sizes */
@@ -784,55 +795,127 @@ static void update_alg_stats(double avg_num_waits, double avg_num_waits_lt, doub
 
 	++update_type_counter[update_type];
 
+	latest_updates[num_adjustment_ops % NUM_LATEST_UPDATES] = update_type;
+
 	++num_adjustment_ops;
 }
 
 static void print_alg_stats(void)
 {
 	LOG_STATS("avg_num_waits: ");
-	for (int i=0; i<HIST_AVG_WAIT_BUCKETS; ++i) {
-		LOG_STATS("%ld, ",avg_waits_counter[i]);
+
+	for (int b = 0; b < HIST_NO_BUCKETS; ++b) {
+			bool empty = true;
+
+		for (int g = 0; g < MAX_STAT_GROUP; ++g) {
+			for (int o = 0; o < MAX_MEMOP; ++o) {
+				if (op_counter[b][g][o] != 0) {
+					empty = false;
+					break;
+				}
+			}
+			if (!empty)
+				break;
+		}
+		if (empty)
+			continue;
+
+		if (b < (HIST_NO_BUCKETS-1))
+			LOG_STATS("% 8d-%-8d: ", b*4096, ((b+1)*4096)-1);
+		else
+			LOG_STATS(" >=%-12d: ", b*4096);
+
+
+		for (int i=0; i<HIST_AVG_WAIT_BUCKETS; ++i) {
+			LOG_STATS("%lld, ",avg_waits_counter[b][i]);
+		}
+
+		LOG_STATS("\n");
 	}
+
 	LOG_STATS("\n");
 
 	LOG_STATS("avg_num_waits_lt: ");
 	for (int i=0; i<HIST_AVG_WAIT_BUCKETS; ++i) {
-		LOG_STATS("%ld, ",avg_waits_lt_counter[i]);
+		LOG_STATS("%lld, ",avg_waits_lt_counter[i]);
 	}
 	LOG_STATS("\n");
 
 	LOG_STATS("avg_num_waits_diff: ");
 	for (int i=0; i<HIST_AVG_WAIT_DIFF_BUCKETS; ++i) {
-		LOG_STATS("%ld, ",avg_waits_diff_counter[i]);
+		LOG_STATS("%lld, ",avg_waits_diff_counter[i]);
 	}
 	LOG_STATS("\n");
 
 	LOG_STATS("cpu_fraction: ");
 	for (int i=0; i<HIST_CPU_FRACT_BUCKETS; ++i) {
-		LOG_STATS("%ld, ", cpu_fract_counter[i]);
+		LOG_STATS("%lld, ", cpu_fract_counter[i]);
 	}
 	LOG_STATS("\n");
 
 	LOG_STATS("min_size: ");
 	for (int i=0; i<HIST_MIN_SIZE_BUCKETS; ++i) {
-		LOG_STATS("%ld, ", min_size_counter[i]);
+		LOG_STATS("%lld, ", min_size_counter[i]);
 	}
 	LOG_STATS("\n");
 
 	LOG_STATS("update_type: ");
 	for (int i=0; i<MAX_UPDATE_TYPE; ++i) {
-		LOG_STATS("%ld, ", update_type_counter[i]);
+		LOG_STATS("%lld, ", update_type_counter[i]);
 	}
 	LOG_STATS("\n");
+
+	LOG_STATS("num_adjustment_ops: %lld,\n",num_adjustment_ops);
+
+	LOG_STATS("latest_updates: ");
+	u_int64_t last;
+	if ((num_adjustment_ops % NUM_LATEST_UPDATES) != 0)
+		last = (num_adjustment_ops % NUM_LATEST_UPDATES) - 1;
+	else
+		last = NUM_LATEST_UPDATES - 1;
+
+	num_adjustment_ops = num_adjustment_ops % NUM_LATEST_UPDATES;
+
+	while (num_adjustment_ops != last) {
+		if (latest_updates[num_adjustment_ops] != INVALID_UPDATE_TYPE)
+			LOG_STATS("%lld, ", latest_updates[num_adjustment_ops]);
+		
+		num_adjustment_ops = (num_adjustment_ops + 1) % NUM_LATEST_UPDATES;
+	}
+	LOG_STATS("%lld, ", latest_updates[last]);
+	LOG_STATS("\n");
+	
 }
 
 static void print_alg_stats_dict(void)
 {
-	LOG_STATS("'avg_num_waits': [");
-	for (int i=0; i<HIST_AVG_WAIT_BUCKETS; ++i) {
-		LOG_STATS("%lld, ",avg_waits_counter[i]);
+	LOG_STATS("'avg_num_waits': {");
+
+	for (int b = 0; b < HIST_NO_BUCKETS; ++b) {
+			bool empty = true;
+
+		for (int g = 0; g < MAX_STAT_GROUP; ++g) {
+			for (int o = 0; o < MAX_MEMOP; ++o) {
+				if (op_counter[b][g][o] != 0) {
+					empty = false;
+					break;
+				}
+			}
+			if (!empty)
+				break;
+		}
+		if (empty)
+			continue;
+
+
+		LOG_STATS("%d:[", b*4096);
+
+
+		for (int i=0; i<HIST_AVG_WAIT_BUCKETS; ++i) {
+			LOG_STATS("%lld, ",avg_waits_counter[b][i]);
+		}
+		LOG_STATS("],\n");
 	}
-	LOG_STATS("],\n");
 
 	LOG_STATS("'avg_num_waits_lt': [");
 	for (int i=0; i<HIST_AVG_WAIT_BUCKETS; ++i) {
@@ -865,6 +948,24 @@ static void print_alg_stats_dict(void)
 	LOG_STATS("],\n");
 
 	LOG_STATS("'num_adjustment_ops': [%lld],\n",num_adjustment_ops);
+
+	LOG_STATS("'latest_updates': [");
+	u_int64_t last;
+	if ((num_adjustment_ops % NUM_LATEST_UPDATES) != 0)
+		last = (num_adjustment_ops % NUM_LATEST_UPDATES) - 1;
+	else
+		last = NUM_LATEST_UPDATES - 1;
+
+	num_adjustment_ops = num_adjustment_ops % NUM_LATEST_UPDATES;
+
+	while (num_adjustment_ops != last) {
+		if (latest_updates[num_adjustment_ops] != INVALID_UPDATE_TYPE)
+			LOG_STATS("%lld, ", latest_updates[num_adjustment_ops]);
+		
+		num_adjustment_ops = (num_adjustment_ops + 1) % NUM_LATEST_UPDATES;
+	}
+	LOG_STATS("%lld, ", latest_updates[last]);
+	LOG_STATS("]\n");
 }
 
 static void print_stats(void)

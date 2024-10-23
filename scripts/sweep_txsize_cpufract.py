@@ -26,11 +26,11 @@ num_dsas=1
 min_size = 8
 max_size = 2048
 size_step = 2
-#sizes = [2**x for x in range(3,12)]
-sizes = [8]
+sizes = [2**x for x in range(3,12)]
+#sizes = [8]
 sleep_times = [1,1,1,2,4,16,16,40,128]
 
-wait_methods = ['umwait']  #,'sleep', 'yield']
+wait_methods = ['sleep', 'yield']  #'umwait']  #
 
 num_reps = 1
 
@@ -38,12 +38,12 @@ min_perc=0.1
 max_perc=0.1
 perc_step = 0.2
 
-percentages = [0.0]  #, 0.1, 0.33]
+percentages = [0.0, 0.1, 0.33]
 
 mem_ops = [MEMSET,MEMCOPY,MEMMOVE]
 mem_op_names = ['set', 'cpy', 'mov']
 
-num_iter = 100  #1000000
+num_iter = 1000000
 
 #perf_command = 'perf stat -e dsa0/event=0x1,event_category=0x0/,dsa2/event=0x1,event_category=0x0/,dsa4/event=0x1,event_category=0x0/,dsa6/event=0x1,event_category=0x0/,dsa0/event=0x1,event_category=0x1/,dsa2/event=0x1,event_category=0x1/,dsa4/event=0x1,event_category=0x1/,dsa6/event=0x1,event_category=0x1/,dsa0/event=0x2,event_category=0x1/,dsa2/event=0x2,event_category=0x1/,dsa4/event=0x2,event_category=0x1/,dsa6/event=0x2,event_category=0x1/'
 perf_command = ['perf', 'stat']
@@ -59,7 +59,7 @@ perf_command = ['perf', 'stat']
 #    dto_command = perf_command + ' ' + dto_command
 
 
-name = 'sweeptxsize_perc_minsize8K_1M_iterations_separated_ops'
+name = 'sweeptxsize_perc_minsize8K_1M_iterations_separated_ops_withstatsenabled'
 #name = 'sweeptxsize_nostatscomp_waitsleep_cpufract0.1_minsize8K'
 #name = 'sweeptxsize_nostatscomp_nodsa_minsize8K'
 #name = 'test'
@@ -68,7 +68,7 @@ base_env = os.environ.copy()
 dto_env = os.environ.copy()
 
 #dto_env['DTO_USESTDC_CALLS']='0'
-dto_env['DTO_COLLECT_STATS']='0'
+dto_env['DTO_COLLECT_STATS']='1'
 #dto_env['DTO_WAIT_METHOD']='yield' # 'sleep' #   
 dto_env['DTO_MIN_BYTES']='8192'  #'65536'#    
 #dto_env['DTO_CPU_SIZE_FRACTION']= '0.1' # '0.33' #
@@ -126,10 +126,11 @@ for mem_op, op_name in zip(mem_ops,mem_op_names):
                 f.flush()
                 f.write(',')
                 f.flush()
-            f.write(']}')
+            #f.write(']}')
 
     time.sleep(1)
 
+    """
     out_fn= 'results_{}_{}_nodsa_summary.txt'.format(name,op_name)
     with open(os.path.join(results_dir,fn), "r") as origin_file:
         with open(os.path.join(results_dir,out_fn), "w") as out:
@@ -141,7 +142,7 @@ for mem_op, op_name in zip(mem_ops,mem_op_names):
                     line1 = re.findall(r'cycles', line)
                     if line1:
                         out.write(line)
-
+    """
 
     dto_env['DTO_USESTDC_CALLS']='0'
     for wait_method in wait_methods:
@@ -172,12 +173,12 @@ for mem_op, op_name in zip(mem_ops,mem_op_names):
                         f.flush()
                         f.write(',')
                         f.flush()
-                    f.write(']}')
+                    #f.write(']}')
 
             out_fn = 'results_{}_{}_{}_cpufrace{}_summary.txt'.format(name,op_name,wait_method,perc)
 
             time.sleep(1)
-
+            """
             with open(os.path.join(results_dir,fn), "r") as origin_file:
                 with open(os.path.join(results_dir,out_fn), "w") as out:
                     for line in origin_file:
@@ -188,7 +189,7 @@ for mem_op, op_name in zip(mem_ops,mem_op_names):
                             line1 = re.findall(r'cycles', line)
                             if line1:
                                 out.write(line)
-
+            """
 
     dto_env['DTO_USESTDC_CALLS']='0'
     dto_env['DTO_CPU_SIZE_FRACTION']= '0.33' 
@@ -215,10 +216,11 @@ for mem_op, op_name in zip(mem_ops,mem_op_names):
                 f.flush()
                 f.write(',')
                 f.flush()
-            f.write(']}')
+            #f.write(']}')
 
     time.sleep(1)
 
+    """
     out_fn= 'results_{}_{}_autocpufract_summary.txt'.format(name,op_name)
     with open(os.path.join(results_dir,fn), "r") as origin_file:
         with open(os.path.join(results_dir,out_fn), "w") as out:
@@ -230,6 +232,7 @@ for mem_op, op_name in zip(mem_ops,mem_op_names):
                     line1 = re.findall(r'cycles', line)
                     if line1:
                         out.write(line)
+    """
 
 if bg_command != []:
     bg_process.kill()

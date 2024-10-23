@@ -25,12 +25,12 @@ accel-config enable-wq dsa6/wq6.0
 export DTO_USESTDC_CALLS=0
 
 export DTO_COLLECT_STATS=1
-export DTO_STATS_OUTPUT_TYPE=0   # 0 for text, 1 for python dict
-export DTO_COLLECT_ALG_STATS=0
+export DTO_STATS_OUTPUT_TYPE=1   # 0 for text, 1 for python dict
+export DTO_COLLECT_ALG_STATS=1
 
 
-export DTO_WAIT_METHOD=umwait
-#export DTO_WAIT_METHOD=yield
+#export DTO_WAIT_METHOD=umwait
+export DTO_WAIT_METHOD=yield
 #export DTO_WAIT_METHOD=sleep
 export DTO_MIN_BYTES=28672 # 8192 #  16384  #              32768  #  16384  #
 export DTO_MAX_BYTES=2097152  #  8192  # 32768  #65536 #16384  #
