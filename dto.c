@@ -1442,6 +1442,7 @@ static void dto_memset(void *s, int c, size_t n, int *result)
 	uint64_t memset_pattern;
 	size_t cpu_size, dsa_size;
 	struct dto_wq *wq = get_wq(s);
+	//printf("memset size %d value %x pointer %x\n",n,c,s);
 
 	for (int i = 0; i < 8; ++i)
 		((uint8_t *) &memset_pattern)[i] = (uint8_t) c;
@@ -1453,6 +1454,8 @@ static void dto_memset(void *s, int c, size_t n, int *result)
 	thr_desc.completion_addr = (uint64_t)&thr_comp;
 	thr_desc.pattern = memset_pattern;
 
+	//printf("fille out descriptor\n");
+
 	/* cpu_size_fraction gauranteed to be >= 0 and < 1 */
 	cpu_size = n * cpu_size_fraction / 100;
 	dsa_size = n - cpu_size;
@@ -1463,12 +1466,14 @@ static void dto_memset(void *s, int c, size_t n, int *result)
 		thr_desc.xfer_size = (uint32_t) dsa_size;
 		thr_comp.status = 0;
 		*result = dsa_submit(wq, &thr_desc);
+		//printf("submit result %x\n",*result);
 		if (likely(*result == SUCCESS)) {
 			if (cpu_size) {
 				orig_memset(s, c, cpu_size);
 				thr_bytes_completed = cpu_size;
 			}
 			*result = dsa_wait(wq, &thr_desc, &thr_comp.status);
+			//printf("wait result %x\n",*result);
 		}
 	} else {
 		uint32_t threshold;
@@ -1505,6 +1510,8 @@ static void dto_memset(void *s, int c, size_t n, int *result)
 			 */
 		} while (n >= dsa_min_size);
 	}
+
+	//printf(" -> done\n");
 }
 
 /* For overlapping src & dest buffers in memmove API, we can't split the memmove

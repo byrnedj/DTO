@@ -20,6 +20,7 @@
 #define MAX_THREADS 10 
 #define LOG_COUNT 1000000
 //#define PRINT_OUTPUT 1
+#define MAX_ROWS 64
 
 #define RAND_SEED 121919193
 
@@ -163,11 +164,11 @@ int main(int argc, char **argv)
 
     char line[100];
     char *sp;
-    int size_buckets[40]; // array of size bucket starts
-    int sizes[40];   //array of average transaction sizes
-    double cpy_probs[40];  // array of probablilities for copy 
-    double set_probs[40];  // probabilities for set
-    double mov_probs[40];  // probabilities for move
+    int size_buckets[MAX_ROWS]; // array of size bucket starts
+    int sizes[MAX_ROWS];   //array of average transaction sizes
+    double cpy_probs[MAX_ROWS];  // array of probablilities for copy 
+    double set_probs[MAX_ROWS];  // probabilities for set
+    double mov_probs[MAX_ROWS];  // probabilities for move
     int count = 0;
     double cur_prob = 0.0;  // running total of cumulative probabilities
     int cur_entry = 0;
@@ -193,7 +194,7 @@ int main(int argc, char **argv)
     
         if (fp == NULL)
         {
-            printf("Can not open file");
+            printf("Can not open file %s\n",argv[2]);
             exit(0);
         }
     
@@ -219,8 +220,8 @@ int main(int argc, char **argv)
 
             // The current data has 39 entries. This number could be higher in other data
             //TODO: have the user pass in the size of the arrays
-            if (count > 40) {
-                printf("File contains too many lines. We assume that there are no more than 40 rows\n");
+            if (count > MAX_ROWS) {
+                printf("File contains too many lines. We assume that there are no more than %d rows\n", MAX_ROWS);
                 exit(0);
             }
         }

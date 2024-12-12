@@ -164,6 +164,7 @@ enum stat_group {
 	STDC_CALL = 0x0,
 	DSA_CALL_SUCCESS,
 	DSA_CALL_FAILED,
+	DSA_CALL_FAILED_STDC_CALL,  // stats group for leftover ops performed using stdc from dsa failures (mainly page faults)
 	DSA_FAIL_CODES,
 	MAX_STAT_GROUP
 };
@@ -172,6 +173,7 @@ static const char * const stat_group_names[] = {
 	[STDC_CALL] = "stdc calls",
 	[DSA_CALL_SUCCESS] = "dsa (success)",
 	[DSA_CALL_FAILED] = "dsa (failed)",
+	[DSA_CALL_FAILED_STDC_CALL] = "dsa (failed) stdc",
 	[DSA_FAIL_CODES] = "failure reason"
 };
 
@@ -179,6 +181,7 @@ static const char * const stat_group_names2[] = {  //JJS
 	[STDC_CALL] = "stdc",
 	[DSA_CALL_SUCCESS] = "dsa_success",
 	[DSA_CALL_FAILED] = "dsa_failed",
+	[DSA_CALL_FAILED_STDC_CALL] = "dsa_failed_stdc",
 	[DSA_FAIL_CODES] = "failure_reason"
 };
 
@@ -248,24 +251,27 @@ static __thread uint64_t thr_bytes_completed_cpu;
 		}									\
 	} while (0)									\
 
-#define DTO_COLLECT_STATS_CPU_END(cs, st, et, op, n, orig_n)			\
+#define DTO_COLLECT_STATS_CPU_END(cs, st, et, op, n, orig_n, use_orig_func)			\
 	do {									\
 		if (unlikely(cs)) {						\
 			uint64_t t;						\
 			clock_gettime(CLOCK_BOOTTIME, &et);			\
 			t = (((et.tv_sec*1000000000) + et.tv_nsec) -		\
 				((st.tv_sec*1000000000) + st.tv_nsec));		\
-			update_stats(op, orig_n, n, n, t, STDC_CALL, 0);		\
+			if (use_orig_func)                             \
+				update_stats(op, orig_n, n, n, t, STDC_CALL, 0);		\
+			else                                                        \
+				update_stats(op, orig_n, n, n, t, DSA_CALL_FAILED_STDC_CALL, 0);		\
 		}								\
 	} while (0)								\
 
-static void update_alg_stats(double avg_num_waits, double avg_num_waits_lt, double avg_waits_diff, int update_type, int cpu_size_fraction, int dsa_min_size);
+static void update_alg_stats(double avg_num_waits, double avg_num_waits_lt, double avg_waits_diff, int update_type, int cpu_size_fraction, int dsa_min_size, size_t n);
 
 //update stats collection - JJS
-#define DTO_COLLECT_ALG_STATS(cs, avg_num_waits, avg_num_waits_lt, update_type, cpu_size_fraction, dsa_min_size)			\
+#define DTO_COLLECT_ALG_STATS(cs, avg_num_waits, avg_num_waits_lt, update_type, cpu_size_fraction, dsa_min_size, trans_size)			\
 	do {	\
 		if (unlikely(cs)) {							\
-			update_alg_stats(avg_num_waits, avg_num_waits_lt, avg_num_waits_lt-avg_num_waits, update_type, cpu_size_fraction, dsa_min_size);						\
+			update_alg_stats(avg_num_waits, avg_num_waits_lt, avg_num_waits_lt-avg_num_waits, update_type, cpu_size_fraction, dsa_min_size, trans_size);						\
 		}  \
 	} while (0)								\
 
@@ -295,6 +301,8 @@ enum stats_output_type {
 };
 
 static uint8_t stats_output_type = STATS_TEXT;
+
+static char stats_prefix[100] = "";
 
 #endif
 
@@ -552,7 +560,7 @@ static __always_inline void dsa_wait_and_adjust2(const volatile uint8_t *comp)
  *      - If cpu_size_fraction not too low, decrease it by CSF_STEP_DECREMENT
  *      - else if dsa_min_size not too low, decrease it by DMS_STEP_DECREMENT
  */
-static __always_inline void dsa_wait_and_adjust(const volatile uint8_t *comp)
+static __always_inline void dsa_wait_and_adjust(const volatile uint8_t *comp, size_t transaction_size)
 {
 
 	// adjust_alg v2 - JJS
@@ -613,7 +621,7 @@ static __always_inline void dsa_wait_and_adjust(const volatile uint8_t *comp)
 				}
 			}
 #ifdef DTO_STATS_SUPPORT
-			DTO_COLLECT_ALG_STATS(collect_alg_stats, avg_num_waits, avg_num_waits_lt, ut, cpu_size_fraction, dsa_min_size);
+			DTO_COLLECT_ALG_STATS(collect_alg_stats, avg_num_waits, avg_num_waits_lt, ut, cpu_size_fraction, dsa_min_size, transaction_size);
 #endif
 		}
 	}
@@ -624,7 +632,7 @@ static __always_inline int dsa_wait(struct dto_wq *wq,
 	struct dsa_hw_desc *hw, volatile uint8_t *comp)
 {
 	if (auto_adjust_knobs)
-		dsa_wait_and_adjust(comp);
+		dsa_wait_and_adjust(comp, hw->xfer_size);
 	else
 		dsa_wait_no_adjust(comp);
 
@@ -1005,9 +1013,10 @@ static void print_stats(void)
 		for (int g = 0; g < MAX_STAT_GROUP - 1; ++g) {
 			for (int o = 0; o < MAX_MEMOP; ++o)
 				LOG_STATS("%-8s ", memop_names[o]);
-			if (t == 0)
+			if (t == 0) {
 				LOG_STATS("%-13s ", "bytes");
 				LOG_STATS("%-13s ", "bytes_cpu");
+			}
 		}
 		if (t == 0)
 			for (int o = 1; o < MAX_FAILURES; ++o)
@@ -1049,9 +1058,10 @@ static void print_stats(void)
 						LOG_STATS("%-8d ", 0);
 					}
 				}
-				if (t == 0)
+				if (t == 0) {
 					LOG_STATS("%-13lld ", bytes_counter[b][g]);
 					LOG_STATS("%-13lld ", bytes_counter_cpu[b][g]);
+				}
 			}
 			if (t == 0)
 				for (int o = 1; o < MAX_FAILURES; ++o)
@@ -1073,7 +1083,9 @@ static void print_stats_dict(void)
 
 	clock_gettime(CLOCK_BOOTTIME, &dto_end_time);
 
-	LOG_STATS("{'run_time':%ld,\n", TS_NS(dto_start_time, dto_end_time)/1000000);
+	LOG_STATS("%s\n",stats_prefix);
+
+	LOG_STATS("stats={'run_time':%ld,\n", TS_NS(dto_start_time, dto_end_time)/1000000);
 
 	// display stats
 
@@ -1827,6 +1839,16 @@ static int init_dto(void)
 			collect_alg_stats = !!collect_alg_stats;
 		}
 
+		env_str = getenv("DTO_STATS_PREFIX");
+		if (env_str != NULL) {
+			char temp[PATH_MAX];
+			struct stat st;
+
+			strncpy(stats_prefix, env_str, 99);
+			/* ensure dto_log_path is null terminated */
+			stats_prefix[99] = '\0';
+		}
+
 #endif
 
 		/* Register fork handler for the child process */
@@ -2318,13 +2340,27 @@ void *memset(void *s1, int c, size_t n)
 #endif
 		if (thr_bytes_completed != n) {
 			/* fallback to std call if job is only partially completed */
-			use_orig_func = 1;
+			//use_orig_func = 1;
 			n -= thr_bytes_completed;
 			s1 = (void *)((uint64_t)s1 + thr_bytes_completed);
+
+			// Add call to orig_memset here, so we can keep track of the stats for this case separately from the case where
+			// orig_memset was called from the start
+#ifdef DTO_STATS_SUPPORT
+			DTO_COLLECT_STATS_START(collect_stats, st);
+#endif
+
+			orig_memset(s1, c, n);
+
+#ifdef DTO_STATS_SUPPORT
+			DTO_COLLECT_STATS_CPU_END(collect_stats, st, et, MEMSET, n, orig_n, use_orig_func);
+#endif
+
 		}
 	}
 
-	if (use_orig_func) {
+	//if (use_orig_func) {
+	else {
 #ifdef DTO_STATS_SUPPORT
 		DTO_COLLECT_STATS_START(collect_stats, st);
 #endif
@@ -2332,7 +2368,7 @@ void *memset(void *s1, int c, size_t n)
 		orig_memset(s1, c, n);
 
 #ifdef DTO_STATS_SUPPORT
-		DTO_COLLECT_STATS_CPU_END(collect_stats, st, et, MEMSET, n, orig_n);
+		DTO_COLLECT_STATS_CPU_END(collect_stats, st, et, MEMSET, n, orig_n, use_orig_func);
 #endif
 	}
 	return ret;
@@ -2368,16 +2404,30 @@ void *memcpy(void *dest, const void *src, size_t n)
 #endif
 		if (thr_bytes_completed != n) {
 			/* fallback to std call if job is only partially completed */
-			use_orig_func = 1;
+			//use_orig_func = 1;
 			n -= thr_bytes_completed;
 			if (thr_comp.result == 0) {
 				dest = (void *)((uint64_t)dest + thr_bytes_completed);
 				src = (const void *)((uint64_t)src + thr_bytes_completed);
 			}
+
+			// Add call to orig_memset here, so we can keep track of the stats for this case separately from the case where
+			// orig_memset was called from the start
+#ifdef DTO_STATS_SUPPORT
+			DTO_COLLECT_STATS_START(collect_stats, st);
+#endif
+
+			orig_memcpy(dest, src, n);
+
+#ifdef DTO_STATS_SUPPORT
+			DTO_COLLECT_STATS_CPU_END(collect_stats, st, et, MEMCOPY, n, orig_n, use_orig_func);
+#endif
+
 		}
 	}
 
-	if (use_orig_func) {
+	//if (use_orig_func) {
+	else {
 #ifdef DTO_STATS_SUPPORT
 		DTO_COLLECT_STATS_START(collect_stats, st);
 #endif
@@ -2385,7 +2435,7 @@ void *memcpy(void *dest, const void *src, size_t n)
 		orig_memcpy(dest, src, n);
 
 #ifdef DTO_STATS_SUPPORT
-		DTO_COLLECT_STATS_CPU_END(collect_stats, st, et, MEMCOPY, n, orig_n);
+		DTO_COLLECT_STATS_CPU_END(collect_stats, st, et, MEMCOPY, n, orig_n, use_orig_func);
 #endif
 	}
 	return ret;
@@ -2421,16 +2471,28 @@ void *memmove(void *dest, const void *src, size_t n)
 #endif
 		if (thr_bytes_completed != n) {
 			/* fallback to std call if job is only partially completed */
-			use_orig_func = 1;
+			//use_orig_func = 1;
 			n -= thr_bytes_completed;
 			if (thr_comp.result == 0) {
 				dest = (void *)((uint64_t)dest + thr_bytes_completed);
 				src = (const void *)((uint64_t)src + thr_bytes_completed);
 			}
+			// Add call to orig_memset here, so we can keep track of the stats for this case separately from the case where
+			// orig_memset was called from the start
+#ifdef DTO_STATS_SUPPORT
+			DTO_COLLECT_STATS_START(collect_stats, st);
+#endif
+
+			orig_memmove(dest, src, n);
+
+#ifdef DTO_STATS_SUPPORT
+			DTO_COLLECT_STATS_CPU_END(collect_stats, st, et, MEMMOVE, n, orig_n, use_orig_func);
+#endif			
 		}
 	}
 
-	if (use_orig_func) {
+	//if (use_orig_func) {
+	else {
 #ifdef DTO_STATS_SUPPORT
 		DTO_COLLECT_STATS_START(collect_stats, st);
 #endif
@@ -2438,7 +2500,7 @@ void *memmove(void *dest, const void *src, size_t n)
 		orig_memmove(dest, src, n);
 
 #ifdef DTO_STATS_SUPPORT
-		DTO_COLLECT_STATS_CPU_END(collect_stats, st, et, MEMMOVE, n, orig_n);
+		DTO_COLLECT_STATS_CPU_END(collect_stats, st, et, MEMMOVE, n, orig_n, use_orig_func);
 #endif
 	}
 	return ret;
@@ -2474,14 +2536,26 @@ int memcmp(const void *s1, const void *s2, size_t n)
 #endif
 		if (thr_bytes_completed != n) {
 			/* fallback to std call if job is only partially completed */
-			use_orig_func = 1;
+			//use_orig_func = 1;
 			n -= thr_bytes_completed;
 			s1 = (const void *)((uint64_t)s1 + thr_bytes_completed);
 			s2 = (const void *)((uint64_t)s2 + thr_bytes_completed);
+			// Add call to orig_memset here, so we can keep track of the stats for this case separately from the case where
+			// orig_memset was called from the start
+#ifdef DTO_STATS_SUPPORT
+			DTO_COLLECT_STATS_START(collect_stats, st);
+#endif
+
+			ret = orig_memcmp(s1, s2, n);
+
+#ifdef DTO_STATS_SUPPORT
+			DTO_COLLECT_STATS_CPU_END(collect_stats, st, et, MEMCMP, n, orig_n, use_orig_func);
+#endif			
 		}
 	}
 
-	if (use_orig_func) {
+	//if (use_orig_func) {
+	else {
 #ifdef DTO_STATS_SUPPORT
 		DTO_COLLECT_STATS_START(collect_stats, st);
 #endif
@@ -2489,7 +2563,7 @@ int memcmp(const void *s1, const void *s2, size_t n)
 		ret = orig_memcmp(s1, s2, n);
 
 #ifdef DTO_STATS_SUPPORT
-		DTO_COLLECT_STATS_CPU_END(collect_stats, st, et, MEMCMP, n, orig_n);
+		DTO_COLLECT_STATS_CPU_END(collect_stats, st, et, MEMCMP, n, orig_n, use_orig_func);
 #endif
 	}
 	return ret;

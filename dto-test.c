@@ -18,7 +18,7 @@
 
 #define MAX_ITERS 1000000 // 8000000  //
 #define MAX_THREADS 10 // 2 //1
-#define LOG_COUNT 1000000
+#define LOG_COUNT 100000
 
 atomic_int no_ops = 0;
 

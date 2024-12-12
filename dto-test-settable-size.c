@@ -10,6 +10,7 @@
 #include <string.h>
 #include <threads.h>
 #include <stdatomic.h>
+#include <unistd.h>
 
 //#define NUM_BUFS  (4*1024UL)
 #define BUF_SIZE_BASE  1024UL // (128*1024UL) 
@@ -32,6 +33,7 @@ struct parms {
 	unsigned long long max_iters;
 	int num_threads;
 	uint32_t mem_ops;
+	uint32_t sleep_time_us;
 };
 
 #ifdef PRINT_OUTPUT
@@ -46,6 +48,7 @@ int thread_func(void *thr_data)
 	uint64_t num_bufs = ALLOC_SIZE / buf_size;
 	uint32_t max_iters = p->max_iters;
 	uint32_t mem_ops = p->mem_ops;
+	uint32_t sleep_time_us = p->sleep_time_us;
 
 
 	//printf("buf_size %lu num_bufs %lu max_iter %lu\n", buf_size, num_bufs,max_iters);
@@ -88,6 +91,9 @@ int thread_func(void *thr_data)
 			printf("completed %d ops\n", no_ops);
 #endif
 
+		if (sleep_time_us > 0)
+			usleep(sleep_time_us);
+
 	}
 
 	free(src_addr);
@@ -101,17 +107,18 @@ int main(int argc, char **argv)
 	struct parms p[MAX_THREADS];
  	thrd_t threads[MAX_THREADS];
 
-	if (argc < 5) {
-		printf("Usage: dto-test-settable-size num_threads mem_op buf_size max_iters [buf_size, max_iters for remaining threads]\n");
+	if (argc < 6) {
+		printf("Usage: dto-test-settable-size num_threads sleep_time_us mem_op buf_size max_iters [buf_size, max_iters for remaining threads]\n");
 		printf("buf_size in increments of 1024, num_threads <= 10\n");
 		return 1;
 	}
 
 	else{
 		p[0].num_threads = atoi(argv[1]);
-		p[0].mem_ops = atoi(argv[2]);
-		p[0].buf_size = atoi(argv[3]);
-		sscanf(argv[4], "%llu", &p[0].max_iters);
+		p[0].sleep_time_us = atoi(argv[2]);
+		p[0].mem_ops = atoi(argv[3]);
+		p[0].buf_size = atoi(argv[4]);
+		sscanf(argv[5], "%llu", &p[0].max_iters);
 		printf("num_threads %d buf_size %d iterations %d\n",p[0].num_threads,p[0].buf_size, p[0].max_iters);
 		
 		if(p[0].num_threads > MAX_THREADS) {
@@ -119,8 +126,8 @@ int main(int argc, char **argv)
 			return 1;
 		}
 
-		if(p[0].num_threads>1 && argc>5) {
-			if(argc != 3+(p[0].num_threads*2)) {
+		if(p[0].num_threads>1 && argc>6) {
+			if(argc != 4+(p[0].num_threads*2)) {
 				printf("Need to either provide one buf_size and num_iters, or a buf_size and num_iters for each thread");
 				return 1;
 			}
@@ -128,8 +135,9 @@ int main(int argc, char **argv)
 			for(int i = 1; i<p[0].num_threads;++i){
 				p[i].num_threads = p[0].num_threads;
 				p[i].mem_ops = p[0].mem_ops;
-				p[i].buf_size = atoi(argv[5+(i-1)*2]);
-				p[i].max_iters = atoi(argv[6+(i-1)*2]);
+				p[i].sleep_time_us = p[0].sleep_time_us;
+				p[i].buf_size = atoi(argv[6+(i-1)*2]);
+				p[i].max_iters = atoi(argv[7+(i-1)*2]);
 			}
 		}
 
@@ -137,6 +145,7 @@ int main(int argc, char **argv)
 			for(int i = 1; i<p[0].num_threads;++i){
 				p[i].max_iters = p[0].max_iters;
 				p[i].mem_ops = p[0].mem_ops;
+				p[i].sleep_time_us = p[0].sleep_time_us;
 				p[i].num_threads = p[0].num_threads;
 				p[i].buf_size = p[0].buf_size;
 
