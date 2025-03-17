@@ -12,12 +12,14 @@
 #include <stdatomic.h>
 #include <unistd.h>
 
+//1024*1024*1024*256   A bit over the total memory in both NUMAs
 //#define NUM_BUFS  (4*1024UL)
 #define BUF_SIZE_BASE  1024UL // (128*1024UL) 
-#define ALLOC_SIZE (4*1024UL*128*1024UL)  //(NUM_BUFS * BUF_SIZE)
+//#define ALLOC_SIZE (1024UL*1024UL*1024UL*128)  //(1024UL*128*1024UL)  //(NUM_BUFS * BUF_SIZE)
+#define ALLOC_SIZE (1024UL*1024UL*1024UL*48)
 #define MEMSET_PATTERN 'a'
 
-#define MAX_THREADS 10 
+#define MAX_THREADS 50 
 #define LOG_COUNT 100000
 //#define PRINT_OUTPUT 1
 
@@ -46,7 +48,7 @@ int thread_func(void *thr_data)
 	struct parms *p = (struct parms *)thr_data;
 	uint64_t buf_size = BUF_SIZE_BASE * p->buf_size;
 	uint64_t num_bufs = ALLOC_SIZE / buf_size;
-	uint32_t max_iters = p->max_iters;
+	unsigned long long max_iters = p->max_iters;
 	uint32_t mem_ops = p->mem_ops;
 	uint32_t sleep_time_us = p->sleep_time_us;
 
@@ -57,6 +59,11 @@ int thread_func(void *thr_data)
 	void *src_addr = calloc(ALLOC_SIZE, sizeof(uint8_t));
 	void *dest_addr = calloc(ALLOC_SIZE, sizeof(uint8_t));
 
+	printf("alloc size %lu\n",ALLOC_SIZE);
+
+	//uint8_t *s = src_addr;
+	//uint8_t *d = dest_addr;
+
 	for (unsigned long long i=0; i < p->max_iters; ++i) {
 		int j = i % num_bufs;
 
@@ -65,13 +72,13 @@ int thread_func(void *thr_data)
 
 		// issue the memory transactions
 		if (mem_ops & MEMSET) {
+			//printf("dto-test memset %d %x\n",buf_size,s);
 			memset(s, MEMSET_PATTERN, buf_size);
-			//printf("memset %d\n",buf_size);
 		}
 
 		if (mem_ops & MEMCOPY) {
+			//printf("dto-test memcpy %d %x %x\n",buf_size,s,d);
 			memcpy(d, s, buf_size);
-			//printf("memscpy %d\n",buf_size);
 		}
 
 		if (mem_ops & MEMMOVE) {
@@ -119,7 +126,7 @@ int main(int argc, char **argv)
 		p[0].mem_ops = atoi(argv[3]);
 		p[0].buf_size = atoi(argv[4]);
 		sscanf(argv[5], "%llu", &p[0].max_iters);
-		printf("num_threads %d buf_size %d iterations %d\n",p[0].num_threads,p[0].buf_size, p[0].max_iters);
+		//printf("num_threads %d buf_size %d iterations %llu\n",p[0].num_threads,p[0].buf_size, p[0].max_iters);
 		
 		if(p[0].num_threads > MAX_THREADS) {
 			printf("number of threads must be <= %d\n",MAX_THREADS);

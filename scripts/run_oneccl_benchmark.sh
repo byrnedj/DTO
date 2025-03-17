@@ -15,14 +15,15 @@ export DTO_COLLECT_STATS=0
 export DTO_WAIT_METHOD=yield
 export DTO_MIN_BYTES=8192
 export DTO_CPU_SIZE_FRACTION=0.33
-export DTO_AUTO_ADJUST_KNOBS=1
+export DTO_AUTO_ADJUST_KNOBS=0
 export DTO_LOG_LEVEL=1
  
 # Use this if using DTO
 #export LD_PRELOAD=$libfabric/libfabric.so:/home/jjsydir/internal_dto/projects.research.dto_dev/libdevdto.so.1.0
 #export LD_PRELOAD=$libfabric/libfabric.so:/home/jjsydir/internal_dto/projects.research.dto_dev/libdto.so.1.0
 #export LD_PRELOAD=$libfabric/libfabric.so:/home/jjsydir/old_dto/DTO/libdto.so.1.0
-export LD_PRELOAD=$libfabric/libfabric.so:/home/jjsydir/clean_dto/DTO/libdto.so.1.0
+#export LD_PRELOAD=$libfabric/libfabric.so:/home/jjsydir/external_dto/DTO/libdto.so.1.0
+export LD_PRELOAD=$libfabric/libfabric.so:/home/jjsydir/internal_dto/projects.research.dto_dev/libmindto.so.1.0
 # Otherwise use this to use default stdc mem* operations
 #export LD_PRELOAD=$libfabric/libfabric.so
  

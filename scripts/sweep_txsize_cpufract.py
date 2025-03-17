@@ -26,7 +26,8 @@ num_dsas=1
 min_size = 8
 max_size = 2048
 size_step = 2
-sizes = [2**x for x in range(3,12)]
+#sizes = [2**x for x in range(3,12)]
+sizes = [2**x for x in range(5,11)]
 #sizes = [8]
 sleep_times = [1,1,1,2,4,16,16,40,128]
 
@@ -38,10 +39,11 @@ min_perc=0.1
 max_perc=0.1
 perc_step = 0.2
 
-percentages = [0.0, 0.1, 0.33]
+#percentages = [0.0, 0.1, 0.33]
+percentages = [0.1, 0.3, 0.5, 0.7 ]
 
-mem_ops = [MEMSET,MEMCOPY,MEMMOVE]
-mem_op_names = ['set', 'cpy', 'mov']
+mem_ops = [MEMSET,MEMCOPY] #,MEMMOVE]
+mem_op_names = ['set', 'cpy'] #, 'mov']
 
 num_iter = 1000000
 

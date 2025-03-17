@@ -73,6 +73,7 @@ struct dto_wq {
 	int wq_fd;
 	void *wq_portal;
 	bool wq_mmapped;
+	int index;
 };
 
 struct dto_device {
@@ -105,15 +106,17 @@ static const char * const numa_aware_names[] = {
 static struct dto_wq wqs[MAX_WQS];
 static struct dto_device* devices[MAX_NUMA_NODES];
 static uint8_t num_wqs;
+static uint8_t num_wqs_for_cleanup;
 static atomic_uchar next_wq;
 static atomic_uchar dto_initialized;
 static atomic_uchar dto_initializing;
 static uint8_t use_std_lib_calls;
 static enum numa_aware is_numa_aware;
+static uint8_t opposite_numa = 0;
 static size_t dsa_min_size = DTO_DEFAULT_MIN_SIZE;
 static size_t dsa_max_size = DTO_DEFAULT_MAX_SIZE;  //JJS
 static int wait_method = WAIT_YIELD;
-static size_t cpu_size_fraction;
+//static size_t cpu_size_fraction;
 
 static uint8_t dto_dsa_memcpy = 1;
 static uint8_t dto_dsa_memmove = 1;
@@ -122,8 +125,10 @@ static uint8_t dto_dsa_memcmp = 1;
 
 static uint8_t dto_dsa_cc = 1;
 
-//static uint8_t update_v = 1;
 static uint8_t make_adjustments = 1;
+
+static uint8_t dto_num_autotune_instances = 1;
+static uint8_t dto_per_op_autotune_instances = 0;
 
 
 static unsigned long dto_umwait_delay = UMWAIT_DELAY_DEFAULT;
@@ -153,12 +158,14 @@ static const char * const memop_names[] = {
 // update stats - JJS
 #define HIST_AVG_WAIT_BUCKET_SIZE 0.1
 #define HIST_AVG_WAIT_BUCKETS 512
-#define HIST_AVG_WAIT_DIFF_BUCKETS 1024
-#define HIST_AVG_WAIT_DIFF_BUCKETS_HALF 512
 #define HIST_CPU_FRACT_BUCKET_SIZE 1
 #define HIST_CPU_FRACT_BUCKETS 100
 #define HIST_MIN_SIZE_BUCKET_SIZE 1024
 #define HIST_MIN_SIZE_BUCKETS 64
+
+#define HIST_NO_REQS 50
+
+#define MAX_AUTOTUNE_INSTANCES 2
 
 enum stat_group {
 	STDC_CALL = 0x0,
@@ -209,6 +216,9 @@ static const char * const wait_names[] = {
 
 static int collect_stats;
 static int collect_alg_stats;
+static int collect_alg_stats_latest_updates;
+static int collect_alg_stats_latest_cpufracts;
+
 static char dto_log_path[PATH_MAX];
 static int log_fd = -1;
 //static struct timespec cpu_start_time;
@@ -223,6 +233,14 @@ enum update_type {
 	DECR_FRACT,
 	DECR_MIN_SIZE,
 	MAX_UPDATE_TYPE,
+};
+
+
+enum numa_stats_type { 
+	MEMSET_DST = 0x0,
+	MEMCPY_DST,
+	MEMCPY_SRC,
+	MAX_NUMA_STATS_TYPE,
 };
 
 #ifdef DTO_STATS_SUPPORT
@@ -265,13 +283,13 @@ static __thread uint64_t thr_bytes_completed_cpu;
 		}								\
 	} while (0)								\
 
-static void update_alg_stats(double avg_num_waits, double avg_num_waits_lt, double avg_waits_diff, int update_type, int cpu_size_fraction, int dsa_min_size, size_t n);
+static void update_alg_stats(double avg_num_waits, int update_type, int cpu_size_fraction, int dsa_min_size, size_t n, uint8_t alg_instance);
 
 //update stats collection - JJS
-#define DTO_COLLECT_ALG_STATS(cs, avg_num_waits, avg_num_waits_lt, update_type, cpu_size_fraction, dsa_min_size, trans_size)			\
+#define DTO_COLLECT_ALG_STATS(cs, avg_num_waits, update_type, cpu_size_fraction, dsa_min_size, trans_size, bucket)			\
 	do {	\
 		if (unlikely(cs)) {							\
-			update_alg_stats(avg_num_waits, avg_num_waits_lt, avg_num_waits_lt-avg_num_waits, update_type, cpu_size_fraction, dsa_min_size, trans_size);						\
+			update_alg_stats(avg_num_waits, update_type, cpu_size_fraction, dsa_min_size, trans_size, bucket);						\
 		}  \
 	} while (0)								\
 
@@ -281,18 +299,23 @@ static atomic_ullong bytes_counter_cpu[HIST_NO_BUCKETS][MAX_STAT_GROUP];
 static atomic_ullong lat_counter[HIST_NO_BUCKETS][MAX_STAT_GROUP][MAX_MEMOP];
 static atomic_int fail_counter[HIST_NO_BUCKETS][MAX_FAILURES];
 
+static atomic_ullong numa_node_counts[MAX_NUMA_STATS_TYPE][MAX_NUMA_NODES];
+static int num_numa_nodes;
+
+static atomic_int dto_wq_depth[MAX_WQS];
+static atomic_ulong num_dto_requests[HIST_NO_REQS][MAX_WQS];
+
 //update stats collection - JJS
 static atomic_ullong avg_waits_counter[HIST_NO_BUCKETS][HIST_AVG_WAIT_BUCKETS];
-static atomic_ullong avg_waits_lt_counter[HIST_AVG_WAIT_BUCKETS];
-static atomic_ullong avg_waits_diff_counter[HIST_AVG_WAIT_DIFF_BUCKETS];
 static atomic_ullong cpu_fract_counter[HIST_CPU_FRACT_BUCKETS];
 static atomic_ullong min_size_counter[HIST_MIN_SIZE_BUCKETS];
 static atomic_ullong update_type_counter[MAX_UPDATE_TYPE];
-static atomic_ullong num_adjustment_ops;
+static atomic_ullong num_adjustment_ops[2*MAX_AUTOTUNE_INSTANCES];
 
 #define NUM_LATEST_UPDATES 100000
 
-static atomic_uint_fast8_t latest_updates[NUM_LATEST_UPDATES];
+static atomic_uint_fast8_t latest_updates[2*MAX_AUTOTUNE_INSTANCES][NUM_LATEST_UPDATES];
+static atomic_uint_fast8_t latest_cpu_fract[2*MAX_AUTOTUNE_INSTANCES][NUM_LATEST_UPDATES];
 
 enum stats_output_type {
 	STATS_TEXT = 0,
@@ -303,6 +326,14 @@ enum stats_output_type {
 static uint8_t stats_output_type = STATS_TEXT;
 
 static char stats_prefix[100] = "";
+
+static void update_num_dto_requests(int index, int a) {
+	dto_wq_depth[index] += a;
+}
+
+static int get_num_dto_requests(int index) {
+	return dto_wq_depth[index];
+}
 
 #endif
 
@@ -342,12 +373,23 @@ static unsigned int log_level = LOG_LEVEL_FATAL;
 #define DMS_STEP_INCREMENT 1024
 #define DMS_STEP_DECREMENT 1024
 
+
 /* Auto tuning variables */
-static atomic_ullong num_descs;
-static atomic_ullong adjust_num_descs;
-static atomic_ullong adjust_num_waits;
-static atomic_ullong adjust_num_descs_lt;  //JJS
-static atomic_ullong adjust_num_waits_lt;
+//static atomic_ullong num_descs;
+//static atomic_ullong adjust_num_descs;
+//static atomic_ullong adjust_num_waits;
+
+struct auto_tune_state {
+	atomic_ullong num_descs;
+	atomic_ullong adjust_num_descs;
+	atomic_ullong adjust_num_waits;
+	size_t cpu_size_fraction;
+};
+
+static struct auto_tune_state auto_tune_states[2*MAX_AUTOTUNE_INSTANCES];
+static size_t auto_tune_buckets[MAX_AUTOTUNE_INSTANCES];
+
+
 /* default waits are for yield because yield is default waiting method */
 static double min_avg_waits = MIN_AVG_YIELD_WAITS;
 static double max_avg_waits = MAX_AVG_YIELD_WAITS;
@@ -503,44 +545,36 @@ static __always_inline void dsa_wait_no_adjust(const volatile uint8_t *comp)
 		dsa_wait_busy_poll(comp);
 }
 
-/*
-// adjust_alg v2  NOT FINISHED!!! - JJS
-static __always_inline void dsa_wait_and_adjust2(const volatile uint8_t *comp)
-{
 
-	if (!adjust) {
-		while (*comp == 0)
-			__dsa_wait(comp);
-
-		return;
+static __always_inline uint16_t get_request_size_bucket(size_t size) {
+	for (int i = 0; i < dto_num_autotune_instances; ++i) {
+		//LOG_TRACE("get_bucket size %lu i %d bucket edge %lu\n",size,i,auto_tune_buckets[i]);
+		if (size < auto_tune_buckets[i]) {
+			return i;
+		}
 	}
 
-	clock_gettime(CLOCK_BOOTTIME, &cpu_end_time);
-	
-	// Run the heuristics as well as wait for DSA 
-	while (*comp == 0) {
-		__dsa_wait(comp);
-	}
-
-	clock_gettime(CLOCK_BOOTTIME, &dsa_end_time);
-
-	uint8_t updating = 0;
-	long cpu_time;
-	long dsa_time;
-
-	if (atomic_compare_exchange_strong(&dto_updating, &updating, 1)) {
-		cpu_time = TS_NS(cpu_start_time, cpu_end_time);
-		dsa_time = TS_NS(cpu_start_time, dsa_end_time);
-
-		
-
-		dto_updating = 0;
-	}
-	
-	
-
+	return dto_num_autotune_instances-1;
 }
-*/
+
+static __always_inline uint16_t get_algorithm_instance(size_t size, uint8_t op) {
+	int instance;
+	
+	if (dto_num_autotune_instances == 1)
+		instance = 0;
+	else
+		instance = get_request_size_bucket(size);
+
+	if (dto_per_op_autotune_instances) {
+		if (op != MEMSET)
+			instance= instance+MAX_AUTOTUNE_INSTANCES;
+	}
+
+	//LOG_TRACE("get_algorithm_instance size %lu op %u instance %u\n",size, op, instance );
+
+	return instance;
+}
+
 
 /* A simple auto-tuning heuristic.
  * Goal of the Heuristic:
@@ -560,18 +594,17 @@ static __always_inline void dsa_wait_and_adjust2(const volatile uint8_t *comp)
  *      - If cpu_size_fraction not too low, decrease it by CSF_STEP_DECREMENT
  *      - else if dsa_min_size not too low, decrease it by DMS_STEP_DECREMENT
  */
-static __always_inline void dsa_wait_and_adjust(const volatile uint8_t *comp, size_t transaction_size)
+static __always_inline void dsa_wait_and_adjust(const volatile uint8_t *comp, size_t transaction_size, size_t unsplit_size, uint8_t op)
 {
-
-	// adjust_alg v2 - JJS
-	//if (update_v == 2)
-	//	dsa_wait_and_adjust2(comp);
-
-	//else {
-
 	uint64_t local_num_waits = 0;
 
-	if ((++num_descs & DESCS_PER_RUN) != DESCS_PER_RUN) {
+	//LOG_TRACE("calling get_algorithm_instance\n");
+	uint16_t bucket = get_algorithm_instance(unsplit_size, op);
+	//LOG_TRACE("get_algorithm_instance returned %u\n",bucket);
+	
+
+	if ((++auto_tune_states[bucket].num_descs & DESCS_PER_RUN) != DESCS_PER_RUN) {
+		//LOG_TRACE("dsa_wait_and_adjust size %lu instance %u num_descs %u returning\n",unsplit_size, bucket, auto_tune_states[bucket].num_descs);
 		while (*comp == 0)
 			__dsa_wait(comp);
 
@@ -583,26 +616,28 @@ static __always_inline void dsa_wait_and_adjust(const volatile uint8_t *comp, si
 		__dsa_wait(comp);
 		local_num_waits++;
 	}
-	adjust_num_descs++;
-	adjust_num_waits += local_num_waits;
+	auto_tune_states[bucket].adjust_num_descs++;
+	auto_tune_states[bucket].adjust_num_waits += local_num_waits;
 
-	if (adjust_num_descs >= NUM_DESCS) {
-		unsigned long long temp = adjust_num_descs;
+	if (auto_tune_states[bucket].adjust_num_descs >= NUM_DESCS) {
+		//LOG_TRACE("dsa_wait_and_adjust size %lu instance %u num_descs %u adj_num_desc %u num_waits %u running alg\n",
+		//			unsplit_size, bucket, auto_tune_states[bucket].num_descs, auto_tune_states[bucket].adjust_num_descs,auto_tune_states[bucket].adjust_num_waits);
+		unsigned long long temp = auto_tune_states[bucket].adjust_num_descs;
 
-		if (temp && atomic_compare_exchange_strong(&adjust_num_descs, &temp, 0)) {
-			double avg_num_waits = (double)adjust_num_waits / temp;
+		if (temp && atomic_compare_exchange_strong(&auto_tune_states[bucket].adjust_num_descs, &temp, 0)) {
+			double avg_num_waits = (double)auto_tune_states[bucket].adjust_num_waits / temp;
 
-			adjust_num_descs_lt += temp;
-			adjust_num_waits_lt += adjust_num_waits;
-			double avg_num_waits_lt = (double)adjust_num_waits_lt / adjust_num_descs_lt;
+			//adjust_num_descs_lt += temp;
+			//adjust_num_waits_lt += adjust_num_waits;
+			//double avg_num_waits_lt = (double)adjust_num_waits_lt / adjust_num_descs_lt;
 
 			int ut = NO_CHANGE;
 
-			adjust_num_waits = 0;
+			auto_tune_states[bucket].adjust_num_waits = 0;
 			if (make_adjustments) {
 				if (avg_num_waits > max_avg_waits) {
-					if (cpu_size_fraction < MAX_CPU_SIZE_FRACTION) {
-						cpu_size_fraction += CSF_STEP_INCREMENT;
+					if (auto_tune_states[bucket].cpu_size_fraction < MAX_CPU_SIZE_FRACTION) {
+						auto_tune_states[bucket].cpu_size_fraction += CSF_STEP_INCREMENT;
 						ut = INCR_FRACT;
 					}
 					else if (dsa_min_size < MAX_DSA_MIN_SIZE) {
@@ -610,8 +645,8 @@ static __always_inline void dsa_wait_and_adjust(const volatile uint8_t *comp, si
 						ut = INCR_MIN_SIZE;
 					}
 				} else if (avg_num_waits < min_avg_waits) {
-					if (cpu_size_fraction >= CSF_STEP_DECREMENT) {
-						cpu_size_fraction -= CSF_STEP_DECREMENT;
+					if (auto_tune_states[bucket].cpu_size_fraction >= CSF_STEP_DECREMENT) {
+						auto_tune_states[bucket].cpu_size_fraction -= CSF_STEP_DECREMENT;
 						ut = DECR_FRACT;
 					}
 					else if (dsa_min_size > MIN_DSA_MIN_SIZE) {
@@ -619,22 +654,33 @@ static __always_inline void dsa_wait_and_adjust(const volatile uint8_t *comp, si
 						ut = DECR_MIN_SIZE;
 					}
 				}
+				//LOG_TRACE("dsa_wait_and_adjust instance %u cpu fract %u\n", bucket, auto_tune_states[bucket].cpu_size_fraction);
 			}
 #ifdef DTO_STATS_SUPPORT
-			DTO_COLLECT_ALG_STATS(collect_alg_stats, avg_num_waits, avg_num_waits_lt, ut, cpu_size_fraction, dsa_min_size, transaction_size);
+			DTO_COLLECT_ALG_STATS(collect_alg_stats, avg_num_waits, ut, auto_tune_states[bucket].cpu_size_fraction, dsa_min_size, transaction_size, bucket);
 #endif
 		}
 	}
+	//else {
+	//	LOG_TRACE("dsa_wait_and_adjust size %lu instance %u num_descs %u adj_num_desc %u num_waits %u not running alg\n",
+	//				unsplit_size, bucket, auto_tune_states[bucket].num_descs, auto_tune_states[bucket].adjust_num_descs,auto_tune_states[bucket].adjust_num_waits);
 	//}
 }   
 
 static __always_inline int dsa_wait(struct dto_wq *wq,
-	struct dsa_hw_desc *hw, volatile uint8_t *comp)
+	struct dsa_hw_desc *hw, size_t unsplit_size, volatile uint8_t *comp, uint8_t op)
 {
 	if (auto_adjust_knobs)
-		dsa_wait_and_adjust(comp, hw->xfer_size);
+		dsa_wait_and_adjust(comp, hw->xfer_size, unsplit_size, op);
 	else
 		dsa_wait_no_adjust(comp);
+
+#ifdef DTO_STATS_SUPPORT
+			if(collect_stats) {
+				update_num_dto_requests(wq->index, -1);
+				//LOG_TRACE("%lu: dsa_wait for wq %d num_requests %d\n",(uint64_t)&thr_bytes_completed_cpu, wq->index, get_num_dto_requests(wq->index));
+			}
+#endif
 
 	if (likely(*comp == DSA_COMP_SUCCESS)) {
 		thr_bytes_completed += hw->xfer_size;
@@ -647,46 +693,9 @@ static __always_inline int dsa_wait(struct dto_wq *wq,
 	return FAIL_OTHERS;
 }
 
-// adjust_alg v2  NOT DONE!!!! - JJS
-/*
-static __always_inline int dsa_submit2(struct dto_wq *wq,
-	struct dsa_hw_desc *hw)
-{
-	int ret;
-
-	if (auto_adjust_knobs) {
-		adjust = (++num_descs & DESCS_PER_RUN) != DESCS_PER_RUN;
-
-		if (adjust) {
-			clock_gettime(CLOCK_BOOTTIME, &cpu_start_time);
-		}
-	}	
-
-	//LOG_TRACE("desc flags: 0x%x, opcode: 0x%x\n", hw->flags, hw->opcode);
-	__builtin_ia32_sfence();
-
-	if (wq->wq_mmapped) {
-		ret = enqcmd(hw, wq->wq_portal);
-		if (!ret)
-			return SUCCESS;
-	} else {
-		ret = write(wq->wq_fd, hw, sizeof(*hw));
-		if (ret == sizeof(*hw))
-			return SUCCESS;
-		else
-			return FAIL_OTHERS;
-	}
-	return RETRY;
-}
-*/
-
 static __always_inline int dsa_submit(struct dto_wq *wq,
-	struct dsa_hw_desc *hw)
+	struct dsa_hw_desc *hw, int count)
 {
-
-	// adjust_alg v2 - JJS
-	//if (update_v == 2) 
-	//	return dsa_submit2(wq,hw);
 
 	int ret;
 	//LOG_TRACE("desc flags: 0x%x, opcode: 0x%x\n", hw->flags, hw->opcode);
@@ -694,8 +703,20 @@ static __always_inline int dsa_submit(struct dto_wq *wq,
 
 	if (wq->wq_mmapped) {
 		ret = enqcmd(hw, wq->wq_portal);
-		if (!ret)
+		if (!ret) {
+#ifdef DTO_STATS_SUPPORT
+			if(collect_stats && count) {
+				num_dto_requests[get_num_dto_requests(wq->index)][wq->index] += 1;
+				//LOG_TRACE("%lu: dsa_submit for wq %d num_requests %d\n",(uint64_t)&thr_bytes_completed_cpu, wq->index, get_num_dto_requests(wq->index));
+				update_num_dto_requests(wq->index, 1);
+			}
+#endif
+		
 			return SUCCESS;
+		}
+		else {
+			LOG_TRACE("DSA Submit failed with ret code %x",ret);
+		}
 	} else {
 		ret = write(wq->wq_fd, hw, sizeof(*hw));
 		if (ret == sizeof(*hw))
@@ -761,7 +782,7 @@ static void update_stats(int op, size_t n, size_t bytes_completed, size_t bytes_
 
 }
 
-static void update_alg_stats(double avg_num_waits, double avg_num_waits_lt, double avg_waits_diff, int update_type, int cpu_size_fraction, int dsa_min_size, size_t n)
+static void update_alg_stats(double avg_num_waits, int update_type, int cpu_size_fraction, int dsa_min_size, size_t n, uint8_t alg_instance)
 {
 
 	int size_bucket = (n / HIST_BUCKET_SIZE);
@@ -773,23 +794,6 @@ static void update_alg_stats(double avg_num_waits, double avg_num_waits_lt, doub
 	if (bucket >= HIST_AVG_WAIT_BUCKETS)  /* last bucket includes remaining sizes */
 		bucket = HIST_AVG_WAIT_BUCKETS-1;
 	++avg_waits_counter[size_bucket][bucket];
-
-	bucket = (avg_num_waits_lt / HIST_AVG_WAIT_BUCKET_SIZE);
-	if (bucket >= HIST_AVG_WAIT_BUCKETS)  /* last bucket includes remaining sizes */
-		bucket = HIST_AVG_WAIT_BUCKETS-1;
-	++avg_waits_lt_counter[bucket];
-
-	if (avg_waits_diff >= 0) {
-		bucket = (avg_waits_diff / HIST_AVG_WAIT_BUCKET_SIZE) + HIST_AVG_WAIT_DIFF_BUCKETS_HALF;
-		if (bucket >= HIST_AVG_WAIT_DIFF_BUCKETS)  /* last bucket includes remaining sizes */
-			bucket = HIST_AVG_WAIT_DIFF_BUCKETS-1;	
-	}
-	else {
-		bucket = HIST_AVG_WAIT_DIFF_BUCKETS_HALF - ((-1*avg_waits_diff) / HIST_AVG_WAIT_BUCKET_SIZE) - 1;
-		if (bucket < 0 )  /* last bucket includes remaining sizes */
-			bucket = 0;
-	}
-	++avg_waits_diff_counter[bucket];
 
 	bucket = (cpu_size_fraction / HIST_CPU_FRACT_BUCKET_SIZE);
 	if (bucket >= HIST_CPU_FRACT_BUCKETS)  /* last bucket includes remaining sizes */
@@ -803,9 +807,12 @@ static void update_alg_stats(double avg_num_waits, double avg_num_waits_lt, doub
 
 	++update_type_counter[update_type];
 
-	latest_updates[num_adjustment_ops % NUM_LATEST_UPDATES] = update_type;
+	if (collect_alg_stats_latest_updates)
+		latest_updates[alg_instance][num_adjustment_ops[alg_instance] % NUM_LATEST_UPDATES] = update_type;
+	if (collect_alg_stats_latest_cpufracts)
+		latest_cpu_fract[alg_instance][num_adjustment_ops[alg_instance] % NUM_LATEST_UPDATES] = cpu_size_fraction;
 
-	++num_adjustment_ops;
+	++num_adjustment_ops[alg_instance];
 }
 
 static void print_alg_stats(void)
@@ -843,18 +850,6 @@ static void print_alg_stats(void)
 
 	LOG_STATS("\n");
 
-	LOG_STATS("avg_num_waits_lt: ");
-	for (int i=0; i<HIST_AVG_WAIT_BUCKETS; ++i) {
-		LOG_STATS("%lld, ",avg_waits_lt_counter[i]);
-	}
-	LOG_STATS("\n");
-
-	LOG_STATS("avg_num_waits_diff: ");
-	for (int i=0; i<HIST_AVG_WAIT_DIFF_BUCKETS; ++i) {
-		LOG_STATS("%lld, ",avg_waits_diff_counter[i]);
-	}
-	LOG_STATS("\n");
-
 	LOG_STATS("cpu_fraction: ");
 	for (int i=0; i<HIST_CPU_FRACT_BUCKETS; ++i) {
 		LOG_STATS("%lld, ", cpu_fract_counter[i]);
@@ -873,6 +868,7 @@ static void print_alg_stats(void)
 	}
 	LOG_STATS("\n");
 
+	/*
 	LOG_STATS("num_adjustment_ops: %lld,\n",num_adjustment_ops);
 
 	LOG_STATS("latest_updates: ");
@@ -892,6 +888,7 @@ static void print_alg_stats(void)
 	}
 	LOG_STATS("%lld, ", latest_updates[last]);
 	LOG_STATS("\n");
+	*/
 	
 }
 
@@ -925,17 +922,7 @@ static void print_alg_stats_dict(void)
 		LOG_STATS("],\n");
 	}
 
-	LOG_STATS("'avg_num_waits_lt': [");
-	for (int i=0; i<HIST_AVG_WAIT_BUCKETS; ++i) {
-		LOG_STATS("%lld, ",avg_waits_lt_counter[i]);
-	}
-	LOG_STATS("],\n");
-
-	LOG_STATS("'avg_num_waits_diff': [");
-	for (int i=0; i<HIST_AVG_WAIT_DIFF_BUCKETS; ++i) {
-		LOG_STATS("%lld, ",avg_waits_diff_counter[i]);
-	}
-	LOG_STATS("],\n");
+	LOG_STATS("},\n");
 
 	LOG_STATS("'cpu_fraction': [");
 	for (int i=0; i<HIST_CPU_FRACT_BUCKETS; ++i) {
@@ -955,25 +942,61 @@ static void print_alg_stats_dict(void)
 	}
 	LOG_STATS("],\n");
 
-	LOG_STATS("'num_adjustment_ops': [%lld],\n",num_adjustment_ops);
-
-	LOG_STATS("'latest_updates': [");
-	u_int64_t last;
-	if ((num_adjustment_ops % NUM_LATEST_UPDATES) != 0)
-		last = (num_adjustment_ops % NUM_LATEST_UPDATES) - 1;
-	else
-		last = NUM_LATEST_UPDATES - 1;
-
-	num_adjustment_ops = num_adjustment_ops % NUM_LATEST_UPDATES;
-
-	while (num_adjustment_ops != last) {
-		if (latest_updates[num_adjustment_ops] != INVALID_UPDATE_TYPE)
-			LOG_STATS("%lld, ", latest_updates[num_adjustment_ops]);
-		
-		num_adjustment_ops = (num_adjustment_ops + 1) % NUM_LATEST_UPDATES;
+	LOG_STATS("'num_adjustment_ops': [");
+	for (int i=0;i<2*MAX_AUTOTUNE_INSTANCES;++i) {
+		LOG_STATS("%lld,",num_adjustment_ops[i]);
 	}
-	LOG_STATS("%lld, ", latest_updates[last]);
-	LOG_STATS("]\n");
+	LOG_STATS("],\n");
+
+	if (collect_alg_stats_latest_updates) {
+		LOG_STATS("'latest_updates': {");
+		for (int i=0;i<2*MAX_AUTOTUNE_INSTANCES;++i) {
+			LOG_STATS("[");
+			u_int64_t last;
+			u_int64_t num = num_adjustment_ops[i];
+			if ((num % NUM_LATEST_UPDATES) != 0)
+				last = (num % NUM_LATEST_UPDATES) - 1;
+			else
+				last = NUM_LATEST_UPDATES - 1;
+
+			num = num % NUM_LATEST_UPDATES;
+
+			while (num != last) {
+				if (latest_updates[i][num] != INVALID_UPDATE_TYPE)
+					LOG_STATS("%lld, ", latest_updates[i][num]);
+				
+				num = (num + 1) % NUM_LATEST_UPDATES;
+			}
+			LOG_STATS("%lld, ", latest_updates[i][last]);
+			LOG_STATS("],\n");
+		}
+		LOG_STATS("},\n");
+	}
+
+	if (collect_alg_stats_latest_cpufracts) {
+		LOG_STATS("'latest_cpu_fracs': {");
+		for (int i=0;i<2*MAX_AUTOTUNE_INSTANCES;++i) {
+			LOG_STATS("[");
+			u_int64_t last;
+			u_int64_t num = num_adjustment_ops[i];
+			if ((num % NUM_LATEST_UPDATES) != 0)
+				last = (num % NUM_LATEST_UPDATES) - 1;
+			else
+				last = NUM_LATEST_UPDATES - 1;
+
+			num = num % NUM_LATEST_UPDATES;
+
+			while (num != last) {
+				if (latest_cpu_fract[i][num] != INVALID_UPDATE_TYPE)
+					LOG_STATS("%lld, ", latest_cpu_fract[i][num]);
+				
+				num = (num + 1) % NUM_LATEST_UPDATES;
+			}
+			LOG_STATS("%lld, ", latest_cpu_fract[i][last]);
+			LOG_STATS("],\n");
+		}
+		LOG_STATS("},\n");
+	}
 }
 
 static void print_stats(void)
@@ -1069,6 +1092,27 @@ static void print_stats(void)
 			LOG_STATS("\n");
 		}
 	}
+
+	for(int i=0; i < num_wqs; ++i) {
+		LOG_STATS("Work Queue Occupancy %d: ", i);
+		for( int j=0; j<HIST_NO_REQS;++j) {
+			LOG_STATS("%d,",num_dto_requests[j][i]);
+		}
+		LOG_STATS("\n");
+	}
+
+	LOG_STATS("Numa node counts\n");
+	LOG_STATS("    MEMESET Destination\n");
+	for (int i=0;i<num_numa_nodes;++i) 
+		LOG_STATS("        Numa %d: %lu\n",i,numa_node_counts[MEMSET_DST][i]);
+	
+	LOG_STATS("    MEMECPY Source\n");
+	for (int i=0;i<num_numa_nodes;++i)
+		LOG_STATS("        Numa %d: %lu\n",i,numa_node_counts[MEMCPY_SRC][i]);
+	
+	LOG_STATS("    MEMECPY Destination\n");
+	for (int i=0;i<num_numa_nodes;++i)
+		LOG_STATS("        Numa %d: %lu\n",i,numa_node_counts[MEMCPY_DST][i]);
 
 	if(collect_alg_stats)
 		print_alg_stats();
@@ -1171,6 +1215,17 @@ static void print_stats_dict(void)
 	}
 
 	LOG_STATS("},\n");
+
+	LOG_STATS("'wq_occupance': {");
+	for(int i=0; i < num_wqs; ++i) {
+		LOG_STATS("%d:[", i);
+		for( int j=0; j<HIST_NO_REQS;++j) {
+			LOG_STATS("%d,",num_dto_requests[j][i]);
+		}
+		LOG_STATS("],\n");
+	}
+	LOG_STATS("},\n");
+
 	if(collect_alg_stats)
 		print_alg_stats_dict();
 	LOG_STATS("}\n");
@@ -1261,6 +1316,29 @@ static void correct_devices_list() {
 	}
 }
 
+static __always_inline  int get_numa_node_buf(void* buf) {
+	int numa_node = -1;
+	if (buf != NULL) {
+
+		int status[1] = {-1};
+		// get numa node of memory pointed by buf
+		//if (move_pages(0, 1, &buf, NULL, status, 0) == 0) {
+		//	numa_node = status[0];
+		//} else {
+		//	LOG_ERROR("move_pages call error: %d - %s", errno, strerror(errno));
+		//}
+
+		// alternatively get_mempolicy can be used
+		if (get_mempolicy(&numa_node, NULL, 0, (void *)buf, MPOL_F_NODE | MPOL_F_ADDR) != 0) {
+		 	LOG_ERROR("get_mempolicy call error: %d - %s", errno, strerror(errno));
+		 }
+	} else {
+		LOG_ERROR("NULL buffer delivered. Unable to detect numa node");
+	}
+	return numa_node;
+}
+
+
 static __always_inline  int get_numa_node(void* buf) {
 	int numa_node = -1;
 
@@ -1288,7 +1366,7 @@ static __always_inline  int get_numa_node(void* buf) {
 		case NA_CPU_CENTRIC: {
 			const int cpu = sched_getcpu();
 			if (cpu != -1) {
-				numa_node = numa_node_of_cpu(sched_getcpu());
+				numa_node = numa_node_of_cpu(cpu);
 			}
 			else {
 				LOG_ERROR("sched_getcpu call error: %d - %s", errno, strerror(errno));
@@ -1298,6 +1376,13 @@ static __always_inline  int get_numa_node(void* buf) {
         default:
 		break;
         }
+
+		//LOG_TRACE("numa node %d\n", numa_node);
+
+		if (opposite_numa) {
+			numa_node = (numa_node + 1) % 2;
+			//LOG_TRACE("updated numa node %d\n ", numa_node);
+		}
 
         return numa_node;
 }
@@ -1325,7 +1410,7 @@ static bool test_write_syscall(struct dto_wq *wq)
 
 	desc.completion_addr = (unsigned long)&comp;
 
-	if (dsa_submit(wq, &desc) == SUCCESS) {
+	if (dsa_submit(wq, &desc, 0) == SUCCESS) {
 		while (comp.status == 0 && retry++ < 10000)
 			_mm_pause();
 
@@ -1364,6 +1449,8 @@ static int dsa_init_from_wq_list(char *wq_list)
 			rc = -errno;
 			goto fail_wq;
 		}
+
+		wqs[num_wqs].index = num_wqs;
 
 		wqs[num_wqs].dsa_gencap = dto_get_param_ullong(dir_fd, "gen_cap", &rc);
 		if (rc) {
@@ -1490,6 +1577,8 @@ static int dsa_init_from_accfg(void)
 	int rc;
 	int i;
 
+	//LOG_TRACE("dsa_init_from_accfg\n");
+
 	for (i = 0; i < MAX_WQS; i++) {
 		wqs[i].acc_wq = NULL;
 		used_devids[i] = -1;
@@ -1524,6 +1613,7 @@ static int dsa_init_from_accfg(void)
 		if (is_numa_aware) {
 			const int dev_numa_node = accfg_device_get_numa_node(device);
 			dev = get_dto_device(dev_numa_node);
+			LOG_TRACE("Device %s numa node %d\n",accfg_device_get_devname(device),dev_numa_node);
 		}
 
 		accfg_wq_foreach(device, wq) {
@@ -1546,8 +1636,14 @@ static int dsa_init_from_accfg(void)
 			if (mode != ACCFG_WQ_SHARED)
 				continue;
 
+			wqs[num_wqs].index = num_wqs;
+			//LOG_TRACE("inited index %d\n",num_wqs);
+
 			wqs[num_wqs].wq_size = accfg_wq_get_size(wq);
 			wqs[num_wqs].max_transfer_size = accfg_wq_get_max_transfer_size(wq);
+			//if (wqs[num_wqs].max_transfer_size > max_transfer_size) {
+			//	max_transfer_size = wqs[num_wqs].max_transfer_size;
+			//}
 
 			wqs[num_wqs].acc_wq = wq;
 			wqs[num_wqs].dsa_gencap = accfg_device_get_gen_cap(device);
@@ -1659,6 +1755,9 @@ static int dsa_init(void)
 				max_avg_waits = MAX_AVG_POLL_WAITS;
 			} else
 				LOG_ERROR("umwait not supported. Falling back to default wait method\n");
+		
+		} else if (!strncmp(env_str, wait_names[WAIT_SLEEP], strlen(wait_names[WAIT_SLEEP]))) {
+                    wait_method = WAIT_SLEEP;
 		}
 	}
 
@@ -1676,6 +1775,7 @@ static int dsa_init(void)
 static int init_dto(void)
 {
 	uint8_t init_notcomplete = 0;
+	//LOG_TRACE("init_dto\n");
 
 	if (atomic_compare_exchange_strong(&dto_initializing, &init_notcomplete, 1)) {
 		char *env_str;
@@ -1778,22 +1878,12 @@ static int init_dto(void)
 			dto_dsa_memcmp = !!dto_dsa_memcmp;
 		}
 
-		/*
-		env_str = getenv("DTO_UPDATE_V");
-		if (env_str != NULL) {
-			errno = 0;
-			update_v = strtoul(env_str, NULL, 10);
-			if (errno)
-				update_v = 1;
-		}
-		*/
-
 		env_str = getenv("DTO_MAKE_ADJ");
 		if (env_str != NULL) {
 			errno = 0;
 			make_adjustments = strtoul(env_str, NULL, 10);
 			if (errno)
-				make_adjustments = 0;
+				make_adjustments = 1;
 
 			make_adjustments = !!make_adjustments;
 		}
@@ -1818,7 +1908,9 @@ static int init_dto(void)
 				log_level = LOG_LEVEL_STATS;
 		}
 
-		num_adjustment_ops = 0;
+		for (int i=0;i<2*MAX_AUTOTUNE_INSTANCES;++i){
+			num_adjustment_ops[i] = 0;
+		}
 
 		env_str = getenv("DTO_STATS_OUTPUT_TYPE");
 		if (env_str != NULL) {
@@ -1849,7 +1941,49 @@ static int init_dto(void)
 			stats_prefix[99] = '\0';
 		}
 
+		env_str = getenv("DTO_COLLECT_ALG_STATS_LATEST_UPDATES");
+		if (env_str != NULL) {
+			errno = 0;
+			collect_alg_stats_latest_updates = strtoul(env_str, NULL, 10);
+			if (errno)
+				collect_alg_stats_latest_updates = 0;
+
+			collect_alg_stats_latest_updates = !!collect_alg_stats_latest_updates;
+		}
+
+		env_str = getenv("DTO_COLLECT_ALG_STATS_LATEST_CPUFRACTS");
+		if (env_str != NULL) {
+			errno = 0;
+			collect_alg_stats_latest_cpufracts = strtoul(env_str, NULL, 10);
+			if (errno)
+				collect_alg_stats_latest_cpufracts = 0;
+
+			collect_alg_stats_latest_cpufracts = !!collect_alg_stats_latest_cpufracts;
+		}
+		num_numa_nodes = numa_num_configured_nodes();
+
 #endif
+
+		env_str = getenv("DTO_NUM_AUTOTUNE_INSTANCES");
+		if (env_str != NULL) {
+			errno = 0;
+			dto_num_autotune_instances = strtoul(env_str, NULL, 10);
+			if (errno)
+				dto_num_autotune_instances = 1;
+			else if (dto_num_autotune_instances > MAX_AUTOTUNE_INSTANCES)
+				dto_num_autotune_instances = MAX_AUTOTUNE_INSTANCES;
+		}
+
+		
+		env_str = getenv("DTO_PER_OP_AUTOTUNE_INSTANCES");
+		if (env_str != NULL) {
+			errno = 0;
+			dto_per_op_autotune_instances = strtoul(env_str, NULL, 10);
+			if (errno)
+				dto_per_op_autotune_instances = 0;
+
+			dto_per_op_autotune_instances = !!dto_per_op_autotune_instances;
+		}
 
 		/* Register fork handler for the child process */
 		if (!fork_handler_registered) {
@@ -1891,6 +2025,7 @@ static int init_dto(void)
 
 
 			env_str = getenv("DTO_CPU_SIZE_FRACTION");
+			size_t cpu_size_fraction = 33;
 
 			if (env_str != NULL) {
 				errno = 0;
@@ -1928,6 +2063,17 @@ static int init_dto(void)
 				}
 			}
 
+			env_str = getenv("DTO_OPPOSITE_NUMA");
+
+			if (env_str != NULL) {
+				errno = 0;
+				opposite_numa = strtoul(env_str, NULL, 10);
+				if (errno)
+					opposite_numa = 0;
+
+				opposite_numa = !!opposite_numa;
+			}
+
 			env_str = getenv("DTO_UMWAIT_DELAY");
 
 			if (env_str != NULL) {
@@ -1951,14 +2097,46 @@ static int init_dto(void)
 					dto_sleep_time_usec = DEFAULT_SLEEP_TIME_USEC;
 			}
 
+			//Allow user to set the number of DSAs to use without having to change the configuration. 
+			// THIS ASSUMES that there is one WQ for each DSA, which doesn't have to be the case!!!!!!!!!!!!!
+			env_str = getenv("DTO_NUM_WQS");
+			uint32_t dto_num_wqs = 0;
+			if (env_str != NULL) {
+				errno = 0;
+				dto_num_wqs = strtoul(env_str, NULL, 10);
+				if (errno)
+					dto_num_wqs = 0;
+			}
+
+			num_wqs_for_cleanup = num_wqs;
+
+			if (dto_num_wqs > 0)
+				num_wqs = num_wqs < dto_num_wqs ? num_wqs : dto_num_wqs;
+
+			uint32_t range = dsa_max_size - dsa_min_size;
+			uint32_t step_size = range / dto_num_autotune_instances;
+			auto_tune_buckets[dto_num_autotune_instances-1] = dsa_max_size;
+			
+			LOG_TRACE("min size %u max size %u range %u step_size %u\n", dsa_min_size, dsa_max_size, range, step_size);
+			//LOG_TRACE("%d:%u\n",0,auto_tune_buckets[0]);
+			for(int i=0; i < dto_num_autotune_instances-1; ++i) {
+				auto_tune_buckets[i] = dsa_min_size + (i+1)*step_size;
+				LOG_TRACE("%d:%u\n",i,auto_tune_buckets[i]);
+			}
+			LOG_TRACE("%d:%u\n",num_wqs-1,auto_tune_buckets[dto_num_autotune_instances-1]);
+
+			for(int i=0; i < 2*MAX_AUTOTUNE_INSTANCES; ++i) {
+				auto_tune_states[i].cpu_size_fraction = cpu_size_fraction;
+			}
+
 			// display configuration
 			LOG_TRACE("log_level: %d, collect_stats: %d, use_std_lib_calls: %d, dsa_min_size: %lu, "
 				"cpu_size_fraction: %.2f, wait_method: %s, auto_adjust_knobs: %d, numa_awareness: %s, dto_dsa_cc: %d\n",
 				log_level, collect_stats, use_std_lib_calls, dsa_min_size,
 				(float)cpu_size_fraction/100, wait_names[wait_method], auto_adjust_knobs, numa_aware_names[is_numa_aware], dto_dsa_cc);
 			for (int i = 0; i < num_wqs; i++)
-				LOG_TRACE("[%d] wq_path: %s, wq_size: %d, dsa_cap: %lx\n", i,
-					wqs[i].wq_path, wqs[i].wq_size, wqs[i].dsa_gencap);
+				LOG_TRACE("[%d] wq_path: %s, wq_size: %d, dsa_cap: %lx, index %d\n", i,
+					wqs[i].wq_path, wqs[i].wq_size, wqs[i].dsa_gencap, wqs[i].index);
 		}
 		dto_initialized = 1;
 
@@ -1971,7 +2149,7 @@ static int init_dto(void)
 static void cleanup_dto(void)
 {
 	// unmap and close wq portal
-	for (int i = 0; i < num_wqs; i++) {
+	for (int i = 0; i < num_wqs_for_cleanup; i++) {
 		if (wqs[i].wq_mmapped) {
 			munmap(wqs[i].wq_portal, 0x1000);
 			wqs[i].wq_mmapped = false;
@@ -2017,8 +2195,10 @@ static __always_inline  struct dto_wq *get_wq(void* buf)
 
 static void dto_memset(void *s, int c, size_t n, int *result)
 {
+	//LOG_TRACE("dto_memset size %d value %x pointer %x descriptor %x\n",n,c,s,&thr_desc);
+	
 	uint64_t memset_pattern;
-	size_t cpu_size, dsa_size;
+	size_t cpu_size, dsa_size, unsplit_size;
 	struct dto_wq *wq = get_wq(s);
 
 	for (int i = 0; i < 8; ++i)
@@ -2032,6 +2212,10 @@ static void dto_memset(void *s, int c, size_t n, int *result)
 	thr_desc.pattern = memset_pattern;
 
 	/* cpu_size_fraction gauranteed to be >= 0 and < 1 */
+	//uint16_t bucket = get_algorithm_instance(n);
+	//LOG_TRACE("got bucket %d\n", bucket);
+	size_t cpu_size_fraction = auto_tune_states[get_algorithm_instance(n,MEMSET)].cpu_size_fraction;
+	//LOG_TRACE("dto_memset size %d cpu fraction %d, alg instance %u\n",n,cpu_size_fraction,get_algorithm_instance(n,MEMSET));
 	cpu_size = n * cpu_size_fraction / 100;
 	dsa_size = n - cpu_size;
 
@@ -2047,7 +2231,9 @@ static void dto_memset(void *s, int c, size_t n, int *result)
 		thr_desc.dst_addr = (uint64_t) s + cpu_size;
 		thr_desc.xfer_size = (uint32_t) dsa_size;
 		thr_comp.status = 0;
-		*result = dsa_submit(wq, &thr_desc);
+		unsplit_size = n;
+		//LOG_TRACE("dto_memset size %d \n",unsplit_size);
+		*result = dsa_submit(wq, &thr_desc, 1);
 		if (likely(*result == SUCCESS)) {
 			if (cpu_size) {
 				orig_memset(s, c, cpu_size);
@@ -2056,24 +2242,27 @@ static void dto_memset(void *s, int c, size_t n, int *result)
 				thr_bytes_completed_cpu = cpu_size;
 #endif
 			}
-			*result = dsa_wait(wq, &thr_desc, &thr_comp.status);
+			*result = dsa_wait(wq, &thr_desc, unsplit_size, &thr_comp.status, MEMSET);
 		}
 	} else {
 		uint32_t threshold;
 		threshold = max_transfer_size * 100 / (100 - cpu_size_fraction);
-		
+		//LOG_TRACE("dto_memset size %d value %x in the loop\n",n,c);
+
 		do {
 			size_t len;
 
 			len = n <= threshold ? n : threshold;
-
+			unsplit_size = len;
 			cpu_size = len * cpu_size_fraction / 100;
 			dsa_size = len - cpu_size;
+
+			//LOG_TRACE("dto_memset size %d \n",unsplit_size);
 
 			thr_desc.dst_addr = (uint64_t) s + cpu_size + thr_bytes_completed;
 			thr_desc.xfer_size = (uint32_t) dsa_size;
 			thr_comp.status = 0;
-			*result = dsa_submit(wq, &thr_desc);
+			*result = dsa_submit(wq, &thr_desc, 1);
 			if (*result == SUCCESS) {
 				if (cpu_size) {
 					void *s1 = s + thr_bytes_completed;
@@ -2084,7 +2273,7 @@ static void dto_memset(void *s, int c, size_t n, int *result)
 					thr_bytes_completed_cpu += cpu_size;
 #endif
 				}
-				*result = dsa_wait(wq, &thr_desc, &thr_comp.status);
+				*result = dsa_wait(wq, &thr_desc, unsplit_size, &thr_comp.status, MEMSET);
 			}
 
 			if (*result != SUCCESS)
@@ -2112,7 +2301,7 @@ static bool is_overlapping_buffers (void *dest, const void *src, size_t n)
 static void dto_memcpymove(void *dest, const void *src, size_t n, bool is_memcpy, int *result)
 {
 	struct dto_wq *wq = get_wq(dest);
-	size_t cpu_size, dsa_size;
+	size_t cpu_size, dsa_size, unsplit_size;
 
 	thr_desc.opcode = DSA_OPCODE_MEMMOVE;
 	thr_desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
@@ -2120,11 +2309,15 @@ static void dto_memcpymove(void *dest, const void *src, size_t n, bool is_memcpy
 		thr_desc.flags |= IDXD_OP_FLAG_CC;
 	thr_desc.completion_addr = (uint64_t)&thr_comp;
 
+	size_t cpu_size_fraction = auto_tune_states[get_algorithm_instance(n,MEMCOPY)].cpu_size_fraction;
+
+	//LOG_TRACE("dto_memcpymove size %d cpu fraction %d alg instance %u\n",n,cpu_size_fraction,get_algorithm_instance(n,MEMCOPY));
 	/* cpu_size_fraction gauranteed to be >= 0 and < 1 */
 	if (!is_memcpy && is_overlapping_buffers(dest, src, n))
 		cpu_size = 0;
-	else
+	else {
 		cpu_size = n * cpu_size_fraction / 100;
+	}
 
 	dsa_size = n - cpu_size;
 
@@ -2142,7 +2335,9 @@ static void dto_memcpymove(void *dest, const void *src, size_t n, bool is_memcpy
 		thr_desc.dst_addr = (uint64_t) dest + cpu_size;
 		thr_desc.xfer_size = (uint32_t) dsa_size;
 		thr_comp.status = 0;
-		*result = dsa_submit(wq, &thr_desc);
+		unsplit_size = n;
+		//LOG_TRACE("dto_memcpy size %d \n",unsplit_size);
+		*result = dsa_submit(wq, &thr_desc, 1);
 		if (*result == SUCCESS) {
 			if (cpu_size) {
 				if (is_memcpy)
@@ -2154,7 +2349,7 @@ static void dto_memcpymove(void *dest, const void *src, size_t n, bool is_memcpy
 				thr_bytes_completed_cpu += cpu_size ;
 #endif
 			}
-			*result = dsa_wait(wq, &thr_desc, &thr_comp.status);
+			*result = dsa_wait(wq, &thr_desc,  unsplit_size, &thr_comp.status,MEMCOPY);
 		}
 	} else {
 		uint32_t threshold;
@@ -2176,7 +2371,9 @@ static void dto_memcpymove(void *dest, const void *src, size_t n, bool is_memcpy
 			thr_desc.dst_addr = (uint64_t) dest + cpu_size + thr_bytes_completed;
 			thr_desc.xfer_size = (uint32_t) dsa_size;
 			thr_comp.status = 0;
-			*result = dsa_submit(wq, &thr_desc);
+			unsplit_size = len;
+			//LOG_TRACE("dto_memcpy size %d \n",unsplit_size);
+			*result = dsa_submit(wq, &thr_desc, 1);
 			if (*result == SUCCESS) {
 				if (cpu_size) {
 					const void *src1 = src + thr_bytes_completed;
@@ -2191,7 +2388,7 @@ static void dto_memcpymove(void *dest, const void *src, size_t n, bool is_memcpy
 					thr_bytes_completed_cpu += cpu_size ;
 #endif
 				}
-				*result = dsa_wait(wq, &thr_desc, &thr_comp.status);
+				*result = dsa_wait(wq, &thr_desc,  unsplit_size, &thr_comp.status,MEMCOPY);
 			}
 
 			if (*result != SUCCESS)
@@ -2320,6 +2517,8 @@ void *memset(void *s1, int c, size_t n)
 	size_t orig_n = n;
 #endif
 
+	//LOG_TRACE("memset size %d value %x dest %x\n",n,c,s1);
+
 	if (unlikely(dto_initialized == 0)) {
 		/* If there are other constructors in the same binary,
 		 * they may run before DTO's constructor. Just use
@@ -2328,6 +2527,18 @@ void *memset(void *s1, int c, size_t n)
 		 */
 		return dto_internal_memset(s1, c, n);
 	}
+
+
+#ifdef DTO_STATS_SUPPORT
+	if (unlikely(collect_stats)) {
+		if (n >= dsa_min_size) { 
+			//LOG_TRACE("memset numa node %d\n",get_numa_node_buf(s1));
+			numa_node_counts[MEMSET_DST][get_numa_node_buf(s1)]++;
+		}
+	}
+#endif
+
+
 
 	if (!use_orig_func) {
 #ifdef DTO_STATS_SUPPORT
@@ -2384,6 +2595,8 @@ void *memcpy(void *dest, const void *src, size_t n)
 	size_t orig_n = n;
 #endif
 
+	//LOG_TRACE("memcpy size %d src %x dest %x\n",n,src,dest);
+
 	if (unlikely(dto_initialized == 0)) {
 		/* If there are other constructors in the same binary,
 		 * they may run before DTO's constructor. Just use
@@ -2392,6 +2605,17 @@ void *memcpy(void *dest, const void *src, size_t n)
 		 */
 		return dto_internal_memcpymove(dest, src, n);
 	}
+
+
+#ifdef DTO_STATS_SUPPORT
+	if (unlikely(collect_stats)) {
+		if (n >= dsa_min_size) {
+			//LOG_TRACE("memcpy src numa node %d dest numa node %d\n",get_numa_node_buf((void*)src),get_numa_node_buf(dest));
+			numa_node_counts[MEMCPY_DST][get_numa_node_buf(dest)]++;
+			numa_node_counts[MEMCPY_SRC][get_numa_node_buf((void*)src)]++;
+		}
+	}
+#endif
 
 	if (!use_orig_func) {
 #ifdef DTO_STATS_SUPPORT

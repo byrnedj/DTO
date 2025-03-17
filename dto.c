@@ -289,6 +289,8 @@ static void dto_log(int req_log_level, const char *fmt, ...)
 /* Reinitialize DTO in the child process. */
 static void child (void)
 {
+	//LOG_TRACE("child process initialization called\n");
+
 #ifdef DTO_STATS_SUPPORT
 	int i, j, k;
 
@@ -315,6 +317,7 @@ static void child (void)
 static __always_inline unsigned char enqcmd(struct dsa_hw_desc *desc, volatile void *reg)
 {
 	unsigned char retry;
+	//LOG_TRACE("descriptor %x reg %x\n",desc,reg);
 
 	asm volatile(".byte 0xf2, 0x0f, 0x38, 0xf8, 0x02\t\n"
 			"setz %0\t\n"
@@ -492,8 +495,8 @@ static __always_inline int dsa_wait(struct dto_wq *wq,
 		thr_bytes_completed += thr_comp.bytes_completed;
 		return PAGE_FAULT;
 	}
-	if(hw->opcode==3)
-		LOG_ERROR("failed status %x xfersz %x opcode %d\n", *comp, hw->xfer_size, hw->opcode);
+
+	LOG_ERROR("failed status %x xfersz %x opcode %d\n", *comp, hw->xfer_size, hw->opcode);
 	return FAIL_OTHERS;
 }
 
@@ -501,7 +504,7 @@ static __always_inline int dsa_submit(struct dto_wq *wq,
 	struct dsa_hw_desc *hw)
 {
 	int ret;
-	//LOG_TRACE("desc flags: 0x%x, opcode: 0x%x\n", hw->flags, hw->opcode);
+	//LOG_TRACE("dsa_submit: desc flags: 0x%x, opcode: 0x%x, wq %x descriptor %x\n", hw->flags, hw->opcode, wq, hw);
 	__builtin_ia32_sfence();
 
 	if (wq->wq_mmapped) {
@@ -805,6 +808,8 @@ static bool test_write_syscall(struct dto_wq *wq)
 	struct dsa_completion_record comp __attribute__((aligned(32)));
 	int retry = 0;
 
+	//LOG_TRACE("test_write_syscall\n");
+
 	desc.opcode = DSA_OPCODE_NOOP;
 	desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
 	comp.status = 0;
@@ -910,6 +915,7 @@ static int dsa_init_from_wq_list(char *wq_list)
 
 		// map DSA WQ portal
 		wqs[num_wqs].wq_portal = mmap(NULL, 0x1000, PROT_WRITE, MAP_SHARED | MAP_POPULATE,
+		//wqs[num_wqs].wq_portal = mmap(NULL, 0x1000, PROT_WRITE, MAP_PRIVATE | MAP_POPULATE,
 				wqs[num_wqs].wq_fd, 0);
 
 		if (wqs[num_wqs].wq_portal == MAP_FAILED) {
@@ -1121,12 +1127,14 @@ static int dsa_init(void)
 	const char *env_str;
 	char wq_list[256];
 
+	//LOG_TRACE("dsa_init called\n");
+
 	/* detect umwait support */
 	leaf = 7;
 	waitpkg = 0;
 	if (__get_cpuid(0, &leaf, unused, &waitpkg, unused + 1)) {
 		if (waitpkg & 0x20) {
-			LOG_TRACE("umwait supported\n");
+			//LOG_TRACE("umwait supported\n");
 			umwait_support = 1;
 		}
 	}
@@ -1199,6 +1207,8 @@ static int init_dto(void)
 			if (log_level > LOG_LEVEL_TRACE)
 				log_level = LOG_LEVEL_TRACE;
 		}
+
+		//LOG_TRACE("init_dto called\n");
 
 		// save std c lib function pointers
 		orig_memset = dlsym(RTLD_NEXT, "memset");
@@ -1314,11 +1324,12 @@ static int init_dto(void)
 					dsa_min_size = DTO_DEFAULT_MIN_SIZE;
 			}
 
+			double cpu_size_fraction_float = 0.0;
 			env_str = getenv("DTO_CPU_SIZE_FRACTION");
 
 			if (env_str != NULL) {
 				errno = 0;
-				double cpu_size_fraction_float = strtod(env_str, NULL);
+				cpu_size_fraction_float = strtod(env_str, NULL);
 
 				if (errno || cpu_size_fraction_float < 0 || cpu_size_fraction_float >= 1) {
 					LOG_ERROR("Invalid DTO_CPU_SIZE_FRACTION %s, "
@@ -1327,7 +1338,7 @@ static int init_dto(void)
 					cpu_size_fraction_float = 0.0;
 				}
 				/* Use only 2 digits after decimal point */
-				cpu_size_fraction = 100 * cpu_size_fraction_float;
+				cpu_size_fraction = cpu_size_fraction_float * 100;
 			}
 
 			env_str = getenv("DTO_AUTO_ADJUST_KNOBS");
@@ -1376,14 +1387,16 @@ static int init_dto(void)
 			}
 
 			// display configuration
-			LOG_TRACE("log_level: %d, collect_stats: %d, use_std_lib_calls: %d, dsa_min_size: %lu, "
+			/*
+			LOG_TRACE("Internal_DTO - log_level: %d, collect_stats: %d, use_std_lib_calls: %d, dsa_min_size: %lu, "
 				"cpu_size_fraction: %.2f, wait_method: %s, auto_adjust_knobs: %d, numa_awareness: %s, dto_dsa_cc: %d\n",
 				//"cpu_size_fraction: %d, wait_method: %s, auto_adjust_knobs: %d, numa_awareness: %s, dto_dsa_cc: %d\n",
 				log_level, collect_stats, use_std_lib_calls, dsa_min_size,
-				(float)cpu_size_fraction/100, wait_names[wait_method], auto_adjust_knobs, numa_aware_names[is_numa_aware], dto_dsa_cc);
+				cpu_size_fraction_float, wait_names[wait_method], auto_adjust_knobs, numa_aware_names[is_numa_aware], dto_dsa_cc);
 			for (int i = 0; i < num_wqs; i++)
-				LOG_TRACE("[%d] wq_path: %s, wq_size: %d, dsa_cap: %lx\n", i,
-					wqs[i].wq_path, wqs[i].wq_size, wqs[i].dsa_gencap);
+				LOG_TRACE("[%d] wq_path: %s, wq_size: %d, dsa_cap: %lx, wq pointer %x wq portal %x\n", i,
+					wqs[i].wq_path, wqs[i].wq_size, wqs[i].dsa_gencap,&wqs[i],wqs[i].wq_portal);
+			*/
 		}
 		dto_initialized = 1;
 
@@ -1426,16 +1439,23 @@ static __always_inline  struct dto_wq *get_wq(void* buf)
 			if (dev != NULL &&
 				dev->num_wqs > 0) {
 				wq = dev->wqs[dev->next_wq++ % dev->num_wqs];
+
+				//LOG_TRACE("numa aware get WQ %x, next_wq %d, num_wqs %d\n",wq, dev->next_wq, dev->num_wqs);
 			}
 		}
 	}
 
 	if (wq == NULL) {
-		wq = &wqs[next_wq++ % num_wqs];
+		int ind = next_wq++ % num_wqs;
+		wq = &wqs[ind];
+		//wq = &wqs[next_wq++ % num_wqs];
+		//LOG_TRACE("not numa aware get WQ %x, next_wq %d, ind %d, num_wqs %d wqs base address %x\n",wq, next_wq, ind, num_wqs, wqs);
 	}
 
 	return wq;
 }
+
+static void *dto_internal_memset(void *s1, int c, size_t n);
 
 static void dto_memset(void *s, int c, size_t n, int *result)
 {
@@ -1443,6 +1463,7 @@ static void dto_memset(void *s, int c, size_t n, int *result)
 	size_t cpu_size, dsa_size;
 	struct dto_wq *wq = get_wq(s);
 	//printf("memset size %d value %x pointer %x\n",n,c,s);
+	//LOG_TRACE("dto_memset size %d value %x pointer %x descriptor %x\n",n,c,s,&thr_desc);
 
 	for (int i = 0; i < 8; ++i)
 		((uint8_t *) &memset_pattern)[i] = (uint8_t) c;
@@ -1465,6 +1486,9 @@ static void dto_memset(void *s, int c, size_t n, int *result)
 		thr_desc.dst_addr = (uint64_t) s + cpu_size;
 		thr_desc.xfer_size = (uint32_t) dsa_size;
 		thr_comp.status = 0;
+
+		//dto_internal_memset(s, c, n);
+
 		*result = dsa_submit(wq, &thr_desc);
 		//printf("submit result %x\n",*result);
 		if (likely(*result == SUCCESS)) {
@@ -1477,14 +1501,15 @@ static void dto_memset(void *s, int c, size_t n, int *result)
 		}
 	} else {
 		uint32_t threshold;
-		threshold = wq->max_transfer_size * 100 / (100 - cpu_size_fraction);
+		size_t current_cpu_size_fraction = cpu_size_fraction;  // the cpu_size_fraction might be changed by the auto tune algorithm 
+		threshold = wq->max_transfer_size * 100 / (100 - current_cpu_size_fraction);
 
 		do {
 			size_t len;
 
 			len = n <= threshold ? n : threshold;
 
-			cpu_size = len * cpu_size_fraction / 100;
+			cpu_size = len * current_cpu_size_fraction / 100;
 			dsa_size = len - cpu_size;
 
 			thr_desc.dst_addr = (uint64_t) s + cpu_size + thr_bytes_completed;
@@ -1530,6 +1555,8 @@ static void dto_memcpymove(void *dest, const void *src, size_t n, bool is_memcpy
 	struct dto_wq *wq = get_wq(dest);
 	size_t cpu_size, dsa_size;
 
+	//LOG_TRACE("dto_memcpymove size %d src pointer %x dst pointer %x, descriptor %x\n",n,dest,src, &thr_desc);
+
 	thr_desc.opcode = DSA_OPCODE_MEMMOVE;
 	thr_desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
 	if (dto_dsa_cc && (wq->dsa_gencap & GENCAP_CC_MEMORY))
@@ -1564,8 +1591,8 @@ static void dto_memcpymove(void *dest, const void *src, size_t n, bool is_memcpy
 		}
 	} else {
 		uint32_t threshold;
-		threshold = wq->max_transfer_size * 100 / (100 - cpu_size_fraction);
-
+		size_t current_cpu_size_fraction = cpu_size_fraction;  // the cpu_size_fraction might be changed by the auto tune algorithm 
+		threshold = wq->max_transfer_size * 100 / (100 - current_cpu_size_fraction);
 		do {
 			size_t len;
 
@@ -1574,8 +1601,7 @@ static void dto_memcpymove(void *dest, const void *src, size_t n, bool is_memcpy
 			if (!is_memcpy && is_overlapping_buffers(dest, src, len))
 				cpu_size = 0;
 			else
-				cpu_size = len * cpu_size_fraction / 100;
-
+				cpu_size = len * current_cpu_size_fraction / 100;
 
 			dsa_size = len - cpu_size;
 
@@ -1614,6 +1640,8 @@ static int dto_memcmp(const void *s1, const void *s2, size_t n, int *result)
 	struct dto_wq *wq = get_wq((void*)s2);
 	int cmp_result = 0;
 	size_t orig_n = n;
+
+	//LOG_TRACE("dto_memcmp size %d pointer1 %x pointer2 %x, descriptor %x\n",n,s1,s2,&thr_desc);
 
 	thr_desc.opcode = DSA_OPCODE_COMPARE;
 	thr_desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
@@ -1672,6 +1700,8 @@ static void *dto_internal_memset(void *s1, int c, size_t n)
 	char *dest = s1;
 	size_t i;
 
+	//LOG_TRACE("dto_internal_memset size %d value %x pointer %x\n",n,c,s1);
+
 	for (i = 0; i < n; i++)
 		dest[i] = (char)c;
 
@@ -1683,6 +1713,7 @@ static void *dto_internal_memcpymove(void *dest, const void *src, size_t n)
 	char *d = dest;
 	const char *s = (const char *)src;
 	ssize_t i;
+	//LOG_TRACE("dto_memcpymove size %d src pointer %x dst pointer %x\n",n,dest,src);
 
 	if (s >= d) {
 		/* go from beginning to end */
@@ -1703,6 +1734,8 @@ static int dto_internal_memcmp(const void *s1, const void *s2, size_t n)
 	const unsigned char *src2 = (const unsigned char *)s2;
 	size_t i;
 
+	//LOG_TRACE("dto_internal_memcmp size %d pointer1 %x pointer2 %x\n",n,s1,s2);
+
 	for (i = 0; i < n; i++) {
 		if (src1[i] != src2[i])
 			return src1[i] - src2[i];
@@ -1714,6 +1747,9 @@ void *memset(void *s1, int c, size_t n)
 {
 	int result = 0;
 	void *ret = s1;
+
+	//LOG_TRACE("memset size %d value %x pointer %x\n",n,c,s1);
+
 	int use_orig_func = USE_ORIG_FUNC(n, dto_dsa_memset);
 #ifdef DTO_STATS_SUPPORT
 	struct timespec st, et;
@@ -1764,6 +1800,8 @@ void *memcpy(void *dest, const void *src, size_t n)
 {
 	int result = 0;
 	void *ret = dest;
+	//LOG_TRACE("memcpy size %d src pointer %x dst pointer %x\n",n,dest,src);
+
 	int use_orig_func = USE_ORIG_FUNC(n, dto_dsa_memcpy);
 #ifdef DTO_STATS_SUPPORT
 	struct timespec st, et;
@@ -1818,6 +1856,9 @@ void *memmove(void *dest, const void *src, size_t n)
 	int result = 0;
 	void *ret = dest;
 	int use_orig_func = USE_ORIG_FUNC(n, dto_dsa_memmove);
+
+	//LOG_TRACE("memmove size %d src pointer %x dst pointer %x\n",n,dest,src);
+
 #ifdef DTO_STATS_SUPPORT
 	struct timespec st, et;
 	size_t orig_n = n;
@@ -1871,6 +1912,9 @@ int memcmp(const void *s1, const void *s2, size_t n)
 	int result = 0;
 	int ret;
 	int use_orig_func = USE_ORIG_FUNC(n, dto_dsa_memcmp);
+
+	//LOG_TRACE("memcmp size %d pointer1 %x pointer2 %x\n",n,s1,s2);
+
 #ifdef DTO_STATS_SUPPORT
 	struct timespec st, et;
 	size_t orig_n = n;
