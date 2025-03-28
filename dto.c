@@ -7,6 +7,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <string.h>
@@ -104,7 +105,8 @@ enum wait_options {
 	WAIT_BUSYPOLL = 0,
 	WAIT_UMWAIT,
 	WAIT_YIELD,
-	WAIT_TPAUSE
+	WAIT_TPAUSE,
+	WAIT_SLEEP
 };
 
 enum numa_aware {
@@ -230,7 +232,8 @@ static const char * const wait_names[] = {
 	[WAIT_BUSYPOLL] = "busypoll",
 	[WAIT_UMWAIT] = "umwait",
 	[WAIT_YIELD] = "yield",
-        [WAIT_TPAUSE] = "tpause"
+        [WAIT_TPAUSE] = "tpause",
+        [WAIT_SLEEP] = "sleep"
 };
 
 static int collect_stats;
@@ -531,10 +534,20 @@ static __always_inline void dsa_wait_no_adjust(const volatile uint8_t *comp)
         case WAIT_TPAUSE:
             dsa_wait_tpause(comp);
             break;
+        case WAIT_SLEEP:
+            // This method is not typically used in high-performance scenarios,
+            // but included for completeness. It can be implemented with a sleep.
+            // For example, using usleep or sleep for a short duration.
+            // This is a placeholder for actual sleep implementation.
+            do {
+                usleep(20); // Sleep for 20 microseconds
+            } while (*comp == 0);
+            break;
         default:
             dsa_wait_busy_poll(comp);
     }
 }
+
 
 /* A simple auto-tuning heuristic.
  * Goal of the Heuristic:
