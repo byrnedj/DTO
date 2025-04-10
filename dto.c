@@ -57,6 +57,10 @@
 #define DTO_INITIALIZED 0
 #define DTO_INITIALIZING 1
 
+#define NSEC_PER_SEC (1000000000)
+#define MSEC_PER_SEC (1000)
+#define NSEC_PER_MSEC (NSEC_PER_SEC/MSEC_PER_SEC)
+
 // thread specific variables
 static __thread struct dsa_hw_desc thr_desc;
 static __thread struct dsa_completion_record thr_comp __attribute__((aligned(32)));
@@ -118,6 +122,7 @@ static enum numa_aware is_numa_aware;
 static size_t dsa_min_size = DTO_DEFAULT_MIN_SIZE;
 static int wait_method = WAIT_YIELD;
 static size_t cpu_size_fraction;   // range of values is 0 to 99
+static uint64_t wait_time = 100000; //10K nanoseconds
 
 static uint8_t dto_dsa_memcpy = 1;
 static uint8_t dto_dsa_memmove = 1;
@@ -142,6 +147,7 @@ static uint8_t fork_handler_registered;
 enum memop {
 	MEMSET = 0x0,
 	MEMCOPY,
+	MEMCOPY_ASYNC,
 	MEMMOVE,
 	MEMCMP,
 	MAX_MEMOP,
@@ -150,6 +156,7 @@ enum memop {
 static const char * const memop_names[] = {
 	[MEMSET] = "set",
 	[MEMCOPY] = "cpy",
+	[MEMCOPY_ASYNC] = "cpy_async",
 	[MEMMOVE] = "mov",
 	[MEMCMP] = "cmp"
 };
@@ -424,28 +431,57 @@ static __always_inline void dsa_wait_busy_poll(const volatile uint8_t *comp)
 	}
 }
 
-static __always_inline void dsa_wait_tpause(const volatile uint8_t *comp)
+//static __always_inline void dsa_wait_tpause(const volatile uint8_t *comp)
+static void dsa_wait_tpause(const volatile uint8_t *comp)
 {
-	while (*comp == 0) {
-            tpause(__rdtsc() + dto_use_c02 ? TPAUSE_C02_DELAY : TPAUSE_C01_DELAY,
-	    dto_use_c02 ? C02_STATE : C01_STATE);
-	}
+	do {
+            uint64_t delay = 0;
+	    _mm_mfence();
+            _mm_lfence();
+            delay = _rdtsc();
+                _mm_lfence();
+	    //delay = delay + dto_use_c02 ? TPAUSE_C02_DELAY : TPAUSE_C01_DELAY;
+	    delay = delay + wait_time;
+	    //unsigned int state = dto_use_c02 ? C02_STATE : C01_STATE;
+            //while (_tpause( 1 , delay) == 1);
+            _tpause( 0 , delay);
+	} while (*comp == 0);
+            //tpause(__rdtsc() + dto_use_c02 ? TPAUSE_C02_DELAY : TPAUSE_C01_DELAY,
+	    //dto_use_c02 ? C02_STATE : C01_STATE);
+
+	//}
 }
 
 static __always_inline void __dsa_wait_umwait(const volatile uint8_t *comp)
 {
-	umonitor(comp);
+	_umonitor((void*)comp);
 	
-        uint64_t delay = __rdtsc() + dto_umwait_delay;
-	umwait(delay, dto_use_c02 ? C02_STATE : C01_STATE);
+         uint64_t delay = 0;
+	 _mm_mfence();
+         _mm_lfence();
+         delay = _rdtsc();
+	 uint64_t start = delay;
+             _mm_lfence();
+	 //delay = delay + dto_use_c02 ? TPAUSE_C02_DELAY : TPAUSE_C01_DELAY;
+	 delay = delay + wait_time*10;
+	//umwait(delay, dto_use_c02 ? C02_STATE : C01_STATE);
+	
+	_umwait(1, delay);
+	 _mm_mfence();
+         _mm_lfence();
+	uint64_t end = _rdtsc();
+	uint64_t actual = end - start;
+        _mm_lfence();
+	if (rand() % (SAMPLE_INTERVAL) == 0) {
+	  LOG_TRACE("actual delay %d\n", actual);
+	}
 }
 
 static __always_inline void dsa_wait_umwait(const volatile uint8_t *comp)
 {
-
-	while (*comp == 0) {
+	do {
 	    __dsa_wait_umwait(comp);
-        }
+	} while (*comp == 0);
 }
 
 static __always_inline void __dsa_wait(const volatile uint8_t *comp)
@@ -474,6 +510,9 @@ static __always_inline void dsa_wait_no_adjust(const volatile uint8_t *comp)
             break;
         case WAIT_UMWAIT:
             dsa_wait_umwait(comp);
+            break;
+        case WAIT_TPAUSE:
+            dsa_wait_tpause(comp);
             break;
         case WAIT_BUSYPOLL:
             dsa_wait_busy_poll(comp);
@@ -693,6 +732,7 @@ static void print_stats(void)
 	clock_gettime(CLOCK_BOOTTIME, &dto_end_time);
 
 	LOG_TRACE("DTO Run Time: %ld ms\n", TS_NS(dto_start_time, dto_end_time)/1000000);
+	LOG_TRACE("DTO CPU Fraction: %.2f \n", cpu_size_fraction/100.0);
 
 	// display stats
 	for (int t = 0; t < 2; ++t) {
@@ -1517,6 +1557,23 @@ static int init_dto(void)
 				LOG_ERROR("Didn't find any usable DSAs. Falling back to using CPUs.\n");
 				use_std_lib_calls = 1;
 			}
+    			unsigned int num, den, freq;
+    			unsigned int unused;
+    			unsigned long long tmp;
+    			__get_cpuid( 0x15, &den, &num, &freq, &unused );
+    			freq /= 1000;
+    			LOG_TRACE( "Core Freq = %u kHz\n", freq );
+    			LOG_TRACE( "TSC Mult  = %u\n", num );
+    			LOG_TRACE( "TSC Den   = %u\n", den );
+    			freq *= num;
+    			freq /= den;
+    			LOG_TRACE( "CPU freq = %u kHz\n", freq );
+    			LOG_TRACE( "Requested wait: %llu nsec\n", wait_time );
+    			tmp = wait_time;
+    			tmp *= freq;
+    			wait_time = tmp / NSEC_PER_MSEC;
+    			LOG_TRACE( "Requested wait duration: %llu cycles\n", wait_time );
+    
 
 			// display configuration
 			LOG_TRACE("log_level: %d, collect_stats: %d, use_std_lib_calls: %d, dsa_min_size: %lu, "
