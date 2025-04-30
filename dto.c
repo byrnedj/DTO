@@ -121,7 +121,6 @@ static enum numa_aware is_numa_aware;
 static size_t dsa_min_size = DTO_DEFAULT_MIN_SIZE;
 static int wait_method = WAIT_YIELD;
 static size_t cpu_size_fraction;   // range of values is 0 to 99
-static uint64_t wait_time = 100000; //10K nanoseconds
 
 static uint8_t dto_dsa_memcpy = 1;
 static uint8_t dto_dsa_memmove = 1;
@@ -133,11 +132,14 @@ static bool dto_use_c02 = true; //C02 state is default -
                             //C02 avg exit latency is ~500 ns
                             //and C01 is about ~240 ns on SPR
 
-#define TPAUSE_C02_DELAY 10000 //in this case we are offloading so delay can
-                               //be 4~5 us
+#define TPAUSE_C02_DELAY_NS 6000 //in this case we are offloading so delay can
+                                 //be ~6 us as this is around the time a > 64KB 
+                                 //copy takes to complete
 
-#define TPAUSE_C01_DELAY 1000 //keep smaller because we want to wake up
-                              //with lower latency
+#define TPAUSE_C01_DELAY_NS 1000 //keep smaller because we want to wake up
+                                 //with lower latency
+
+static uint64_t tpause_wait_time = TPAUSE_C02_DELAY_NS;
 
 static unsigned long dto_umwait_delay = UMWAIT_DELAY_DEFAULT;
 
@@ -407,57 +409,27 @@ static __always_inline void dsa_wait_busy_poll(const volatile uint8_t *comp)
 	}
 }
 
-//static __always_inline void dsa_wait_tpause(const volatile uint8_t *comp)
-static void dsa_wait_tpause(const volatile uint8_t *comp)
+static __always_inline void dsa_wait_tpause(const volatile uint8_t *comp)
 {
-	do {
-            uint64_t delay = 0;
-	    _mm_mfence();
-            _mm_lfence();
-            delay = _rdtsc();
-                _mm_lfence();
-	    //delay = delay + dto_use_c02 ? TPAUSE_C02_DELAY : TPAUSE_C01_DELAY;
-	    delay = delay + wait_time;
-	    //unsigned int state = dto_use_c02 ? C02_STATE : C01_STATE;
-            //while (_tpause( 1 , delay) == 1);
-            _tpause( 0 , delay);
-	} while (*comp == 0);
-            //tpause(__rdtsc() + dto_use_c02 ? TPAUSE_C02_DELAY : TPAUSE_C01_DELAY,
-	    //dto_use_c02 ? C02_STATE : C01_STATE);
-
-	//}
+	while (*comp == 0) {
+            uint64_t delay = _rdtsc() + tpause_wait_time;
+            _tpause(C02_STATE, delay);
+        }
 }
 
 static __always_inline void __dsa_wait_umwait(const volatile uint8_t *comp)
 {
 	_umonitor((void*)comp);
-	
-         uint64_t delay = 0;
-	 _mm_mfence();
-         _mm_lfence();
-         delay = _rdtsc();
-	 uint64_t start = delay;
-             _mm_lfence();
-	 //delay = delay + dto_use_c02 ? TPAUSE_C02_DELAY : TPAUSE_C01_DELAY;
-	 delay = delay + wait_time*10;
-	//umwait(delay, dto_use_c02 ? C02_STATE : C01_STATE);
-	
-	_umwait(1, delay);
-	 _mm_mfence();
-         _mm_lfence();
-	uint64_t end = _rdtsc();
-	uint64_t actual = end - start;
-        _mm_lfence();
-	if (rand() % (SAMPLE_INTERVAL) == 0) {
-	  LOG_TRACE("actual delay %d\n", actual);
-	}
+
+        uint64_t delay = _rdtsc() + UMWAIT_DELAY_DEFAULT;
+	_umwait(C02_STATE, delay);
 }
 
 static __always_inline void dsa_wait_umwait(const volatile uint8_t *comp)
 {
-	do {
+	while (*comp == 0) {
 	    __dsa_wait_umwait(comp);
-	} while (*comp == 0);
+        }
 }
 
 static __always_inline void __dsa_wait(const volatile uint8_t *comp)
@@ -470,8 +442,7 @@ static __always_inline void __dsa_wait(const volatile uint8_t *comp)
                 __dsa_wait_umwait(comp);
                 break;
             case WAIT_TPAUSE:
-                tpause(__rdtsc() + dto_use_c02 ? TPAUSE_C02_DELAY : TPAUSE_C01_DELAY,
-			dto_use_c02 ? C02_STATE : C01_STATE);
+                _tpause( C01_STATE, _rdtsc() + TPAUSE_C01_DELAY); 
                 break;
             default:
                  _mm_pause();
@@ -1544,11 +1515,11 @@ static int init_dto(void)
     			freq *= num;
     			freq /= den;
     			LOG_TRACE( "CPU freq = %u kHz\n", freq );
-    			LOG_TRACE( "Requested wait: %llu nsec\n", wait_time );
-    			tmp = wait_time;
+    			LOG_TRACE( "Requested wait: %llu nsec\n", tpause_wait_time );
+    			tmp = tpause_wait_time;
     			tmp *= freq;
-    			wait_time = tmp / NSEC_PER_MSEC;
-    			LOG_TRACE( "Requested wait duration: %llu cycles\n", wait_time );
+    			tpause_wait_time = tmp / NSEC_PER_MSEC;
+    			LOG_TRACE( "Requested wait duration: %llu cycles\n", tpause_wait_time );
     
 
 			// display configuration
