@@ -442,7 +442,7 @@ static __always_inline void __dsa_wait(const volatile uint8_t *comp)
                 __dsa_wait_umwait(comp);
                 break;
             case WAIT_TPAUSE:
-                _tpause( C01_STATE, _rdtsc() + TPAUSE_C01_DELAY); 
+                _tpause( C01_STATE, _rdtsc() + TPAUSE_C01_DELAY_NS); 
                 break;
             default:
                  _mm_pause();
