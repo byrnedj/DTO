@@ -60,7 +60,31 @@
 #define MSEC_PER_SEC (1000)
 #define NSEC_PER_MSEC (NSEC_PER_SEC/MSEC_PER_SEC)
 
+/* Dedicate for IAA test */
+struct iaa_extras {
+	uint16_t iaa_compr_flags;
+	uint16_t iaa_decompr_flags;
+	uint16_t iaa_crc64_flags;
+	uint16_t iaa_cipher_flags;
+	uint32_t iaa_max_dst_size;
+	uint32_t iaa_src2_xfer_size;
+	struct {
+		uint8_t algorithm;
+		uint8_t flags;
+	} crypto_aecs;
+};
+struct aecs_encrypt {
+    uint32_t crypto_flags;     // bits for AES-CFB/GCM/XTS, key length, flush
+    uint8_t  iv[16];           // initialization vector
+    uint8_t  key[32];          // AES key (use only first 16 or 32 bytes)
+    // ... other state fields zeroed ...
+} __attribute__((aligned(4096)));
+
 // thread specific variables
+static __thread struct iax_hw_desc iaa_thr_desc;
+static __thread struct iax_completion_record iaa_thr_comp __attribute__((aligned(64)));
+static __thread uint64_t iaa_thr_bytes_completed;
+
 static __thread struct dsa_hw_desc thr_desc;
 static __thread struct dsa_completion_record thr_comp __attribute__((aligned(32)));
 static __thread uint64_t thr_bytes_completed;
@@ -75,6 +99,7 @@ struct dto_wq {
 	struct accfg_wq *acc_wq;
 	char wq_path[PATH_MAX];
 	uint64_t dsa_gencap;
+	uint64_t iaa_gencap;
 	int wq_size;
 	uint32_t max_transfer_size;
 	int wq_fd;
@@ -84,8 +109,11 @@ struct dto_wq {
 
 struct dto_device {
 	struct dto_wq* wqs[MAX_WQS];
+	struct dto_wq* iaa_wqs[MAX_WQS];
 	uint8_t num_wqs;
+	uint8_t iaa_num_wqs;
 	atomic_uchar next_wq;
+	atomic_uchar iaa_next_wq;
 };
 
 enum wait_options {
@@ -114,6 +142,12 @@ static struct dto_wq wqs[MAX_WQS];
 static struct dto_device* devices[MAX_NUMA_NODES];
 static uint8_t num_wqs;
 static atomic_uchar next_wq;
+
+static struct dto_wq iaa_wqs[MAX_WQS];
+static struct dto_device* iaa_devices[MAX_NUMA_NODES];
+static uint8_t iaa_num_wqs;
+static atomic_uchar iaa_next_wq;
+
 static atomic_uchar dto_initialized;
 static atomic_uchar dto_initializing;
 static uint8_t use_std_lib_calls;
@@ -1066,6 +1100,156 @@ fail:
 	return rc;
 }
 
+static int iaa_init_from_accfg(void)
+{
+	int used_devids[MAX_WQS];
+	struct accfg_device *device;
+	struct accfg_wq *wq;
+	struct accfg_ctx *iaa_ctx = NULL;
+	int rc;
+	int i;
+
+        for (i = 0; i < MAX_WQS; i++) {
+            iaa_wqs[i].acc_wq = NULL;
+            used_devids[i] = -1;
+        }
+
+        rc = accfg_new(&iaa_ctx);
+	
+        if (rc < 0)
+		return rc;
+	iaa_num_wqs = 0;
+
+	accfg_device_foreach(iaa_ctx, device) {
+		enum accfg_device_state dstate;
+
+		/* use dsa devices only*/
+		if (strncmp(accfg_device_get_devname(device), "iax", 3)!= 0)
+			continue;
+
+		/* Make sure that the device is enabled */
+		dstate = accfg_device_get_state(device);
+		if (dstate != ACCFG_DEVICE_ENABLED)
+			continue;
+
+		/* Check if we have already used a wq on this device */
+		for (i = 0; i < iaa_num_wqs; i++)
+			if (accfg_device_get_id(device) == used_devids[i])
+				break;
+		if (i != iaa_num_wqs)
+			continue;
+
+		struct dto_device* dev = NULL;
+
+		if (is_numa_aware) {
+			const int dev_numa_node = accfg_device_get_numa_node(device);
+			dev = get_dto_device(dev_numa_node);
+		}
+
+		accfg_wq_foreach(device, wq) {
+			enum accfg_wq_state wstate;
+			enum accfg_wq_mode mode;
+			enum accfg_wq_type type;
+
+			/* Get a workqueue that's enabled */
+			wstate = accfg_wq_get_state(wq);
+			if (wstate != ACCFG_WQ_ENABLED)
+				continue;
+
+			/* The wq type should be user */
+			type = accfg_wq_get_type(wq);
+			if (type != ACCFG_WQT_USER)
+				continue;
+
+			/* the wq mode should be shared work queue */
+			mode = accfg_wq_get_mode(wq);
+			if (mode != ACCFG_WQ_SHARED)
+				continue;
+
+			iaa_wqs[iaa_num_wqs].wq_size = accfg_wq_get_size(wq);
+			iaa_wqs[iaa_num_wqs].max_transfer_size = accfg_wq_get_max_transfer_size(wq);
+
+			iaa_wqs[iaa_num_wqs].acc_wq = wq;
+			iaa_wqs[iaa_num_wqs].iaa_gencap = accfg_device_get_gen_cap(device);
+
+			used_devids[iaa_num_wqs] = accfg_device_get_id(device);
+
+			if (is_numa_aware &&
+				dev != NULL &&
+				dev->iaa_num_wqs < MAX_WQS) {
+				dev->iaa_wqs[dev->iaa_num_wqs++] = &iaa_wqs[iaa_num_wqs];
+			}
+
+			iaa_num_wqs++;
+		}
+
+		if (iaa_num_wqs == MAX_WQS)
+			break;
+	}
+
+	if (iaa_num_wqs == 0) {
+		rc = -EINVAL;
+		goto fail;
+	}
+
+	for (i = 0; i < iaa_num_wqs; i++) {
+		struct accfg_wq *acc_wq = iaa_wqs[i].acc_wq;
+
+		rc = accfg_wq_get_user_dev_path(acc_wq, wqs[i].wq_path, PATH_MAX);
+		if (rc) {
+			LOG_ERROR("Error getting device path\n");
+			goto fail_wq;
+		}
+
+		// open DSA WQ
+		iaa_wqs[i].wq_fd = open(iaa_wqs[i].wq_path, O_RDWR);
+		if (iaa_wqs[i].wq_fd < 0) {
+			LOG_ERROR("IAA WQ %s open error: %s\n", iaa_wqs[i].wq_path, strerror(errno));
+			rc = -errno;
+			goto fail_wq;
+		}
+
+		// map DSA WQ portal
+		iaa_wqs[i].wq_portal = mmap(NULL, 0x1000, PROT_WRITE, MAP_SHARED | MAP_POPULATE, iaa_wqs[i].wq_fd, 0);
+
+		if (iaa_wqs[i].wq_portal == MAP_FAILED) {
+			/* In case the driver doesn't support mmap, test if it
+			 * supports write system call for work submission, and
+			 * if yes, fallback to using write syscall.
+			 */
+			//rc = -errno;
+			//if (test_write_syscall(&iaa_wqs[i]))
+			//	iaa_wqs[iaa_num_wqs].wq_mmapped = false;
+			//else {
+		    	LOG_ERROR("mmap error for IAA wq: %s, error: %s\n", iaa_wqs[i].wq_path, strerror(errno));
+			goto fail_wq;
+			//}
+		} else {
+			iaa_wqs[i].wq_mmapped = true;
+			close(iaa_wqs[i].wq_fd);
+		}
+	}
+
+	if (is_numa_aware) {
+		correct_devices_list();
+	}
+
+	accfg_unref(iaa_ctx);
+	return 0;
+
+fail_wq:
+	for (int j = 0; j < i; j++)
+		munmap(iaa_wqs[j].wq_portal, 0x1000);
+	iaa_num_wqs = 0;
+
+	cleanup_devices();
+fail:
+	accfg_unref(iaa_ctx);
+	return rc;
+
+
+}
+
 static int dsa_init_from_accfg(void)
 {
 	int used_devids[MAX_WQS];
@@ -1279,8 +1463,11 @@ static int dsa_init(void)
 	}
 
 	env_str = getenv("DTO_WQ_LIST");
-	if (env_str == NULL)
-		return dsa_init_from_accfg();
+	if (env_str == NULL) {
+	    int n = iaa_init_from_accfg();
+            int m = dsa_init_from_accfg();
+            return n + m;
+        }
 
 	strncpy(wq_list, env_str, sizeof(wq_list) - 1);
 	/* ensure wq_list is null terminated */
@@ -1558,6 +1745,31 @@ static void cleanup_dto(void)
 	cleanup_devices();
 }
 
+static __always_inline  struct dto_wq *get_wq_iaa(void* buf)
+{
+	struct dto_wq* wq = NULL;
+
+	if (is_numa_aware) {
+		int status[1] = {-1};
+
+		// get the numa node for the target DSA device
+		const int numa_node = get_numa_node(buf);
+		if (numa_node >= 0 && numa_node < MAX_NUMA_NODES) {
+			struct dto_device* dev = iaa_devices[numa_node];
+			if (dev != NULL &&
+				dev->iaa_num_wqs > 0) {
+				wq = dev->iaa_wqs[dev->iaa_next_wq++ % dev->iaa_num_wqs];
+			}
+		}
+	}
+
+	if (wq == NULL) {
+		wq = &iaa_wqs[iaa_next_wq++ % iaa_num_wqs];
+	}
+
+	return wq;
+}
+
 static __always_inline  struct dto_wq *get_wq(void* buf)
 {
 	struct dto_wq* wq = NULL;
@@ -1665,6 +1877,37 @@ static bool is_overlapping_buffers (void *dest, const void *src, size_t n)
 		return false;
 
 	return true;
+}
+
+__attribute__((visibility("default"))) void dto_encrypt_async(void *dest, const void *src, size_t n, callback_t cb, void* args) {
+	//submit dsa work if successful, call the callback
+	int result = 0;
+#ifdef DTO_STATS_SUPPORT
+	struct timespec st, et;
+	size_t orig_n = n;
+	DTO_COLLECT_STATS_START(collect_stats, st);
+#endif
+
+        iaa_thr_desc.opcode = 
+	acctest_prep_desc_common(tsk->desc, tsk->opcode, (uint64_t)(tsk->dst1),
+				 (uint64_t)(tsk->src1), tsk->xfer_size, tsk->dflags);
+	hw->flags = dflags;
+	hw->opcode = opcode;
+	hw->src_addr = src;
+	hw->dst_addr = dest;
+	hw->xfer_size = len;
+	
+        iaa_thr_desc->completion_addr = (uint63_t)(tsk->comp);
+	iaa_thr_desc->iax_src2_addr = (uint64_t)(tsk->src2);
+	iaa_thr_desc->iax_src2_xfer_size = tsk->iaa_src2_xfer_size;
+	iaa_thr_desc->iax_max_dst_size = tsk->iaa_max_dst_size;
+	iaa_thr_desc->iax_cipher_flags = tsk->iaa_cipher_flags;
+	iaa_thr_comp->status = 0;
+
+
+#ifdef DTO_STATS_SUPPORT
+	DTO_COLLECT_STATS_CPU_END(collect_stats, st, et, MEMCOPY_ASYNC, n, orig_n);
+#endif
 }
 
 __attribute__((visibility("default"))) void dto_memcpy_async(void *dest, const void *src, size_t n, callback_t cb, void* args) {
