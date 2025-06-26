@@ -58,7 +58,7 @@ Following environment variables control the behavior of DTO library:
    DTO_DSA_CC=0/1, 1 (default) - DTO sets DSA Cache Control flag to 1 if DSA supports cache control, 0 - DTO sets DSA Cache Control flag to 0
    DTO_UMWAIT_DELAY=xxxx defines delay for umwait command (check max possible value at: /sys/devices/system/cpu/umwait_control/max_time), default is 100000
 	DTO_LOG_FILE=<dto log file path> Redirect the DTO output to the specified file instead of std output (useful for debugging and statistics collection). file name is suffixed by process pid.
-	DTO_LOG_LEVEL=0/1/2 controls the log level. higher value means more verbose logging (default 0).
+	DTO_LOG_LEVEL=0/1/2/3 controls the log level. higher value means more verbose logging (default 0). 1 errors, 2 stats, 3 trace
 ```
 
 The following features have been added to the dev-dto library (see below for related ENV variables):
@@ -87,17 +87,24 @@ The following features have been added to the dev-dto library (see below for rel
 
 ```bash
 The following environment variables are used to control those features:
-   DTO_STATS_OUTPUT_TYPE=0/1 0 (default) text output as before 1 python dictionary output
+   DTO_STATS_OUTPUT_TYPE=0/1/2 2 (default) text output as before, 0 new version of text output, 1 python dictionary output
    DTO_COLLECT_ALG_STATS=0/1 - 0 (default) disables collection of auto-tune algorithm stats 1 - enables collection
+   DTO_COLLECT_ALG_STATS_LATEST_UPDATES=0/1 0(default) do not collect  1 collect
+   DTO_COLLECT_ALG_STATS_LATEST_CPUFRACTS=0/1 0(default) do not collect  1 collect
    DTO_LOG_LEVEL=0/1/2/3 controls the log level. higher value means more verbose logging (default 0). Level 2 corresponds to "stats". Level 3 corresponds to "trace".
+   DTO_PER_OP_AUTOTUNE_INSTANCES=0/1 0 (default) Do not run separate instances of algorithm for memset, memcpy and memmov. 1 run separate instances of algorithm for memset, memcpy, memmov.
+   DTO_STATS_NUM_WARMUP_OPS=xxxx 0 (default) number of operations to ignore in data collection at the start 
+   DTO_AUTOTUNE_EXCLUDE_FAILED=0/1 0 (default) use all DTO transactions in autotune algorithm 1 ignore failed (page fault) transactions
+    
    DTO_MAKE_ADJ=0/1 1 (default) algorithm makes adjustments to CPU fraction and min size. 0 algorithm counts wait cycles but makes no adjustements.
    DTO_MAX_BYTES=xxxx (specifies maximum size of API call needed for DSA operation execution, default is 2MB)
    DTO_WAIT_METHOD=<yield,busypoll,umwait,sleep> (specifies the method to use while waiting for DSA to complete operation, default is yield)
    DTO_SLEEP_DELAY_US=sleep duration in usec. Default is 8 usec.
-   DTO_NUM_AUTOTUNE_INSTANCES=number of instances (default 1) - Range of transaction sizes between min_bytes and max_bytes is divided into this number of sub-ranges and algorithm instance is run for each of them
    DTO_PER_OP_AUTOTUNE_INSTANCES=0/1 0 (default) Do not run separate instances of algorithm for memset and memcpy. 1 run separate instances of algorithm for memset and memcpy.
    DTO_NUM_WQS=0/number 0 (default) use all configured WQs. number - use specified number of WQs taken blindly from the front of the list of discovered WQs.
    DTO_OPPOSITE_NUMA=0/1 0 (default) normal numa awareness modes. 1 - use the opposite numa node. (only works for systems with 2 numa nodes)
+
+   DTO_NUM_AUTOTUNE_INSTANCES=number of instances (default 1) - Range of transaction sizes between min_bytes and max_bytes is divided into this number of sub-ranges and algorithm instance is run for each of them
 
 
 ```

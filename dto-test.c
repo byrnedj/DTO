@@ -11,14 +11,14 @@
 #include <threads.h>
 #include <stdatomic.h>
 
-#define NUM_BUFS  (4*4*1024UL) //(4*1024UL) //  1 //750 // 
-#define BUF_SIZE  (32*1024UL) //(128*1024UL) //    (2*8192UL)  //
+#define NUM_BUFS  (4*1024UL) //(4*1024UL) //  1 //750 // 
+#define BUF_SIZE  (128*1024UL) //(128*1024UL) //    (2*8192UL)  //
 #define ALLOC_SIZE (NUM_BUFS * BUF_SIZE)
 #define MEMSET_PATTERN 'a'
 
-#define MAX_ITERS 100 //1000000 // 8000000  //
-#define MAX_THREADS 1  //10 // 2 //1
-#define LOG_COUNT 1  //100000
+#define MAX_ITERS 2000000 //2500000  //3333333  //  3333333 //5000000 //10000000        //10000000 //1000000 // 8000000  //
+#define MAX_THREADS 10 // 2 //1
+#define LOG_COUNT 1000000
 
 atomic_int no_ops = 0;
 
@@ -40,8 +40,8 @@ int thread_func(void *thr_data)
 		uint8_t *s = src_addr + j * BUF_SIZE;
 		uint8_t *d = dest_addr + j * BUF_SIZE;
 
-		printf("dto-test calling memset\n");
-		memset(s, MEMSET_PATTERN, BUF_SIZE);
+		//printf("dto-test calling memset\n");
+		//memset(s, MEMSET_PATTERN, BUF_SIZE);
 		memcpy(d, s, BUF_SIZE);
 		
 		//if (memcmp(d, s, BUF_SIZE) != 0)

@@ -12,16 +12,14 @@
 #include <stdatomic.h>
 #include <unistd.h>
 
-//1024*1024*1024*256   A bit over the total memory in both NUMAs
 //#define NUM_BUFS  (4*1024UL)
 #define BUF_SIZE_BASE  1024UL // (128*1024UL) 
-//#define ALLOC_SIZE (1024UL*1024UL*1024UL*128)  //(1024UL*128*1024UL)  //(NUM_BUFS * BUF_SIZE)
-#define ALLOC_SIZE (1024UL*1024UL*1024UL*48)
+#define ALLOC_SIZE (4*1024UL*128*1024UL)  //(NUM_BUFS * BUF_SIZE)
 #define MEMSET_PATTERN 'a'
 
 #define MAX_THREADS 50 
 #define LOG_COUNT 100000
-//#define PRINT_OUTPUT 1
+#define PRINT_OUTPUT 1
 
 enum memop {
 	MEMSET = 0x1,  
@@ -31,11 +29,13 @@ enum memop {
 };
 
 struct parms {
-    int buf_size;
 	unsigned long long max_iters;
 	int num_threads;
 	uint32_t mem_ops;
 	uint32_t sleep_time_us;
+	uint32_t start_size;
+	uint32_t end_size;
+	uint32_t step_size;
 };
 
 #ifdef PRINT_OUTPUT
@@ -46,12 +46,14 @@ int thread_func(void *thr_data)
 {
 
 	struct parms *p = (struct parms *)thr_data;
-	uint64_t buf_size = BUF_SIZE_BASE * p->buf_size;
-	uint64_t num_bufs = ALLOC_SIZE / buf_size;
+	uint64_t buf_size;
+	uint64_t num_bufs = ALLOC_SIZE / BUF_SIZE_BASE;
 	unsigned long long max_iters = p->max_iters;
 	uint32_t mem_ops = p->mem_ops;
 	uint32_t sleep_time_us = p->sleep_time_us;
-
+	uint32_t start_size = p->start_size;
+	uint32_t end_size = p->end_size;
+	uint32_t step_size = p->step_size;
 
 	//printf("buf_size %lu num_bufs %lu max_iter %lu\n", buf_size, num_bufs,max_iters);
 
@@ -59,26 +61,32 @@ int thread_func(void *thr_data)
 	void *src_addr = calloc(ALLOC_SIZE, sizeof(uint8_t));
 	void *dest_addr = calloc(ALLOC_SIZE, sizeof(uint8_t));
 
-	printf("alloc size %lu\n",ALLOC_SIZE);
-
-	//uint8_t *s = src_addr;
-	//uint8_t *d = dest_addr;
+	uint32_t cur_size = start_size;
+    uint64_t cur_num_bufs = 0;
+    uint64_t next_num_bufs;
 
 	for (unsigned long long i=0; i < p->max_iters; ++i) {
-		int j = i % num_bufs;
 
-		uint8_t *s = src_addr + j * buf_size;
-		uint8_t *d = dest_addr + j * buf_size;
+        next_num_bufs = cur_num_bufs + cur_size;
+        if (next_num_bufs > num_bufs) {
+            cur_num_bufs = 0;
+        }
+		uint8_t *s = src_addr + cur_num_bufs * BUF_SIZE_BASE;
+		uint8_t *d = dest_addr + cur_num_bufs * BUF_SIZE_BASE;
+
+        buf_size = cur_size*BUF_SIZE_BASE;
+
+		//printf("%d: buf_size %lu cur_size %lu next_num_bufs %lu num_bufs %lu\n", i, buf_size, cur_size, cur_num_bufs+cur_size, num_bufs);
 
 		// issue the memory transactions
 		if (mem_ops & MEMSET) {
-			//printf("dto-test memset %d %x\n",buf_size,s);
 			memset(s, MEMSET_PATTERN, buf_size);
+			//printf("memset %d\n",buf_size);
 		}
 
 		if (mem_ops & MEMCOPY) {
-			//printf("dto-test memcpy %d %x %x\n",buf_size,s,d);
 			memcpy(d, s, buf_size);
+			//printf("memscpy %d\n",buf_size);
 		}
 
 		if (mem_ops & MEMMOVE) {
@@ -90,7 +98,12 @@ int thread_func(void *thr_data)
 			memcmp(d, s, buf_size);
 			//printf("memcmp %d\n",buf_size);
 		}
-        
+
+        cur_num_bufs = cur_num_bufs + step_size;
+        cur_size = cur_size + step_size;
+        if (cur_size >= end_size) {
+            cur_size = 0;
+        }
 
 #ifdef PRINT_OUTPUT
 		++no_ops;
@@ -114,9 +127,9 @@ int main(int argc, char **argv)
 	struct parms p[MAX_THREADS];
  	thrd_t threads[MAX_THREADS];
 
-	if (argc < 6) {
-		printf("Usage: dto-test-settable-size num_threads sleep_time_us mem_op buf_size max_iters [buf_size, max_iters for remaining threads]\n");
-		printf("buf_size in increments of 1024, num_threads <= 10\n");
+	if (argc < 8) {
+		printf("Usage: dto-test-settable-size num_threads sleep_time_us mem_op start_size end_size step_size max_iters [buf_size, max_iters for remaining threads]\n");
+		printf("sizes are in increments of 1024, num_threads <= 10\n");
 		return 1;
 	}
 
@@ -124,16 +137,19 @@ int main(int argc, char **argv)
 		p[0].num_threads = atoi(argv[1]);
 		p[0].sleep_time_us = atoi(argv[2]);
 		p[0].mem_ops = atoi(argv[3]);
-		p[0].buf_size = atoi(argv[4]);
-		sscanf(argv[5], "%llu", &p[0].max_iters);
-		//printf("num_threads %d buf_size %d iterations %llu\n",p[0].num_threads,p[0].buf_size, p[0].max_iters);
+		p[0].start_size = atoi(argv[4]);
+        p[0].end_size = atoi(argv[5]);
+        p[0].step_size = atoi(argv[6]);
+		sscanf(argv[7], "%llu", &p[0].max_iters);
+		printf("num_threads %d start_size %d end_size %d step_size %d iterations %llu\n",p[0].num_threads,p[0].start_size,p[0].end_size,p[0].step_size, p[0].max_iters);
 		
 		if(p[0].num_threads > MAX_THREADS) {
 			printf("number of threads must be <= %d\n",MAX_THREADS);
 			return 1;
 		}
 
-		if(p[0].num_threads>1 && argc>6) {
+        /*
+		if(p[0].num_threads>1 && argc>8) {
 			if(argc != 4+(p[0].num_threads*2)) {
 				printf("Need to either provide one buf_size and num_iters, or a buf_size and num_iters for each thread");
 				return 1;
@@ -147,17 +163,20 @@ int main(int argc, char **argv)
 				p[i].max_iters = atoi(argv[7+(i-1)*2]);
 			}
 		}
+        */
 
-		else {
+		//else {
 			for(int i = 1; i<p[0].num_threads;++i){
 				p[i].max_iters = p[0].max_iters;
 				p[i].mem_ops = p[0].mem_ops;
 				p[i].sleep_time_us = p[0].sleep_time_us;
 				p[i].num_threads = p[0].num_threads;
-				p[i].buf_size = p[0].buf_size;
+				p[i].start_size = p[0].start_size;
+                p[i].end_size = p[0].end_size;
+                p[i].step_size = p[0].step_size;
 
 			}
-		}	
+		//}	
 	}
 
 	//printf("buf_size %lu iters %lu threads %u\n",p.buf_size, p.max_iters, p.num_threads);

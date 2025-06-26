@@ -52,7 +52,7 @@ dto-test-static: dto-test.c
 	gcc -g dto-test.c $(DML_LIB_CXX) -o dto-test -l:libdto.a -lpthread -laccel-config -ldl -lnuma -L ./
 
 dto-test-dev: dto-test.c
-	gcc -g dto-test.c $(DML_LIB_CXX) -o dto-test-dev -ldevdto -lpthread -L ./
+	gcc -g dto-test.c $(DML_LIB_CXX) -o dto-test-dev -ldevdto2 -lpthread -L ./
 
 dto-test-set: dto-test-settable-size.c
 	gcc -g dto-test-settable-size.c $(DML_LIB_CXX) -o dto-test-settable-size -ldto -lpthread -L ./
@@ -62,6 +62,32 @@ dto-test-set-dev: dto-test-settable-size.c
 
 dto-test-set-dev2: dto-test-settable-size2.c
 	gcc -g dto-test-settable-size2.c $(DML_LIB_CXX) -o dto-test-settable-size-dev2 -ldevdto -lpthread -lnuma -L ./
+
+dto-test-set-dev3: dto-test-settable-size3.c
+	gcc -g dto-test-settable-size3.c $(DML_LIB_CXX) -o dto-test-settable-size-dev3 -ldevdto -lpthread -lnuma -L ./
+
+dto-test-set-wodto3: dto-test-settable-size3.c
+	gcc -g dto-test-settable-size3.c $(DML_LIB_CXX) -o dto-test-settable-size-wodto3 -lpthread -lnuma -L ./
+
+dto-test-set-dev4: dto-test-settable-size4.c
+	gcc -g dto-test-settable-size4.c $(DML_LIB_CXX) -o dto-test-settable-size-dev4 -ldevdto -lpthread -lnuma -L ./
+
+dto-test-set-dev5: dto-test-settable-size5.c
+	gcc -g dto-test-settable-size5.c $(DML_LIB_CXX) -o dto-test-settable-size-dev5 -ldevdto -lpthread -lnuma -L ./
+
+dto-test-set5: dto-test-settable-size5.c
+	gcc -g dto-test-settable-size5.c $(DML_LIB_CXX) -o dto-test-settable-size5 -ldto -lpthread -lnuma -L ./
+
+dto-test-set-dev5-nodto: dto-test-settable-size5.c
+	gcc -g dto-test-settable-size5.c $(DML_LIB_CXX) -o dto-test-settable-size-dev5-nodto -lpthread -lnuma -L ./
+
+junk: junk.c
+	gcc -g junk.c $(DML_LIB_CXX) -o junk -lpthread -lnuma -L ./
+
+
+dto-test-set-dev6: dto-test-settable-size6.c
+	gcc -g dto-test-settable-size6.c $(DML_LIB_CXX) -o dto-test-settable-size-dev6 -ldevdto -lpthread -lnuma -L ./
+
 
 dto-test-size-steps: dto-test-size-steps.c
 	gcc -g dto-test-size-steps.c $(DML_LIB_CXX) -o dto-test-size-steps -ldevdtodebug -lpthread -L ./
@@ -80,6 +106,18 @@ dto-test-distribution-multithread-dev: dto-test-distribution-multithread.c
 
 dto-test-distribution-multithread-dev2: dto-test-distribution-multithread2.c
 	gcc dto-test-distribution-multithread2.c $(DML_LIB_CXX) -o dto-test-distribution-multithread-dev2 -ldevdto -lpthread -L ./
+
+dto-test-distribution-multithread-dev3: dto-test-distribution-multithread3.c
+	gcc dto-test-distribution-multithread3.c $(DML_LIB_CXX) -o dto-test-distribution-multithread-dev3 -ldevdto -lpthread -lnuma -L ./
+
+dto-test-distribution-multithread-dev4: dto-test-distribution-multithread4.c
+	gcc dto-test-distribution-multithread4.c $(DML_LIB_CXX) -o dto-test-distribution-multithread-dev4 -mwaitpkg -ldevdto -lpthread -lnuma -L ./
+
+dto-test-distribution-multithread-dev5: dto-test-distribution-multithread5.c
+	gcc dto-test-distribution-multithread5.c $(DML_LIB_CXX) -o dto-test-distribution-multithread-dev5 -mwaitpkg -ldevdto -lpthread -lnuma -L ./
+
+dto-test-distribution-multithread-dev6: dto-test-distribution-multithread6.c
+	gcc dto-test-distribution-multithread6.c $(DML_LIB_CXX) -o dto-test-distribution-multithread-dev6 -mwaitpkg -ldevdto -lpthread -lnuma -L ./
 
 dto-test-wodto: dto-test.c
 	gcc -g dto-test.c $(DML_LIB_CXX) -o dto-test-wodto -lpthread

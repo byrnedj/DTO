@@ -1,0 +1,1 @@
+emon  -collect-edp    edp_file=/opt/intel/sep/config/edp/sapphirerapids_server_events.txt 1>./results/emon_cachebench_native/native_0.33.emon.txt 2>emon_stderr.log

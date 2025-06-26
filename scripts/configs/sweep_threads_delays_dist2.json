@@ -1,0 +1,1 @@
+{ "percentages": [ "auto" ], "mem_ops": [2], "thread_counts":[5,10, 15], "sleep_delays":[10,50,100,200,500,1000], "ramp_types":[0], "ramp_modes":[0], "wait_methods": ["yield"], "numa_configs": ["unaware"], "scale_buf_sizes_with_tx_size": false,"mem_buf_sizes": [1024], "num_mem_bufs": [8192], "alloc_types": ["single"], "rand_index_uses": [1], "cache_control_configs": [1]}

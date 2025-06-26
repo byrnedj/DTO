@@ -1,0 +1,337 @@
+#python sweep_all_test_settable_size2.py --output-type emon --run-name alloc-type --cfg-filepath ./configs/alloc-type_config.json
+#python sweep_numa_cases_test_settable_size2.py --output-type emon --run-name redo --cfg-filepath ./configs/numacases_cpy_config.json
+#python sweep_numa_cases_test_settable_size2.py --output-type perf --run-name set --cfg-filepath ./configs/numacases_set_config.json
+#python sweep_all_test_settable_size2.py --output-type emon --run-name alloc-type-tiny --cfg-filepath ./configs/alloc-type_tiny_config.json
+#python sweep_all_test_settable_size2.py --output-type perf --run-name tx-size --cfg-filepath ./configs/tx_size_sweep_config.json
+
+#sudo sysctl -w kernel.numa_balancing=1
+
+#python sweep_all_test_settable_size2.py --output-type perf --run-name tx-size-singlealloc-autonuma --cfg-filepath ./configs/tx_size_sweep_singlealloc_config.json
+#python sweep_all_test_settable_size2.py --output-type perf --run-name tx-size-autonuma --cfg-filepath ./configs/tx_size_sweep_config.json
+#python sweep_all_test_settable_size2.py --output-type perf --run-name alloc-type-autonuma --cfg-filepath ./configs/alloc-type_config.json
+#python sweep_all_test_settable_size2.py --output-type perf --run-name alloc-type-tiny-autonuma --cfg-filepath ./configs/alloc-type_tiny_config.json  --results-dirname sweepalltest2_alloc-type-tiny-autonuma_perf_032825_091839
+
+#python sweep_all_test_settable_size2.py --output-type emon --run-name alloc-type-tiny-autonuma-cpy --cfg-filepath ./configs/alloc-type_tiny-cpy_config.json
+#python sweep_all_test_settable_size2.py --output-type emon --run-name alloc-type-autonuma --cfg-filepath ./configs/alloc-type_config.json
+
+
+#python sweep_all_test_settable_size2.py --output-type perf --run-name tx-size-indiv-seq-autonuma --cfg-filepath ./configs/tx_size_sweep_indiv_seq_config.json
+
+#python sweep_all_test_settable_size4.py --output-type DTO_python --run-name single-size-alg-stats-cpy-1thread --cfg-filepath ./configs/single_size_auto_cpy.json  --alg-stats --num-iter 1000000 --results-dirname dto_alg_stats_multithread2 --alg-stats --num-dsas 1
+#python sweep_all_test_settable_size4.py --output-type DTO_python --run-name single-size-alg-stats-set-1thread --cfg-filepath ./configs/single_size_auto_set.json  --alg-stats --num-iter 1000000 --results-dirname dto_alg_stats_multithread2 --alg-stats --num-dsas 1
+#python sweep_all_test_settable_size4.py --output-type DTO_python --run-name single-size-alg-stats-cpy-2thread --cfg-filepath ./configs/single_size_auto_cpy.json  --alg-stats --num-iter 1000000 --num-threads 2 --results-dirname dto_alg_stats_multithread2 --alg-stats --num-dsas 1
+#python sweep_all_test_settable_size4.py --output-type DTO_python --run-name single-size-alg-stats-set-2thread --cfg-filepath ./configs/single_size_auto_set.json  --alg-stats --num-iter 1000000 --num-threads 2 --results-dirname dto_alg_stats_multithread2 --alg-stats --num-dsas 1
+#python sweep_all_test_settable_size4.py --output-type DTO_python --run-name single-size-alg-stats-cpy-3thread --cfg-filepath ./configs/single_size_auto_cpy.json  --alg-stats --num-iter 1000000 --num-threads 3 --results-dirname dto_alg_stats_multithread2 --alg-stats --num-dsas 1
+#python sweep_all_test_settable_size4.py --output-type DTO_python --run-name single-size-alg-stats-set-3thread --cfg-filepath ./configs/single_size_auto_set.json  --alg-stats --num-iter 1000000 --num-threads 3 --results-dirname dto_alg_stats_multithread2 --alg-stats --num-dsas 1
+#python sweep_all_test_settable_size4.py --output-type DTO_python --run-name dist-cpy-1thread --cfg-filepath ./configs/single_size_auto_cpy.json  --alg-stats --num-iter 1000000 --distribution-filepath ../dto-test-configs/uniform_cpy_64_1024.csv --results-dirname dto_alg_stats_multithread2 --alg-stats --num-dsas 1
+#python sweep_all_test_settable_size4.py --output-type DTO_python --run-name dist-set-1thread --cfg-filepath ./configs/single_size_auto_set.json  --alg-stats --num-iter 1000000 --distribution-filepath ../dto-test-configs/uniform_set_64_1024.csv --results-dirname dto_alg_stats_multithread2 --alg-stats --num-dsas 1
+#python sweep_all_test_settable_size4.py --output-type DTO_python --run-name dist-cpy-2thread --cfg-filepath ./configs/single_size_auto_cpy.json  --alg-stats --num-iter 1000000 --num-threads 2 --distribution-filepath ../dto-test-configs/uniform_cpy_64_1024.csv --results-dirname dto_alg_stats_multithread2 --alg-stats --num-dsas 1
+#python sweep_all_test_settable_size4.py --output-type DTO_python --run-name dist-set-2thread --cfg-filepath ./configs/single_size_auto_set.json  --alg-stats --num-iter 1000000 --num-threads 2 --distribution-filepath ../dto-test-configs/uniform_set_64_1024.csv --results-dirname dto_alg_stats_multithread2 --alg-stats --num-dsas 1
+#python sweep_all_test_settable_size4.py --output-type DTO_python --run-name dist-cpy-3thread --cfg-filepath ./configs/single_size_auto_cpy.json  --alg-stats --num-iter 1000000 --num-threads 3 --distribution-filepath ../dto-test-configs/uniform_cpy_64_1024.csv --results-dirname dto_alg_stats_multithread2 --alg-stats --num-dsas 1
+#python sweep_all_test_settable_size4.py --output-type DTO_python --run-name dist-set-3thread --cfg-filepath ./configs/single_size_auto_set.json  --alg-stats --num-iter 1000000 --num-threads 3 --distribution-filepath ../dto-test-configs/uniform_set_64_1024.csv --results-dirname dto_alg_stats_multithread2 --alg-stats --num-dsas 1
+#python sweep_all_test_settable_size4.py --output-type DTO_python --run-name dist-cpy-1thread --cfg-filepath ./configs/single_size_auto_cpy.json  --alg-stats --num-iter 1000000 --distribution-filepath ../dto-test-configs/uniform_normalized_cpy_64_1024.csv --results-dirname dto_alg_stats_multithread2 --alg-stats --num-dsas 1
+#python sweep_all_test_settable_size4.py --output-type DTO_python --run-name dist-set-1thread --cfg-filepath ./configs/single_size_auto_set.json  --alg-stats --num-iter 1000000 --distribution-filepath ../dto-test-configs/uniform_normalized_set_64_1024.csv --results-dirname dto_alg_stats_multithread2 --alg-stats --num-dsas 1
+#python sweep_all_test_settable_size4.py --output-type DTO_python --run-name dist-cpy-2thread --cfg-filepath ./configs/single_size_auto_cpy.json  --alg-stats --num-iter 1000000 --num-threads 2 --distribution-filepath ../dto-test-configs/uniform_normalized_cpy_64_1024.csv --results-dirname dto_alg_stats_multithread2 --alg-stats --num-dsas 1
+#python sweep_all_test_settable_size4.py --output-type DTO_python --run-name dist-set-2thread --cfg-filepath ./configs/single_size_auto_set.json  --alg-stats --num-iter 1000000 --num-threads 2 --distribution-filepath ../dto-test-configs/uniform_normalized_set_64_1024.csv --results-dirname dto_alg_stats_multithread2 --alg-stats --num-dsas 1
+#python sweep_all_test_settable_size4.py --output-type DTO_python --run-name dist-cpy-3thread --cfg-filepath ./configs/single_size_auto_cpy.json  --alg-stats --num-iter 1000000 --num-threads 3 --distribution-filepath ../dto-test-configs/uniform_normalized_cpy_64_1024.csv --results-dirname dto_alg_stats_multithread2 --alg-stats --num-dsas 1
+#python sweep_all_test_settable_size4.py --output-type DTO_python --run-name dist-set-3thread --cfg-filepath ./configs/single_size_auto_set.json  --alg-stats --num-iter 1000000 --num-threads 3 --distribution-filepath ../dto-test-configs/uniform_normalized_set_64_1024.csv --results-dirname dto_alg_stats_multithread2 --alg-stats --num-dsas 1
+#python sweep_all_test_settable_size4.py --output-type DTO_python --run-name convergence --cfg-filepath ./configs/single_size_auto_set.json  --alg-stats --num-iter 1000000 --distribution-filepath ../dto-test-configs/uniform_set_64_1024.csv --results-dirname convergence --num-dsas 1
+#python sweep_all_test_settable_size4.py --output-type DTO_python --run-name convergence --cfg-filepath ./configs/single_size_auto_cpy.json  --alg-stats --num-iter 1000000 --distribution-filepath ../dto-test-configs/uniform_cpy_64_1024.csv --results-dirname convergence --num-dsas 1
+#python sweep_all_test_settable_size4.py --output-type DTO_python --run-name convergence --cfg-filepath ./configs/single_size_auto_set.json  --alg-stats --num-iter 1000000 --distribution-filepath ../dto-test-configs/uniform_normalized_set_64_1024.csv --results-dirname convergence --num-dsas 1
+#python sweep_all_test_settable_size4.py --output-type DTO_python --run-name convergence --cfg-filepath ./configs/single_size_auto_cpy.json  --alg-stats --num-iter 1000000 --distribution-filepath ../dto-test-configs/uniform_normalized_cpy_64_1024.csv --results-dirname convergence --num-dsas 1
+
+
+# cpy
+#python sweep_all_test_settable_size4.py --output-type perf --run-name perc-sweep --cfg-filepath ./configs/sweep_perc_30_50.json  --alg-stats --num-iter 10000000 --num-threads-override 1 --distribution-filepath ../dto-test-configs/uniform_cpy_64_1024.csv --results-dirname perc_sweep --num-dsas 1
+#python sweep_all_test_settable_size4.py --output-type perf --run-name perc-sweep --cfg-filepath ./configs/sweep_perc_65_85.json  --alg-stats --num-iter 10000000 --num-threads-override 5 --distribution-filepath ../dto-test-configs/uniform_cpy_64_1024.csv --results-dirname perc_sweep --num-dsas 1
+#python sweep_all_test_settable_size4.py --output-type perf --run-name perc-sweep --cfg-filepath ./configs/sweep_perc_70_90.json  --alg-stats --num-iter 10000000 --num-threads-override 10 --distribution-filepath ../dto-test-configs/uniform_cpy_64_1024.csv --results-dirname perc_sweep --num-dsas 1
+#python sweep_all_test_settable_size4.py --output-type perf --run-name perc-sweep --cfg-filepath ./configs/sweep_perc_70_90.json  --alg-stats --num-iter 10000000 --num-threads-override 15 --distribution-filepath ../dto-test-configs/uniform_cpy_64_1024.csv --results-dirname perc_sweep --num-dsas 1
+#python sweep_all_test_settable_size4.py --output-type perf --run-name perc-sweep --cfg-filepath ./configs/sweep_perc_75_95.json  --alg-stats --num-iter 10000000 --num-threads-override 20 --distribution-filepath ../dto-test-configs/uniform_cpy_64_1024.csv --results-dirname perc_sweep --num-dsas 1
+
+#cpy outside
+#python sweep_all_test_settable_size4.py --output-type perf --run-name perc-sweep --cfg-filepath ./configs/sweep_perc_outside_30_50.json  --alg-stats --num-iter 10000000 --num-threads-override 1 --distribution-filepath ../dto-test-configs/uniform_cpy_64_1024.csv --results-dirname perc_sweep --num-dsas 1
+#python sweep_all_test_settable_size4.py --output-type perf --run-name perc-sweep --cfg-filepath ./configs/sweep_perc_outside_65_85.json  --alg-stats --num-iter 10000000 --num-threads-override 5 --distribution-filepath ../dto-test-configs/uniform_cpy_64_1024.csv --results-dirname perc_sweep --num-dsas 1
+#python sweep_all_test_settable_size4.py --output-type perf --run-name perc-sweep --cfg-filepath ./configs/sweep_perc_outside_70_90.json  --alg-stats --num-iter 10000000 --num-threads-override 10 --distribution-filepath ../dto-test-configs/uniform_cpy_64_1024.csv --results-dirname perc_sweep --num-dsas 1
+#python sweep_all_test_settable_size4.py --output-type perf --run-name perc-sweep --cfg-filepath ./configs/sweep_perc_outside_70_90.json  --alg-stats --num-iter 10000000 --num-threads-override 15 --distribution-filepath ../dto-test-configs/uniform_cpy_64_1024.csv --results-dirname perc_sweep --num-dsas 1
+#python sweep_all_test_settable_size4.py --output-type perf --run-name perc-sweep --cfg-filepath ./configs/sweep_perc_outside_75_95.json  --alg-stats --num-iter 10000000 --num-threads-override 20 --distribution-filepath ../dto-test-configs/uniform_cpy_64_1024.csv --results-dirname perc_sweep --num-dsas 1
+
+#set
+#python sweep_all_test_settable_size4.py --output-type perf --run-name perc-sweep --cfg-filepath ./configs/sweep_perc_20_40.json  --alg-stats --num-iter 10000000 --num-threads-override 1 --distribution-filepath ../dto-test-configs/uniform_set_64_1024.csv --results-dirname perc_sweep --num-dsas 1
+#python sweep_all_test_settable_size4.py --output-type perf --run-name perc-sweep --cfg-filepath ./configs/sweep_perc_50_70.json  --alg-stats --num-iter 10000000 --num-threads-override 5 --distribution-filepath ../dto-test-configs/uniform_set_64_1024.csv --results-dirname perc_sweep --num-dsas 1
+#python sweep_all_test_settable_size4.py --output-type perf --run-name perc-sweep --cfg-filepath ./configs/sweep_perc_60_80.json  --alg-stats --num-iter 10000000 --num-threads-override 10 --distribution-filepath ../dto-test-configs/uniform_set_64_1024.csv --results-dirname perc_sweep --num-dsas 1
+#python sweep_all_test_settable_size4.py --output-type perf --run-name perc-sweep --cfg-filepath ./configs/sweep_perc_60_80.json  --alg-stats --num-iter 10000000 --num-threads-override 15 --distribution-filepath ../dto-test-configs/uniform_set_64_1024.csv --results-dirname perc_sweep --num-dsas 1
+#python sweep_all_test_settable_size4.py --output-type perf --run-name perc-sweep --cfg-filepath ./configs/sweep_perc_60_80.json  --alg-stats --num-iter 10000000 --num-threads-override 20 --distribution-filepath ../dto-test-configs/uniform_set_64_1024.csv --results-dirname perc_sweep --num-dsas 1
+
+#set outside
+#python sweep_all_test_settable_size4.py --output-type perf --run-name perc-sweep --cfg-filepath ./configs/sweep_perc_outside_20_40.json  --alg-stats --num-iter 10000000 --num-threads-override 1 --distribution-filepath ../dto-test-configs/uniform_set_64_1024.csv --results-dirname perc_sweep --num-dsas 1
+#python sweep_all_test_settable_size4.py --output-type perf --run-name perc-sweep --cfg-filepath ./configs/sweep_perc_outside_50_70.json  --alg-stats --num-iter 10000000 --num-threads-override 5 --distribution-filepath ../dto-test-configs/uniform_set_64_1024.csv --results-dirname perc_sweep --num-dsas 1
+#python sweep_all_test_settable_size4.py --output-type perf --run-name perc-sweep --cfg-filepath ./configs/sweep_perc_outside_60_80.json  --alg-stats --num-iter 10000000 --num-threads-override 10 --distribution-filepath ../dto-test-configs/uniform_set_64_1024.csv --results-dirname perc_sweep --num-dsas 1
+#python sweep_all_test_settable_size4.py --output-type perf --run-name perc-sweep --cfg-filepath ./configs/sweep_perc_outside_60_80.json  --alg-stats --num-iter 10000000 --num-threads-override 15 --distribution-filepath ../dto-test-configs/uniform_set_64_1024.csv --results-dirname perc_sweep --num-dsas 1
+#python sweep_all_test_settable_size4.py --output-type perf --run-name perc-sweep --cfg-filepath ./configs/sweep_perc_outside_60_80.json  --alg-stats --num-iter 10000000 --num-threads-override 20 --distribution-filepath ../dto-test-configs/uniform_set_64_1024.csv --results-dirname perc_sweep --num-dsas 1
+
+#Normalized cases
+#cpy
+#python sweep_all_test_settable_size4.py --output-type perf --run-name perc-sweep --cfg-filepath ./configs/sweep_perc_30_50.json  --alg-stats --num-iter 10000000 --num-threads-override 1 --distribution-filepath ../dto-test-configs/uniform_normalized_cpy_64_1024.csv --results-dirname perc_sweep2 --num-dsas 1
+#python sweep_all_test_settable_size4.py --output-type perf --run-name perc-sweep --cfg-filepath ./configs/sweep_perc_60_80.json  --alg-stats --num-iter 10000000 --num-threads-override 5 --distribution-filepath ../dto-test-configs/uniform_normalized_cpy_64_1024.csv --results-dirname perc_sweep2 --num-dsas 1
+#python sweep_all_test_settable_size4.py --output-type perf --run-name perc-sweep --cfg-filepath ./configs/sweep_perc_70_90.json  --alg-stats --num-iter 10000000 --num-threads-override 10 --distribution-filepath ../dto-test-configs/uniform_normalized_cpy_64_1024.csv --results-dirname perc_sweep2 --num-dsas 1
+#python sweep_all_test_settable_size4.py --output-type perf --run-name perc-sweep --cfg-filepath ./configs/sweep_perc_70_90.json  --alg-stats --num-iter 10000000 --num-threads-override 15 --distribution-filepath ../dto-test-configs/uniform_normalized_cpy_64_1024.csv --results-dirname perc_sweep2 --num-dsas 1
+#python sweep_all_test_settable_size4.py --output-type perf --run-name perc-sweep --cfg-filepath ./configs/sweep_perc_75_95.json  --alg-stats --num-iter 10000000 --num-threads-override 20 --distribution-filepath ../dto-test-configs/uniform_normalized_cpy_64_1024.csv --results-dirname perc_sweep2 --num-dsas 1
+
+#cpy outside
+#python sweep_all_test_settable_size4.py --output-type perf --run-name perc-sweep --cfg-filepath ./configs/sweep_perc_outside_30_50.json  --alg-stats --num-iter 10000000 --num-threads-override 1 --distribution-filepath ../dto-test-configs/uniform_normalized_cpy_64_1024.csv --results-dirname perc_sweep2 --num-dsas 1
+#python sweep_all_test_settable_size4.py --output-type perf --run-name perc-sweep --cfg-filepath ./configs/sweep_perc_outside_65_85.json  --alg-stats --num-iter 10000000 --num-threads-override 5 --distribution-filepath ../dto-test-configs/uniform_normalized_cpy_64_1024.csv --results-dirname perc_sweep2 --num-dsas 1
+#python sweep_all_test_settable_size4.py --output-type perf --run-name perc-sweep --cfg-filepath ./configs/sweep_perc_outside_70_90.json  --alg-stats --num-iter 10000000 --num-threads-override 10 --distribution-filepath ../dto-test-configs/uniform_normalized_cpy_64_1024.csv --results-dirname perc_sweep2 --num-dsas 1
+#python sweep_all_test_settable_size4.py --output-type perf --run-name perc-sweep --cfg-filepath ./configs/sweep_perc_outside_70_90.json  --alg-stats --num-iter 10000000 --num-threads-override 15 --distribution-filepath ../dto-test-configs/uniform_normalized_cpy_64_1024.csv --results-dirname perc_sweep2 --num-dsas 1
+#python sweep_all_test_settable_size4.py --output-type perf --run-name perc-sweep --cfg-filepath ./configs/sweep_perc_outside_75_95.json  --alg-stats --num-iter 10000000 --num-threads-override 20 --distribution-filepath ../dto-test-configs/uniform_normalized_cpy_64_1024.csv --results-dirname perc_sweep2 --num-dsas 1
+
+#set
+#python sweep_all_test_settable_size4.py --output-type perf --run-name perc-sweep --cfg-filepath ./configs/sweep_perc_20_40.json  --alg-stats --num-iter 10000000 --num-threads-override 1 --distribution-filepath ../dto-test-configs/uniform_normalized_set_64_1024.csv --results-dirname perc_sweep2 --num-dsas 1
+#python sweep_all_test_settable_size4.py --output-type perf --run-name perc-sweep --cfg-filepath ./configs/sweep_perc_50_70.json  --alg-stats --num-iter 10000000 --num-threads-override 5 --distribution-filepath ../dto-test-configs/uniform_normalized_set_64_1024.csv --results-dirname perc_sweep2 --num-dsas 1
+#python sweep_all_test_settable_size4.py --output-type perf --run-name perc-sweep --cfg-filepath ./configs/sweep_perc_55_75.json  --alg-stats --num-iter 10000000 --num-threads-override 10 --distribution-filepath ../dto-test-configs/uniform_normalized_set_64_1024.csv --results-dirname perc_sweep2 --num-dsas 1
+#python sweep_all_test_settable_size4.py --output-type perf --run-name perc-sweep --cfg-filepath ./configs/sweep_perc_60_80.json  --alg-stats --num-iter 10000000 --num-threads-override 15 --distribution-filepath ../dto-test-configs/uniform_normalized_set_64_1024.csv --results-dirname perc_sweep2 --num-dsas 1
+#python sweep_all_test_settable_size4.py --output-type perf --run-name perc-sweep --cfg-filepath ./configs/sweep_perc_60_80.json  --alg-stats --num-iter 10000000 --num-threads-override 20 --distribution-filepath ../dto-test-configs/uniform_normalized_set_64_1024.csv --results-dirname perc_sweep2 --num-dsas 1
+
+#set outside
+#python sweep_all_test_settable_size4.py --output-type perf --run-name perc-sweep --cfg-filepath ./configs/sweep_perc_outside_20_40.json  --alg-stats --num-iter 10000000 --num-threads-override 1 --distribution-filepath ../dto-test-configs/uniform_normalized_set_64_1024.csv --results-dirname perc_sweep2 --num-dsas 1
+#python sweep_all_test_settable_size4.py --output-type perf --run-name perc-sweep --cfg-filepath ./configs/sweep_perc_outside_50_70.json  --alg-stats --num-iter 10000000 --num-threads-override 5 --distribution-filepath ../dto-test-configs/uniform_normalized_set_64_1024.csv --results-dirname perc_sweep2 --num-dsas 1
+#python sweep_all_test_settable_size4.py --output-type perf --run-name perc-sweep --cfg-filepath ./configs/sweep_perc_outside_55_75.json  --alg-stats --num-iter 10000000 --num-threads-override 10 --distribution-filepath ../dto-test-configs/uniform_normalized_set_64_1024.csv --results-dirname perc_sweep2 --num-dsas 1
+#python sweep_all_test_settable_size4.py --output-type perf --run-name perc-sweep --cfg-filepath ./configs/sweep_perc_outside_60_80.json  --alg-stats --num-iter 10000000 --num-threads-override 15 --distribution-filepath ../dto-test-configs/uniform_normalized_set_64_1024.csv --results-dirname perc_sweep2 --num-dsas 1
+#python sweep_all_test_settable_size4.py --output-type perf --run-name perc-sweep --cfg-filepath ./configs/sweep_perc_outside_60_80.json  --alg-stats --num-iter 10000000 --num-threads-override 20 --distribution-filepath ../dto-test-configs/uniform_normalized_set_64_1024.csv --results-dirname perc_sweep2 --num-dsas 1
+
+#python sweep_all_test_settable_size4.py --output-type perf --run-name perc-sweep --cfg-filepath ./configs/junk_74.json  --alg-stats --num-iter 10000000 --num-threads-override 20 --distribution-filepath ../dto-test-configs/uniform_set_64_1024.csv --results-dirname perc_sweep --num-dsas 1
+#python sweep_all_test_settable_size4.py --output-type perf --run-name perc-sweep --cfg-filepath ./configs/junk_74.json  --alg-stats --num-iter 10000000 --num-threads-override 20 --distribution-filepath ../dto-test-configs/uniform_normalized_set_64_1024.csv --results-dirname perc_sweep2 --num-dsas 1
+
+# numa convergence
+# cpy
+#python sweep_numa_cases_test_settable_size4.py --output-type DTO_python --run-name convergence --cfg-filepath ./configs/distribution_auto_cpy.json  --alg-stats --num-iter 1000000 --num-threads-override 1 --distribution-filepath ../dto-test-configs/uniform_cpy_64_1024.csv --results-dirname numa_convergence --num-dsas 1 --exclude-nodsa
+#python sweep_numa_cases_test_settable_size4.py --output-type DTO_python --run-name convergence --cfg-filepath ./configs/distribution_auto_cpy.json  --alg-stats --num-iter 1000000 --num-threads-override 5 --distribution-filepath ../dto-test-configs/uniform_cpy_64_1024.csv --results-dirname numa_convergence --num-dsas 1 --exclude-nodsa
+#python sweep_numa_cases_test_settable_size4.py --output-type DTO_python --run-name convergence --cfg-filepath ./configs/distribution_auto_cpy.json  --alg-stats --num-iter 1000000 --num-threads-override 10 --distribution-filepath ../dto-test-configs/uniform_cpy_64_1024.csv --results-dirname numa_convergence --num-dsas 1 --exclude-nodsa
+#python sweep_numa_cases_test_settable_size4.py --output-type DTO_python --run-name convergence --cfg-filepath ./configs/distribution_auto_cpy.json  --alg-stats --num-iter 1000000 --num-threads-override 15 --distribution-filepath ../dto-test-configs/uniform_cpy_64_1024.csv --results-dirname numa_convergence --num-dsas 1 --exclude-nodsa
+#python sweep_numa_cases_test_settable_size4.py --output-type DTO_python --run-name convergence --cfg-filepath ./configs/distribution_auto_cpy.json  --alg-stats --num-iter 1000000 --num-threads-override 20 --distribution-filepath ../dto-test-configs/uniform_cpy_64_1024.csv --results-dirname numa_convergence --num-dsas 1 --exclude-nodsa
+
+# set
+#python sweep_numa_cases_test_settable_size4.py --output-type DTO_python --run-name convergence --cfg-filepath ./configs/distribution_auto_set.json  --alg-stats --num-iter 1000000 --num-threads-override 1 --distribution-filepath ../dto-test-configs/uniform_set_64_1024.csv --results-dirname numa_convergence --num-dsas 1 --exclude-nodsa
+#python sweep_numa_cases_test_settable_size4.py --output-type DTO_python --run-name convergence --cfg-filepath ./configs/distribution_auto_set.json  --alg-stats --num-iter 1000000 --num-threads-override 5 --distribution-filepath ../dto-test-configs/uniform_set_64_1024.csv --results-dirname numa_convergence --num-dsas 1 --exclude-nodsa
+#python sweep_numa_cases_test_settable_size4.py --output-type DTO_python --run-name convergence --cfg-filepath ./configs/distribution_auto_set.json  --alg-stats --num-iter 1000000 --num-threads-override 10 --distribution-filepath ../dto-test-configs/uniform_set_64_1024.csv --results-dirname numa_convergence --num-dsas 1 --exclude-nodsa
+#python sweep_numa_cases_test_settable_size4.py --output-type DTO_python --run-name convergence --cfg-filepath ./configs/distribution_auto_set.json  --alg-stats --num-iter 1000000 --num-threads-override 15 --distribution-filepath ../dto-test-configs/uniform_set_64_1024.csv --results-dirname numa_convergence --num-dsas 1 --exclude-nodsa
+#python sweep_numa_cases_test_settable_size4.py --output-type DTO_python --run-name convergence --cfg-filepath ./configs/distribution_auto_set.json  --alg-stats --num-iter 1000000 --num-threads-override 20 --distribution-filepath ../dto-test-configs/uniform_set_64_1024.csv --results-dirname numa_convergence --num-dsas 1 --exclude-nodsa
+
+#python sweep_all_test_settable_size4.py --output-type perf --run-name perc-sweep-512K-wq4 --cfg-filepath ./configs/sweep_perc_threads_512K.json  --alg-stats  --num-dsas 1 --results-dirname sweep_perc_threads_512K_wq4
+
+#python sweep_all_test_settable_size4.py --output-type perf --run-name perc-sweep-wq-128 --cfg-filepath ./configs/sweep_perc_threads_512K.json  --alg-stats  --num-dsas 1 --distribution-filepath ../dto-test-configs/uniform_cpy_64_100.csv 
+
+#python sweep_all_test_settable_size4.py --output-type DTO_python --run-name convergence --cfg-filepath ./configs/single_size_auto_busypoll_cpy.json  --alg-stats --num-iter 1000000 --results-dirname convergence_poll_15_wq128 --num-dsas 1
+#python sweep_all_test_settable_size4.py --output-type DTO_python --run-name convergence --cfg-filepath ./configs/single_size_auto_busypoll_cpy.json  --alg-stats --num-iter 1000000 --distribution-filepath ../dto-test-configs/uniform_cpy_64_1024.csv --results-dirname convergence_poll_15_wq128 --num-dsas 1
+#
+#python sweep_all_test_settable_size5.py --output-type perf --run-name bursty_wq128 --cfg-filepath ./configs/sweep_perc_threads_burst_dist.json  --alg-stats  --num-iter 100000000 --num-dsas 1 --distribution-filepath ../dto-test-configs/uniform_cpy_64_100.csv --results-dirname sweepalltest5_bursty_wq128_perf_042125_180112
+#sudo ../config_dsa_8.sh
+#sleep 20
+#python sweep_all_test_settable_size5.py --output-type perf --run-name bursty_wq128 --cfg-filepath ./configs/sweep_perc_threads_burst_dist2.json  --alg-stats  --num-iter 100000000 --num-dsas 1 --distribution-filepath ../dto-test-configs/uniform_cpy_64_100.csv --results-dirname sweepalltest5_bursty_wq128_perf_042125_180112
+#sudo ../config_dsa_1_small.sh
+#sleep 20
+#python sweep_all_test_settable_size5.py --output-type perf --run-name bursty_wq1 --cfg-filepath ./configs/sweep_perc_threads_burst_dist2.json  --alg-stats  --num-iter 100000000 --num-dsas 1 --distribution-filepath ../dto-test-configs/uniform_cpy_64_100.csv --results-dirname sweepalltest5_bursty_wq1_perf_042225_073258
+
+#python sweep_all_test_settable_size6.py --output-type perf --run-name sweep-delays_wq128 --cfg-filepath ./configs/sweep_threads_delays_dist.json  --alg-stats  --num-iter 10000000 --num-dsas 1 --distribution-filepath ../dto-test-configs/uniform_cpy_64_100.csv --results-dirname sweep_delays_wq128 
+#python sweep_all_test_settable_size5.py --output-type perf --run-name bursty-algstatstest_wq128 --cfg-filepath ./configs/junk.json  --alg-stats  --num-iter 100000000 --num-dsas 1 --distribution-filepath ../dto-test-configs/uniform_cpy_64_100.csv --dry-run
+#python sweep_all_test_settable_size5.py --output-type perf --run-name bursty-nostatstest_wq128 --cfg-filepath ./configs/junk.json  --no-stats  --num-iter 100000000 --num-dsas 1 --distribution-filepath ../dto-test-configs/uniform_cpy_64_100.csv
+
+#sudo ../config_dsa_1_small.sh
+
+#python sweep_all_test_settable_size5.py --output-type perf --run-name bursty-small-wq1 --cfg-filepath ./configs/sweep_perc_threads_burst_dist_small1a.json  --alg-stats  --num-iter 100000000 --num-dsas 1 --distribution-filepath ../dto-test-configs/uniform_cpy_64_100.csv  --results-dirname bursty_small_wq1
+
+#sudo ../config_dsa_1_small.sh
+#python sweep_all_test_settable_size5.py --output-type perf --run-name bursty-small-wq1 --cfg-filepath ./configs/sweep_perc_threads_burst_dist_small1.json  --alg-stats  --num-iter 100000000 --num-dsas 1 --distribution-filepath ../dto-test-configs/uniform_cpy_64_100.csv  --results-dirname bursty_small_wq1
+
+#sudo ../config_dsa_8.sh
+
+#python sweep_all_test_settable_size5.py --output-type perf --run-name bursty-small-wq128 --cfg-filepath ./configs/sweep_perc_threads_burst_dist_small1.json  --alg-stats  --num-iter 100000000 --num-dsas 1 --distribution-filepath ../dto-test-configs/uniform_cpy_64_100.csv  --results-dirname bursty_small_wq128
+
+#python sweep_all_test_settable_size5.py --output-type perf --run-name bursty-small-nostats-wq128 --cfg-filepath ./configs/junk.json  --no-stats  --num-iter 10000000 --num-dsas 1 --distribution-filepath ../dto-test-configs/uniform_cpy_64_100.csv  --results-dirname bursty_small_wq128_nostats
+
+#finish the step sweep on wq 128
+#python sweep_all_test_settable_size6.py --output-type perf --run-name sweep-delays_wq128 --cfg-filepath ./configs/sweep_threads_delays_dist_delta.json  --alg-stats  --num-iter 10000000 --num-dsas 1 --distribution-filepath ../dto-test-configs/uniform_cpy_64_100.csv --results-dirname sweep_delays_wq128
+#redo the ramps on wq 128
+#python sweep_all_test_settable_size6.py --output-type perf --run-name ramp_wq128 --cfg-filepath ./configs/sweep_threads_ramp_dist.json  --alg-stats  --num-iter 10000000 --num-dsas 1 --distribution-filepath ../dto-test-configs/uniform_cpy_64_100.csv --results-dirname ramp_wq128
+#sudo ../config_dsa_1_small.sh
+#step sweep on wq 11
+#python sweep_all_test_settable_size6.py --output-type perf --run-name sweep-delays_wq1 --cfg-filepath ./configs/sweep_threads_delays_dist.json  --alg-stats  --num-iter 10000000 --num-dsas 1 --distribution-filepath ../dto-test-configs/uniform_cpy_64_100.csv --results-dirname sweep_delays_wq1
+#redo the ramps on wq 128
+#python sweep_all_test_settable_size6.py --output-type perf --run-name sweep-delays --cfg-filepath ./configs/sweep_threads_ramp_dist.json  --alg-stats  --num-iter 10000000 --num-dsas 1 --distribution-filepath ../dto-test-configs/uniform_cpy_64_100.csv --results-dirname sweep_delays
+
+#python sweep_all_test_settable_size6.py --output-type perf --run-name sweep-delays2_wq1 --cfg-filepath ./configs/sweep_threads_delays_dist2.json  --alg-stats  --num-iter 10000000 --num-dsas 1 --distribution-filepath ../dto-test-configs/uniform_cpy_64_100.csv --results-dirname sweep_delays2_wq1
+
+
+#python sweep_all_test_settable_size5.py --output-type perf --run-name bursty-small-wq128 --cfg-filepath ./configs/sweep_perc_threads_burst_dist_small2.json  --alg-stats  --num-iter 10000000 --num-dsas 1 --distribution-filepath ../dto-test-configs/uniform_cpy_64_1024.csv  --results-dirname bursty_small_64_1024_wq128
+
+#python sweep_all_test_settable_size5.py --output-type perf --run-name bursty-small-set-wq128 --cfg-filepath ./configs/sweep_perc_threads_burst_dist_small1.json  --alg-stats  --num-iter 10000000 --num-dsas 1 --distribution-filepath ../dto-test-configs/uniform_set_64_1024.csv  --results-dirname bursty_small_64_1024_set_wq128
+
+
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-perc-uniform-stats_wq128 --cfg-filepath ./configs/auto_dist.json  --alg-stats --num-iter 10000000 --num-dsas 1 --results-dirname sweep_perc_longer_wq128 --distribution-filepath ../dto-test-configs/uniform_cpy_64_1024.csv
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-perc-uniform_wq128 --cfg-filepath ./configs/sweep_perc_dist.json  --no-stats --num-iter 10000000 --num-dsas 1 --results-dirname sweep_perc_longer_wq128 --distribution-filepath ../dto-test-configs/uniform_cpy_64_1024.csv
+
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-size-perc_wq128 --cfg-filepath ./configs/sweep_sizes_auto.json  --alg-stats --num-iter 10000000 --num-dsas 1 --results-dirname sweep_perc_longer_wq128
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-size-perc_wq128 --cfg-filepath ./configs/sweep_sizes_perc.json  --no-stats --num-iter 10000000 --num-dsas 1 --results-dirname sweep_perc_longer_wq128 
+
+
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-perc-uniform_wq128 --cfg-filepath ./configs/sweep_perc_dist2.json  --alg-stats --num-iter 10000000 --num-dsas 1 --results-dirname sweep_perc_dsa_numa1_wq128 --distribution-filepath ../dto-test-configs/uniform_cpy_64_1024.csv
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-size-perc_wq128 --cfg-filepath ./configs/sweep_sizes_perc2.json  --alg-stats --num-iter 10000000 --num-dsas 1 --results-dirname sweep_perc_dsa_numa1_wq128 
+
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-perc-uniform_wq128 --cfg-filepath ./configs/sweep_perc_dist2.json  --alg-stats --num-iter 10000000 --num-dsas 8 --results-dirname sweep_perc_alldsas_wq128 --distribution-filepath ../dto-test-configs/uniform_cpy_64_1024.csv
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-size-perc_wq128 --cfg-filepath ./configs/sweep_sizes_perc2.json  --alg-stats --num-iter 10000000 --num-dsas 8 --results-dirname sweep_perc_alldsas_wq128 
+
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-perc-uniform_wq128 --cfg-filepath ./configs/sweep_perc_dist2.json  --alg-stats --num-iter 10000000 --num-dsas 1 --results-dirname sweep_perc_dsa_numa0_wq128 --distribution-filepath ../dto-test-configs/uniform_cpy_64_1024.csv
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-size-perc_wq128 --cfg-filepath ./configs/sweep_sizes_perc2.json  --alg-stats --num-iter 10000000 --num-dsas 1 --results-dirname sweep_perc_dsa_numa0_wq128 
+
+#python sweep_all_test_settable_size5.py --output-type perf --run-name bursty-small-cpy-set-wq128 --cfg-filepath ./configs/sweep_perc_threads_burst_dist_small1.json  --alg-stats  --num-iter 10000000 --num-dsas 1 --distribution-filepath ../dto-test-configs/uniform_cpy_set_64_1024.csv  --results-dirname bursty_small_64_1024_cpy_set_wq128
+
+#sudo ../config_dsa_1_small.sh
+
+#python sweep_all_test_settable_size5.py --output-type perf --run-name bursty-small-set-wq1 --cfg-filepath ./configs/sweep_perc_threads_burst_dist_small1.json  --alg-stats  --num-iter 10000000 --num-dsas 1 --distribution-filepath ../dto-test-configs/uniform_set_64_1024.csv  --results-dirname bursty_small_64_1024_set_wq1
+
+#python sweep_all_test_settable_size5.py --output-type perf --run-name bursty-small-cpy-set-wq1 --cfg-filepath ./configs/sweep_perc_threads_burst_dist_small1.json  --alg-stats  --num-iter 10000000 --num-dsas 1 --distribution-filepath ../dto-test-configs/uniform_cpy_set_64_1024.csv  --results-dirname bursty_small_64_1024_cpy_set_wq1
+
+
+
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-perc_wq1 --cfg-filepath ./configs/sweep_perc_threads_1024K.json  --alg-stats --num-iter 10000000 --num-dsas 1 --results-dirname sweep_threads_perc_uniform_set_wq1 --distribution-filepath ../dto-test-configs/uniform_set_64_1024.csv
+
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-perc_wq1 --cfg-filepath ./configs/sweep_perc_threads_1024K.json  --alg-stats --num-iter 10000000 --num-dsas 1 --results-dirname sweep_threads_perc_uniform_cpy_set_wq1 --distribution-filepath ../dto-test-configs/uniform_cpy_set_64_1024.csv
+
+#sudo ../config_dsa_8.sh
+
+
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-perc_wq128 --cfg-filepath ./configs/sweep_perc_threads_1024K.json  --alg-stats --num-iter 10000000 --num-dsas 1 --results-dirname sweep_threads_perc_uniform_set_wq128 --distribution-filepath ../dto-test-configs/uniform_set_64_1024.csv
+
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-perc_wq128 --cfg-filepath ./configs/sweep_perc_threads_1024K.json  --alg-stats --num-iter 10000000 --num-dsas 1 --results-dirname sweep_threads_perc_uniform_cpy_set_wq128 --distribution-filepath ../dto-test-configs/uniform_cpy_set_64_1024.csv
+
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-size-perc3_wq128 --cfg-filepath ./configs/sweep_sizes_perc3.json  --alg-stats --num-iter 10000000 --num-dsas 1 --results-dirname sweep_perc_dsas_numa0_wq128 
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-size-perc3_wq128 --cfg-filepath ./configs/sweep_sizes_perc3.json  --alg-stats --num-iter 10000000 --num-dsas 8 --results-dirname sweep_perc_alldsas_wq128 
+
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-perc-uniform_wq128 --cfg-filepath ./configs/sweep_perc_dist2.json  --alg-stats --num-iter 10000000 --num-dsas 1 --results-dirname sweep_perc_dsa_numa1_dist256_wq128 --distribution-filepath ../dto-test-configs/uniform_cpy_256_test.csv
+
+#sudo ../config_dsa_1_numa1.sh
+
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-size-perc3_wq128 --cfg-filepath ./configs/sweep_sizes_perc3.json  --alg-stats --num-iter 10000000 --num-dsas 1 --results-dirname sweep_perc_dsas_numa1_wq128 
+
+#sudo ../config_dsa_8.sh
+
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-size-perc_wq128 --cfg-filepath ./configs/sweep_sizes_perc.json  --alg-stats --num-iter 1000000 --num-dsas 1 --results-dirname sweep_sizes_perc_wq128
+
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-size-perc_wq128 --cfg-filepath ./configs/sweep_threads_sizes_perc.json  --alg-stats --num-iter 10000000 --num-dsas 1 --results-dirname sweep_threads_sizes_perc_set_wq128
+
+#python sweep_all_test_settable_size5.py --output-type DTO_python --run-name pagefaults-1 --cfg-filepath ./configs/test_page_fault_1.json  --alg-stats --num-iter 300000 --num-dsas 1 --results-dirname sweep_page_faults_1
+#python sweep_all_test_settable_size5.py --output-type DTO_python --run-name pagefaults-2 --cfg-filepath ./configs/test_page_fault_2.json  --alg-stats --num-iter 300000 --num-dsas 1 --results-dirname sweep_page_faults_2
+
+#python sweep_all_test_settable_size5-2.py --output-type DTO-python --run-name sweep-size-alloc --cfg-filepath ./configs/sweep_sizes_perc_allocs.json  --alg-stats --num-iter 1000000 --num-dsas 1 --results-dirname sweep_sizes_alloc_nohugepages
+#python sweep_all_test_settable_size5-2.py --output-type DTO-python --run-name sweep-size-alloc --cfg-filepath ./configs/sweep_sizes_perc_allocs.json  --alg-stats --num-iter 1000000 --num-dsas 1 --results-dirname sweep_sizes_alloc_withhugepages
+#python sweep_all_test_settable_size5-2.py --output-type DTO-python --run-name sweep-size-alloc --cfg-filepath ./configs/sweep_sizes_perc_allocs.json  --alg-stats --num-iter 10000000 --num-dsas 1 --results-dirname sweep_sizes_alloc_withhugepages_long
+#python sweep_all_test_settable_size5-2.py --output-type DTO-python --run-name sweep-size-alloc --cfg-filepath ./configs/sweep_sizes_perc_allocs.json  --alg-stats --num-iter 10000000 --num-dsas 1 --results-dirname sweep_sizes_alloc_nohugepages_long
+
+
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-size-perc_wq128 --cfg-filepath ./configs/sweep_threads_sizes_perc_cpy_set.json  --alg-stats --num-iter 5000000 --num-dsas 1 --results-dirname sweep_threads_sizes_perc_cpy_set_wq128
+
+
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-size-perc_wq1 --cfg-filepath ./configs/sweep_threads_sizes_perc.json  --alg-stats --num-iter 10000000 --num-dsas 1 --results-dirname sweep_threads_sizes_perc_set_wq1
+
+# start here
+#sudo ../config_dsa_1_small.sh
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-size-perc_wq1 --cfg-filepath ./configs/sweep_threads_sizes_perc_cpy_set.json  --alg-stats --num-iter 5000000 --num-dsas 1 --results-dirname sweep_threads_sizes_perc_cpy_set_wq1
+
+
+
+#sudo ../config_dsa_8.sh
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-size-perc_wq128 --cfg-filepath ./configs/sweep_threads_sizes_perc_mov.json  --alg-stats --num-iter 10000000 --num-dsas 1 --results-dirname sweep_threads_sizes_perc_mov_wq128
+
+#sudo ../config_dsa_1_small.sh
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-size-perc_wq1 --cfg-filepath ./configs/sweep_threads_sizes_perc_mov.json  --alg-stats --num-iter 10000000 --num-dsas 1 --results-dirname sweep_threads_sizes_perc_mov_wq1
+
+
+#sudo ../config_dsa_8.sh
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-size-perc_wq128 --cfg-filepath ./configs/sweep_threads_sizes_perc_cpy.json  --alg-stats --num-iter 10000000 --num-dsas 1 --results-dirname sweep_threads_sizes_perc_cpy_wq128
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-size-perc_wq128 --cfg-filepath ./configs/junk.json  --alg-stats --num-iter 10000000 --num-dsas 1 --results-dirname sweep_threads_sizes_perc_cpy_wq128_redo
+
+#sudo ../config_dsa_1_small.sh
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-size-perc_wq1 --cfg-filepath ./configs/sweep_threads_sizes_perc_cpy.json  --alg-stats --num-iter 10000000 --num-dsas 1 --results-dirname sweep_threads_sizes_perc_cpy_wq1
+
+#sudo ../config_dsa_8.sh
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-size-perc_wq128 --cfg-filepath ./configs/sweep_threads_sizes_perc_combinations_short.json  --alg-stats --num-iter 10000000 --stats-warmup-steps 300000 --exclude-pfs --per-op-instances --num-dsas 1 --results-dirname sweep_threads_sizes_perc_comb_wq128 
+
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-size-perc_wq128 --cfg-filepath ./configs/sweep_threads_sizes_perc_combinations.json  --alg-stats --num-iter 10000000 --stats-warmup-steps 300000 --exclude-pfs --per-op-instances --num-dsas 1 --results-dirname sweep_threads_sizes_perc_comb_wq128 
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-size-perc_wq128 --cfg-filepath ./configs/sweep_threads_sizes_perc_cpy2.json  --alg-stats --num-iter 10000000 --stats-warmup-steps 300000 --exclude-pfs --num-dsas 1 --results-dirname sweep_threads_sizes_perc_cpy_wq128_2
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-size-perc_wq128 --cfg-filepath ./configs/sweep_threads_sizes_perc_set2.json  --alg-stats --num-iter 10000000 --stats-warmup-steps 300000 --exclude-pfs --num-dsas 1 --results-dirname sweep_threads_sizes_perc_set_wq128_2
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-size-perc_wq128 --cfg-filepath ./configs/sweep_threads_sizes_perc_mov2.json  --alg-stats --num-iter 10000000 --stats-warmup-steps 300000 --exclude-pfs --num-dsas 1 --results-dirname sweep_threads_sizes_perc_mov_wq128_2
+
+#sudo ../config_dsa_1_small.sh
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-size-perc_wq1 --cfg-filepath ./configs/sweep_threads_sizes_perc_combinations.json  --alg-stats --num-iter 10000000 --stats-warmup-steps 300000 --exclude-pfs --per-op-instances --num-dsas 1 --results-dirname sweep_threads_sizes_perc_comb_wq1 
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-size-perc_wq1 --cfg-filepath ./configs/sweep_threads_sizes_perc_cpy2.json  --alg-stats --num-iter 10000000 --stats-warmup-steps 300000 --exclude-pfs --num-dsas 1 --results-dirname sweep_threads_sizes_perc_cpy_wq1_2
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-size-perc_wq1 --cfg-filepath ./configs/sweep_threads_sizes_perc_set2.json  --alg-stats --num-iter 10000000 --stats-warmup-steps 300000 --exclude-pfs --num-dsas 1 --results-dirname sweep_threads_sizes_perc_set_wq1_2
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-size-perc_wq1 --cfg-filepath ./configs/sweep_threads_sizes_perc_mov2.json  --alg-stats --num-iter 10000000 --stats-warmup-steps 300000 --exclude-pfs --num-dsas 1 --results-dirname sweep_threads_sizes_perc_mov_wq1_2
+
+#python sweep_all_test_settable_size5.py --output-type perf --run-name separate-procs_wq128 --cfg-filepath ./configs/junk.json  --alg-stats --num-iter 10000000 --num-dsas 1 --results-dirname seperate_proc_cpy_wq128 --separate-processes
+
+
+#python sweep_all_test_settable_size5.py --output-type perf --run-name mov-overlapping-25_wq128 --cfg-filepath ./configs/junk2.json  --alg-stats --num-iter 10000000 --num-dsas 1 --results-dirname mov_overlapping_wq128 --perc-buffer-overlap 25
+#python sweep_all_test_settable_size5.py --output-type perf --run-name mov-overlapping-50_wq128 --cfg-filepath ./configs/junk2.json  --alg-stats --num-iter 10000000 --num-dsas 1 --results-dirname mov_overlapping_wq128 --perc-buffer-overlap 50
+#python sweep_all_test_settable_size5.py --output-type perf --run-name mov-overlapping-75_wq128 --cfg-filepath ./configs/junk2.json  --alg-stats --num-iter 10000000 --num-dsas 1 --results-dirname mov_overlapping_wq128 --perc-buffer-overlap 75
+
+#sudo ../config_dsa_4_numa1.sh
+#python sweep_all_test_settable_size5.py --output-type perf --run-name mov-overlapping-0_wq128 --cfg-filepath ./configs/junk2.json  --alg-stats --num-iter 10000000 --num-dsas 1 --results-dirname mov_overlapping_dsasamenuma_wq128 --perc-buffer-overlap 0
+#python sweep_all_test_settable_size5.py --output-type perf --run-name mov-overlapping-25_wq128 --cfg-filepath ./configs/junk2.json  --alg-stats --num-iter 10000000 --num-dsas 1 --results-dirname mov_overlapping_dsasamenuma_wq128 --perc-buffer-overlap 25
+#python sweep_all_test_settable_size5.py --output-type perf --run-name mov-overlapping-50_wq128 --cfg-filepath ./configs/junk2.json  --alg-stats --num-iter 10000000 --num-dsas 1 --results-dirname mov_overlapping_dsasamenuma_wq128 --perc-buffer-overlap 50
+#python sweep_all_test_settable_size5.py --output-type perf --run-name mov-overlapping-75_wq128 --cfg-filepath ./configs/junk2.json  --alg-stats --num-iter 10000000 --num-dsas 1 --results-dirname mov_overlapping_dsasamenuma_wq128 --perc-buffer-overlap 75
+
+#sudo ../config_dsa_8.sh
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-size-perc-bufsize_wq128 --cfg-filepath ./configs/sweep_threads_sizes_perc_bufsizes_cpy_mov.json  --alg-stats --num-iter 10000000 --num-dsas 1 --results-dirname sweep_threads_sizes_perc_bufsizes_cpy_mov_wq128
+
+#python sweep_all_test_settable_size5.py --output-type perf --run-name mov-overlapping-25_wq128 --cfg-filepath ./configs/junk2.json  --alg-stats --num-iter 10000000 --num-dsas 1 --results-dirname mov_overlapping_bufsizes_wq128 --perc-buffer-overlap 25
+#python sweep_all_test_settable_size5.py --output-type perf --run-name mov-overlapping-50_wq128 --cfg-filepath ./configs/junk2.json  --alg-stats --num-iter 10000000 --num-dsas 1 --results-dirname mov_overlapping_bufsizes_wq128 --perc-buffer-overlap 50
+#python sweep_all_test_settable_size5.py --output-type perf --run-name mov-overlapping-75_wq128 --cfg-filepath ./configs/junk2.json  --alg-stats --num-iter 10000000 --num-dsas 1 --results-dirname mov_overlapping_bufsizes_wq128 --perc-buffer-overlap 75
+
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-threads_wq128 --cfg-filepath ./configs/sweep_threads_sizes3.json  --alg-stats --num-iter 10000000 --stats-warmup-steps 300000 --exclude-pfs --num-dsas 1 --results-dirname sweep_threads_small_wq128 
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-procs_wq128 --cfg-filepath ./configs/sweep_threads_sizes3.json  --alg-stats --num-iter 10000000 --stats-warmup-steps 300000 --exclude-pfs --num-dsas 1 --results-dirname sweep_procs_small_wq128 --separate-processes
+
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-threads_wq128 --cfg-filepath ./configs/sweep_threads_sizes_perc_combinations2.json --per-op-instances  --alg-stats --num-iter 10000000 --stats-warmup-steps 300000 --exclude-pfs --num-dsas 1 --results-dirname sweep_threads_comb_small_wq128 
+
+#sudo ../config_dsa_1_small.sh
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-threads_wq1 --cfg-filepath ./configs/sweep_threads_sizes3.json  --alg-stats --num-iter 10000000 --stats-warmup-steps 300000 --exclude-pfs --num-dsas 1 --results-dirname sweep_threads_small_wq1 
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-threads_wq1 --cfg-filepath ./configs/sweep_threads_sizes_perc_combinations2.json --per-op-instances --alg-stats --num-iter 10000000 --stats-warmup-steps 300000 --exclude-pfs --num-dsas 1 --results-dirname sweep_threads_small_wq1 
+
+#python sweep_all_test_settable_size5.py --output-type perf --run-name mov-overlapping-50_wq128 --cfg-filepath ./configs/junk2.json  --alg-stats --num-iter 10000000 --num-dsas 1 --results-dirname mov_overlapping_weird_wq128 --perc-buffer-overlap 50
+
+#python sweep_all_test_settable_size5.py --output-type perf --run-name mov-overlapping-50_wq128 --cfg-filepath ./configs/junk3.json  --alg-stats --num-iter 10000 --num-dsas 1  --perc-buffer-overlap 50 --overlap-probability 50 --dry-run
+
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-procs_wq128 --cfg-filepath ./configs/junk4.json  --alg-stats --num-iter 10000000 --stats-warmup-steps 300000 --exclude-pfs --num-dsas 1 --results-dirname sweep_procs_small_wq128_rest --separate-processes
+
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-procs_wq128 --cfg-filepath ./configs/junk4.json  --alg-stats --num-iter 10000000 --stats-warmup-steps 300000 --exclude-pfs --num-dsas 1 --results-dirname cpy_512K_1thread_wq128
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-procs_wq128 --cfg-filepath ./configs/junk4.json  --alg-stats --num-iter 10000000 --stats-warmup-steps 300000 --exclude-pfs --num-dsas 1 --results-dirname cpy_256K_1thread_wq128
+
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-procs_wq128 --cfg-filepath ./configs/junk4.json  --alg-stats --num-iter 10000000 --stats-warmup-steps 300000 --exclude-pfs --num-dsas 1 --results-dirname cpy_128K_1024K_1thread_wq128
+
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-threads_wq128 --cfg-filepath ./configs/sweep_perc_threads_dist.json  --alg-stats --num-iter 10000000 --stats-warmup-steps 300000 --exclude-pfs --num-dsas 1 --results-dirname uniform_64_1024_wq128 --distribution-filepath ../dto-test-configs/uniform_set_64_1024.csv
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-threads_wq128 --cfg-filepath ./configs/sweep_perc_threads_dist.json  --alg-stats --num-iter 10000000 --stats-warmup-steps 300000 --exclude-pfs --num-dsas 1 --results-dirname uniform_64_1024_wq128 --distribution-filepath ../dto-test-configs/uniform_cpy_64_1024.csv
+
+#python sweep_all_test_settable_size5.py --output-type perf --run-name test-min-size_wq128 --cfg-filepath ./configs/junk.json  --alg-stats --num-iter 10000000 --stats-warmup-steps 300000 --exclude-pfs --num-dsas 1 --results-dirname test_min_size_adj
+
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-size-perc-bufsize_wq128 --cfg-filepath ./configs/sweep_threads_sizes_perc_bufsizes_set.json  --alg-stats --num-iter 10000000 --num-dsas 1 --results-dirname sweep_threads_sizes_perc_bufsizes_set_wq128
+
+
+
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-mov-overlaps_wq128_10 --cfg-filepath ./configs/sweep_sizes_bufsizes_mov_overlaps2.json  --perc-buffer-overlap 10 --overlap-probability 100 --alg-stats --num-iter 10000000 --stats-warmup-steps 300000 --exclude-pfs --num-dsas 1 --results-dirname sweep_move_overlaps_sizes_bufsizes_wq128_2 --overlapping-move-action dsa
+
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-mov-overlaps_wq128_00 --cfg-filepath ./configs/sweep_sizes_bufsizes_mov_overlaps.json  --overlap-probability 0 --alg-stats --num-iter 10000000 --stats-warmup-steps 300000 --exclude-pfs --num-dsas 1 --results-dirname sweep_move_overlaps_sizes_bufsizes_wq128
+
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-mov-overlaps_wq128_20 --cfg-filepath ./configs/sweep_sizes_bufsizes_mov_overlaps2.json  --perc-buffer-overlap 20 --overlap-probability 100 --alg-stats --num-iter 10000000 --stats-warmup-steps 300000 --exclude-pfs --num-dsas 1 --results-dirname sweep_move_overlaps_sizes_bufsizes_wq128_2 --overlapping-move-action dsa
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-mov-overlaps_wq128_30 --cfg-filepath ./configs/sweep_sizes_bufsizes_mov_overlaps2.json  --perc-buffer-overlap 30 --overlap-probability 100 --alg-stats --num-iter 10000000 --stats-warmup-steps 300000 --exclude-pfs --num-dsas 1 --results-dirname sweep_move_overlaps_sizes_bufsizes_wq128_2 --overlapping-move-action dsa
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-mov-overlaps_wq128_40 --cfg-filepath ./configs/sweep_sizes_bufsizes_mov_overlaps2.json  --perc-buffer-overlap 40 --overlap-probability 100 --alg-stats --num-iter 10000000 --stats-warmup-steps 300000 --exclude-pfs --num-dsas 1 --results-dirname sweep_move_overlaps_sizes_bufsizes_wq128_2 --overlapping-move-action dsa
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-mov-overlaps_wq128_50 --cfg-filepath ./configs/sweep_sizes_bufsizes_mov_overlaps2.json  --perc-buffer-overlap 50 --overlap-probability 100 --alg-stats --num-iter 10000000 --stats-warmup-steps 300000 --exclude-pfs --num-dsas 1 --results-dirname sweep_move_overlaps_sizes_bufsizes_wq128_2 --overlapping-move-action dsa
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-mov-overlaps_wq128_60 --cfg-filepath ./configs/sweep_sizes_bufsizes_mov_overlaps2.json  --perc-buffer-overlap 60 --overlap-probability 100 --alg-stats --num-iter 10000000 --stats-warmup-steps 300000 --exclude-pfs --num-dsas 1 --results-dirname sweep_move_overlaps_sizes_bufsizes_wq128_2 --overlapping-move-action dsa
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-mov-overlaps_wq128_70 --cfg-filepath ./configs/sweep_sizes_bufsizes_mov_overlaps2.json  --perc-buffer-overlap 70 --overlap-probability 100 --alg-stats --num-iter 10000000 --stats-warmup-steps 300000 --exclude-pfs --num-dsas 1 --results-dirname sweep_move_overlaps_sizes_bufsizes_wq128_2 --overlapping-move-action dsa
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-mov-overlaps_wq128_80 --cfg-filepath ./configs/sweep_sizes_bufsizes_mov_overlaps2.json  --perc-buffer-overlap 80 --overlap-probability 100 --alg-stats --num-iter 10000000 --stats-warmup-steps 300000 --exclude-pfs --num-dsas 1 --results-dirname sweep_move_overlaps_sizes_bufsizes_wq128_2 --overlapping-move-action dsa
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-mov-overlaps_wq128_90 --cfg-filepath ./configs/sweep_sizes_bufsizes_mov_overlaps2.json  --perc-buffer-overlap 90 --overlap-probability 100 --alg-stats --num-iter 10000000 --stats-warmup-steps 300000 --exclude-pfs --num-dsas 1 --results-dirname sweep_move_overlaps_sizes_bufsizes_wq128_2 --overlapping-move-action dsa
+
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-freqyencues_wq128_1800 --cfg-filepath ./configs/junk.json  --alg-stats --num-iter 10000000 --stats-warmup-steps 300000 --exclude-pfs --num-dsas 1 --results-dirname cpu_freq_sweep_cpy
+
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-freqyencues_wq128_800 --cfg-filepath ./configs/junk.json  --alg-stats --num-iter 10000000 --stats-warmup-steps 300000 --exclude-pfs --num-dsas 1 --results-dirname cpu_freq_sweep_cpy
+
+#python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-freqyencues_wq128 --cfg-filepath ./configs/sweep_frequencies.json  --alg-stats --num-iter 10000000 --stats-warmup-steps 300000 --exclude-pfs --num-dsas 1 --results-dirname freq_sweep_cpy_512 --control-frequencies
+
+python sweep_all_test_settable_size5.py --output-type perf --run-name sweep-freqyencues_wq128 --cfg-filepath ./configs/sweep_frequencies2.json  --alg-stats --num-iter 10000000 --stats-warmup-steps 300000 --exclude-pfs --num-dsas 1 --results-dirname freq_bufsize_sweep_cpy_768 --control-frequencies

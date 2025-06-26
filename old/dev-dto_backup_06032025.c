@@ -96,12 +96,6 @@ enum numa_aware {
 	NA_LAST_ENTRY
 };
 
-enum overlapping_memmove_actions {
-	OVERLAPPING_CPU = 0,
-	OVERLAPPING_DSA,
-	OVERLAPPING_LAST_ENTRY
-};
-
 static const char * const numa_aware_names[] = {
 	[NA_NONE] = "none",
 	[NA_BUFFER_CENTRIC] = "buffer-centric",
@@ -144,7 +138,6 @@ static unsigned int dto_sleep_time_usec = DEFAULT_SLEEP_TIME_USEC; //sleep mode 
 
 static uint8_t autotune_exclude_failed = 0;
 
-static uint8_t dto_overlapping_memmove_action = OVERLAPPING_CPU;
 
 static uint8_t fork_handler_registered;
 
@@ -153,7 +146,6 @@ enum memop {
 	MEMCOPY,
 	MEMMOVE,
 	MEMCMP,
-	MOVOVERLAP,
 	MAX_MEMOP,
 };
 
@@ -161,8 +153,7 @@ static const char * const memop_names[] = {
 	[MEMSET] = "set",
 	[MEMCOPY] = "cpy",
 	[MEMMOVE] = "mov",
-	[MEMCMP] = "cmp",
-	[MOVOVERLAP] = "ovr",
+	[MEMCMP] = "cmp"
 };
 
 // memory stats
@@ -273,7 +264,7 @@ static __thread uint64_t thr_bytes_completed_cpu;
 	} while (0)						\
 
 
-#define DTO_COLLECT_STATS_DSA_END(cs, st, et, op, n, overlap, tbc, tbc_cpu, r)				\
+#define DTO_COLLECT_STATS_DSA_END(cs, st, et, op, n, tbc, tbc_cpu, r)				\
 	do {										\
 		if (unlikely(cs)) {	\
 			if (global_op_counter >= dto_stats_num_warmup_ops) {   						\
@@ -282,14 +273,14 @@ static __thread uint64_t thr_bytes_completed_cpu;
 				t = (((et.tv_sec*1000000000) + et.tv_nsec) -			\
 						((st.tv_sec*1000000000) + st.tv_nsec));		\
 				if (unlikely(r != SUCCESS))					\
-					update_stats(op, n, overlap, tbc, tbc_cpu, t, DSA_CALL_FAILED, r);	\
+					update_stats(op, n, tbc, tbc_cpu, t, DSA_CALL_FAILED, r);	\
 				else								\
-					update_stats(op, n, overlap, tbc, tbc_cpu, t, DSA_CALL_SUCCESS, 0);	\
+					update_stats(op, n, tbc, tbc_cpu, t, DSA_CALL_SUCCESS, 0);	\
 			} \
 		}									\
 	} while (0)									\
 
-#define DTO_COLLECT_STATS_CPU_END(cs, st, et, op, n, orig_n, overlap, use_orig_func)			\
+#define DTO_COLLECT_STATS_CPU_END(cs, st, et, op, n, orig_n, use_orig_func)			\
 	do {									\
 		if (unlikely(cs)) {	\
 			if (global_op_counter >= dto_stats_num_warmup_ops) {  \
@@ -298,9 +289,9 @@ static __thread uint64_t thr_bytes_completed_cpu;
 				t = (((et.tv_sec*1000000000) + et.tv_nsec) -		\
 					((st.tv_sec*1000000000) + st.tv_nsec));		\
 				if (use_orig_func)                             \
-					update_stats(op, orig_n, overlap, n, n, t, STDC_CALL, 0);		\
+					update_stats(op, orig_n, n, n, t, STDC_CALL, 0);		\
 				else                                                        \
-					update_stats(op, orig_n, overlap, n, n, t, DSA_CALL_FAILED_STDC_CALL, 0);		\
+					update_stats(op, orig_n, n, n, t, DSA_CALL_FAILED_STDC_CALL, 0);		\
 			}             \
 		}								\
 	} while (0)								\
@@ -460,8 +451,6 @@ static void child (void)
 		for (j = 0; j < MAX_STAT_GROUP; j++) {
 			for (k = 0; k < MAX_MEMOP; k++) {
 				op_counter[i][j][k] = 0;
-			}
-			for (k = 0; k < MAX_MEMOP-1; k++) {
 				lat_counter[i][j][k] = 0;
 			}
 			bytes_counter[i][j] = 0;
@@ -702,12 +691,22 @@ static __always_inline void dsa_wait_and_adjust(const volatile uint8_t *comp, si
 						//printf("avg num waits %d new cpu fract increased to %d\n",avg_num_waits,auto_tune_states[bucket].cpu_size_fraction);
 						ut = INCR_FRACT;
 					}
+					//else if (dsa_min_size < MAX_DSA_MIN_SIZE) {
+					//	dsa_min_size += DMS_STEP_INCREMENT;
+						//printf("avg num waits %d new cpu fract at %d increased min size\n",avg_num_waits,auto_tune_states[bucket].cpu_size_fraction);
+					//	ut = INCR_MIN_SIZE;
+					//}
 				} else if (avg_num_waits < min_avg_waits) {
 					if (auto_tune_states[bucket].cpu_size_fraction >= CSF_STEP_DECREMENT) {
 						auto_tune_states[bucket].cpu_size_fraction -= CSF_STEP_DECREMENT;
 						//printf("avg num waits %d new cpu fract decreased to %d\n",avg_num_waits,auto_tune_states[bucket].cpu_size_fraction);
 						ut = DECR_FRACT;
 					}
+					//else if (dsa_min_size > MIN_DSA_MIN_SIZE) {
+					//	dsa_min_size -= DMS_STEP_DECREMENT;
+						//printf("avg num waits %d new cpu fract at %d decreased min size\n",avg_num_waits,auto_tune_states[bucket].cpu_size_fraction);
+					//	ut = DECR_MIN_SIZE;
+					//}
 				}
 				//LOG_TRACE("dsa_wait_and_adjust instance %u cpu fract %u\n", bucket, auto_tune_states[bucket].cpu_size_fraction);
 			}
@@ -827,14 +826,10 @@ static __always_inline int dsa_execute(struct dto_wq *wq,
 }
 
 #ifdef DTO_STATS_SUPPORT
-static void update_stats(int op, size_t n, uint8_t overlapping, size_t bytes_completed, size_t bytes_completed_cpu,
+static void update_stats(int op, size_t n, size_t bytes_completed, size_t bytes_completed_cpu,
 		uint64_t elapsed_ns, int group, int error_code)
 {
 	int bucket = (n / HIST_BUCKET_SIZE);
-
-	// dto_memcpymove didn't actually submit the request to DSA, so there is nothing to log. This will be captured by a second call
-	if(op==MEMMOVE && overlapping && dto_overlapping_memmove_action==OVERLAPPING_CPU && group==DSA_CALL_SUCCESS)
-		return;
 
 	if (stats_output_type == STATS_TEXT_OLD_FORMAT && group == DSA_CALL_FAILED_STDC_CALL)
 		group = STDC_CALL;
@@ -842,8 +837,6 @@ static void update_stats(int op, size_t n, uint8_t overlapping, size_t bytes_com
 	if (bucket >= HIST_NO_BUCKETS)  /* last bucket includes remaining sizes */
 		bucket = HIST_NO_BUCKETS-1;
 	++op_counter[bucket][group][op];
-	if (overlapping && op == MEMMOVE)
-		++op_counter[bucket][group][MOVOVERLAP];
 	bytes_counter[bucket][group] += bytes_completed;
 	bytes_counter_cpu[bucket][group] += bytes_completed_cpu;
 	lat_counter[bucket][group][op] += elapsed_ns;
@@ -1089,299 +1082,6 @@ static void print_stats(void)
 	LOG_STATS("DTO Run Time: %ld ms\n", TS_NS(dto_start_time, dto_end_time)/1000000);
 
 	// display stats
-
-
-	LOG_STATS("\n******** Number of Memory Operations ********\n");
-	
-	LOG_STATS("%17s    ", "");
-	for (int g = 0; g < MAX_STAT_GROUP; ++g) {
-		if (g == DSA_FAIL_CODES)
-			LOG_STATS("<***** %-13s *****> ", stat_group_names[g]);
-		else
-			LOG_STATS("<*************************************** %-13s ****************************************> ", stat_group_names[g]);
-	}
-	LOG_STATS("\n");
-
-	LOG_STATS("%-17s -- ", "Byte Range");
-	for (int g = 0; g < MAX_STAT_GROUP - 1; ++g) {
-		for (int o = 0; o < MAX_MEMOP; ++o)
-			LOG_STATS("%-13s ", memop_names[o]);
-		LOG_STATS("%-13s ", "bytes");
-		LOG_STATS("%-13s ", "bytes_cpu");
-	}
-	for (int o = 1; o < MAX_FAILURES; ++o)
-		LOG_STATS("%-6s ", failure_names[o]);
-	LOG_STATS("\n");
-
-	for (int b = 0; b < HIST_NO_BUCKETS; ++b) {
-		bool empty = true;
-
-		for (int g = 0; g < MAX_STAT_GROUP; ++g) {
-			for (int o = 0; o < MAX_MEMOP; ++o) {
-				if (op_counter[b][g][o] != 0) {
-					empty = false;
-					break;
-				}
-			}
-			if (!empty)
-				break;
-		}
-		if (empty)
-			continue;
-
-		if (b < (HIST_NO_BUCKETS-1))
-			LOG_STATS("% 8d-%-8d -- ", b*4096, ((b+1)*4096)-1);
-		else
-			LOG_STATS("   >=%-12d -- ", b*4096);
-
-		for (int g = 0; g < MAX_STAT_GROUP - 1; ++g) {
-			for (int o = 0; o < MAX_MEMOP; ++o) {
-				LOG_STATS("%-13lld ", op_counter[b][g][o]);
-			}
-
-			LOG_STATS("%-13lld ", bytes_counter[b][g]);
-			LOG_STATS("%-13lld ", bytes_counter_cpu[b][g]);
-		}
-
-		for (int o = 1; o < MAX_FAILURES; ++o)
-			LOG_STATS("%-6d ", fail_counter[b][o]);
-		LOG_STATS("\n");
-	}
-
-	LOG_STATS("\n******** Average Memory Operation Latency (us)  ********\n");
-
-	LOG_STATS("%17s    ", "");
-	for (int g = 0; g < MAX_STAT_GROUP; ++g) {
-		if (g != DSA_FAIL_CODES)
-			LOG_STATS("<******** %-13s ********> ", stat_group_names[g]);
-	}
-	LOG_STATS("\n");
-
-	LOG_STATS("%-17s -- ", "Byte Range");
-	for (int g = 0; g < MAX_STAT_GROUP - 1; ++g) {
-		for (int o = 0; o < MAX_MEMOP-1; ++o)
-			LOG_STATS("%-8s ", memop_names[o]);
-	}
-
-	LOG_STATS("\n");
-
-	for (int b = 0; b < HIST_NO_BUCKETS; ++b) {
-		bool empty = true;
-
-		for (int g = 0; g < MAX_STAT_GROUP; ++g) {
-			for (int o = 0; o < MAX_MEMOP-1; ++o) {
-				if (op_counter[b][g][o] != 0) {
-					empty = false;
-					break;
-				}
-			}
-			if (!empty)
-				break;
-		}
-		if (empty)
-			continue;
-
-		if (b < (HIST_NO_BUCKETS-1))
-			LOG_STATS("% 8d-%-8d -- ", b*4096, ((b+1)*4096)-1);
-		else
-			LOG_STATS("   >=%-12d -- ", b*4096);
-
-		for (int g = 0; g < MAX_STAT_GROUP - 1; ++g) {
-			for (int o = 0; o < MAX_MEMOP-1; ++o) {
-				if (op_counter[b][g][o] != 0) {
-					total_memop_time += (lat_counter[b][g][o]/1000);
-					double avg_us = ((double) lat_counter[b][g][o])/(((double) op_counter[b][g][o]) * 1000.0);
-
-					LOG_STATS("%-8.2f ", avg_us);
-				} else {
-					LOG_STATS("%-8d ", 0);
-				}
-			}
-			
-		}
-
-		LOG_STATS("\n");
-	}
-
-	LOG_STATS("Total memory op time %llu\n ",total_memop_time);
-
-	for(int i=0; i < num_wqs; ++i) {
-		LOG_STATS("Work Queue Occupancy %d: ", i);
-		for( int j=0; j<HIST_NO_REQS;++j) {
-			LOG_STATS("%d,",num_dto_requests[j][i]);
-		}
-		LOG_STATS("\n");
-	}
-
-	/*
-	LOG_STATS("Numa node counts\n");
-	LOG_STATS("    MEMESET Destination\n");
-	for (int i=0;i<num_numa_nodes;++i) 
-		LOG_STATS("        Numa %d: %lu\n",i,numa_node_counts[MEMSET_DST][i]);
-	
-	LOG_STATS("    MEMECPY Source\n");
-	for (int i=0;i<num_numa_nodes;++i)
-		LOG_STATS("        Numa %d: %lu\n",i,numa_node_counts[MEMCPY_SRC][i]);
-	
-	LOG_STATS("    MEMECPY Destination\n");
-	for (int i=0;i<num_numa_nodes;++i)
-		LOG_STATS("        Numa %d: %lu\n",i,numa_node_counts[MEMCPY_DST][i]);
-
-	*/
-
-	//LOG_STATS("Number of DSA Queue Full: %llu\n", num_queue_full);
-
-	if(collect_alg_stats)
-		print_alg_stats();
-}
-
-
-static void print_stats_old_format(void)
-{
-	struct timespec dto_end_time;
-
-	if (likely(!collect_stats))
-		return;
-
-	clock_gettime(CLOCK_BOOTTIME, &dto_end_time);
-
-	LOG_STATS("DTO Run Time: %ld ms\n", TS_NS(dto_start_time, dto_end_time)/1000000);
-
-	// display stats
-	LOG_STATS("\n******** Number of Memory Operations ********\n");
-	
-
-	LOG_STATS("%17s    ", "");
-	for (int g = 0; g < MAX_STAT_GROUP; ++g) {
-		if (g == DSA_FAIL_CODES)
-			LOG_STATS("<***** %-13s *****> ", stat_group_names[g]);
-		else if(g != DSA_CALL_FAILED_STDC_CALL)
-			LOG_STATS("<******************** %-13s ********************> ", stat_group_names[g]);
-	}
-	LOG_STATS("\n");
-
-	LOG_STATS("%-17s -- ", "Byte Range");
-	for (int g = 0; g < MAX_STAT_GROUP - 1; ++g) {
-		if (g != DSA_CALL_FAILED_STDC_CALL) {
-			for (int o = 0; o < MAX_MEMOP; ++o)
-				LOG_STATS("%-8s ", memop_names[o]);
-			LOG_STATS("%-12s ", "bytes");
-		}
-	}
-
-	for (int o = 1; o < MAX_FAILURES; ++o)
-		LOG_STATS("%-6s ", failure_names[o]);
-	LOG_STATS("\n");
-
-	for (int b = 0; b < HIST_NO_BUCKETS; ++b) {
-		bool empty = true;
-
-		for (int g = 0; g < MAX_STAT_GROUP; ++g) {
-			for (int o = 0; o < MAX_MEMOP; ++o) {
-				if (op_counter[b][g][o] != 0) {
-					empty = false;
-					break;
-				}
-			}
-			if (!empty)
-				break;
-		}
-		if (empty)
-			continue;
-
-		if (b < (HIST_NO_BUCKETS-1))
-			LOG_STATS("% 8d-%-8d -- ", b*4096, ((b+1)*4096)-1);
-		else
-			LOG_STATS("   >=%-12d -- ", b*4096);
-
-		for (int g = 0; g < MAX_STAT_GROUP - 1; ++g) {
-			if (g != DSA_CALL_FAILED_STDC_CALL) {
-				for (int o = 0; o < MAX_MEMOP; ++o) {
-					LOG_STATS("%-8d ", op_counter[b][g][o]);
-				}
-		
-				LOG_STATS("%-12lld ", bytes_counter[b][g]);
-
-			}
-		}
-
-		for (int o = 1; o < MAX_FAILURES; ++o)
-			LOG_STATS("%-6d ", fail_counter[b][o]);
-		LOG_STATS("\n");
-	}
-	 
-	LOG_STATS("\n******** Average Memory Operation Latency (us)  ********\n");
-
-	LOG_STATS("%17s    ", "");
-	for (int g = 0; g < MAX_STAT_GROUP; ++g) {
-		if (g != DSA_FAIL_CODES && g != DSA_CALL_FAILED_STDC_CALL)
-			LOG_STATS("<******** %-13s ********> ", stat_group_names[g]);
-	}
-	LOG_STATS("\n");
-
-	LOG_STATS("%-17s -- ", "Byte Range");
-	for (int g = 0; g < MAX_STAT_GROUP - 1; ++g) {
-		if (g != DSA_CALL_FAILED_STDC_CALL) {
-			for (int o = 0; o < MAX_MEMOP-1; ++o)
-				LOG_STATS("%-8s ", memop_names[o]);
-		}
-	}
-
-	LOG_STATS("\n");
-
-	for (int b = 0; b < HIST_NO_BUCKETS; ++b) {
-		bool empty = true;
-
-		for (int g = 0; g < MAX_STAT_GROUP; ++g) {
-			for (int o = 0; o < MAX_MEMOP-1; ++o) {
-				if (op_counter[b][g][o] != 0) {
-					empty = false;
-					break;
-				}
-			}
-			if (!empty)
-				break;
-		}
-		if (empty)
-			continue;
-
-		if (b < (HIST_NO_BUCKETS-1))
-			LOG_STATS("% 8d-%-8d -- ", b*4096, ((b+1)*4096)-1);
-		else
-			LOG_STATS("   >=%-12d -- ", b*4096);
-
-		for (int g = 0; g < MAX_STAT_GROUP - 1; ++g) {
-			if (g != DSA_CALL_FAILED_STDC_CALL) {
-				for (int o = 0; o < MAX_MEMOP-1; ++o) {
-					if (op_counter[b][g][o] != 0) {
-						double avg_us = ((double) lat_counter[b][g][o])/(((double) op_counter[b][g][o]) * 1000.0);
-
-						LOG_STATS("%-8.2f ", avg_us);
-					} else {
-						LOG_STATS("%-8d ", 0);
-					}
-				}
-			}
-		}
-		LOG_STATS("\n");
-	}
-}
-
-/*
-
-static void print_stats_backup(void)
-{
-	struct timespec dto_end_time;
-	uint64_t total_memop_time=0;
-
-	if (likely(!collect_stats))
-		return;
-
-	clock_gettime(CLOCK_BOOTTIME, &dto_end_time);
-
-	LOG_STATS("DTO Run Time: %ld ms\n", TS_NS(dto_start_time, dto_end_time)/1000000);
-
-	// display stats
 	for (int t = 0; t < 2; ++t) {
 		if (t == 0)
 			LOG_STATS("\n******** Number of Memory Operations ********\n");
@@ -1475,21 +1175,21 @@ static void print_stats_backup(void)
 		LOG_STATS("\n");
 	}
 
+	/*
+	LOG_STATS("Numa node counts\n");
+	LOG_STATS("    MEMESET Destination\n");
+	for (int i=0;i<num_numa_nodes;++i) 
+		LOG_STATS("        Numa %d: %lu\n",i,numa_node_counts[MEMSET_DST][i]);
 	
-	//LOG_STATS("Numa node counts\n");
-	//LOG_STATS("    MEMESET Destination\n");
-	//for (int i=0;i<num_numa_nodes;++i) 
-	//	LOG_STATS("        Numa %d: %lu\n",i,numa_node_counts[MEMSET_DST][i]);
+	LOG_STATS("    MEMECPY Source\n");
+	for (int i=0;i<num_numa_nodes;++i)
+		LOG_STATS("        Numa %d: %lu\n",i,numa_node_counts[MEMCPY_SRC][i]);
 	
-	//LOG_STATS("    MEMECPY Source\n");
-	//for (int i=0;i<num_numa_nodes;++i)
-	//	LOG_STATS("        Numa %d: %lu\n",i,numa_node_counts[MEMCPY_SRC][i]);
-	
-	//LOG_STATS("    MEMECPY Destination\n");
-	//for (int i=0;i<num_numa_nodes;++i)
-	//	LOG_STATS("        Numa %d: %lu\n",i,numa_node_counts[MEMCPY_DST][i]);
+	LOG_STATS("    MEMECPY Destination\n");
+	for (int i=0;i<num_numa_nodes;++i)
+		LOG_STATS("        Numa %d: %lu\n",i,numa_node_counts[MEMCPY_DST][i]);
 
-	
+	*/
 
 	//LOG_STATS("Number of DSA Queue Full: %llu\n", num_queue_full);
 
@@ -1497,7 +1197,8 @@ static void print_stats_backup(void)
 		print_alg_stats();
 }
 
-static void print_stats_old_format_backup(void)
+
+static void print_stats_old_format(void)
 {
 	struct timespec dto_end_time;
 
@@ -1591,7 +1292,6 @@ static void print_stats_old_format_backup(void)
 		}
 	}
 }
-*/
 
 static void print_stats_dict(void)
 {
@@ -1657,7 +1357,7 @@ static void print_stats_dict(void)
 		bool empty = true;
 
 		for (int g = 0; g < MAX_STAT_GROUP; ++g) {
-			for (int o = 0; o < MAX_MEMOP-1; ++o) {
+			for (int o = 0; o < MAX_MEMOP; ++o) {
 				if (op_counter[b][g][o] != 0) {
 					empty = false;
 					break;
@@ -1674,7 +1374,7 @@ static void print_stats_dict(void)
 		
 		for (int g = 0; g < MAX_STAT_GROUP - 1; ++g) {
 			LOG_STATS("'%s':{",stat_group_names2[g]);
-			for (int o = 0; o < MAX_MEMOP-1; ++o) {
+			for (int o = 0; o < MAX_MEMOP; ++o) {
 				
 				if (op_counter[b][g][o] != 0) {
 					total_memop_time += (lat_counter[b][g][o]/1000);
@@ -2496,13 +2196,6 @@ static int init_dto(void)
 			autotune_exclude_failed = !!autotune_exclude_failed;
 		}
 
-		env_str = getenv("DTO_OVERLAPPING_MEMMOVE_ACTION");
-		if (env_str != NULL) {
-			errno = 0;
-			dto_overlapping_memmove_action = strtoul(env_str, NULL, 10);
-			if (errno)
-				dto_overlapping_memmove_action = OVERLAPPING_CPU;
-		}
 
 		/* Register fork handler for the child process */
 		if (!fork_handler_registered) {
@@ -2636,13 +2329,13 @@ static int init_dto(void)
 			uint32_t step_size = range / dto_num_autotune_instances;
 			auto_tune_buckets[dto_num_autotune_instances-1] = dsa_max_size;
 			
-			//LOG_TRACE("min size %u max size %u range %u step_size %u\n", dsa_min_size, dsa_max_size, range, step_size);
+			LOG_TRACE("min size %u max size %u range %u step_size %u\n", dsa_min_size, dsa_max_size, range, step_size);
 			//LOG_TRACE("%d:%u\n",0,auto_tune_buckets[0]);
 			for(int i=0; i < dto_num_autotune_instances-1; ++i) {
 				auto_tune_buckets[i] = dsa_min_size + (i+1)*step_size;
 				LOG_TRACE("%d:%u\n",i,auto_tune_buckets[i]);
 			}
-			//LOG_TRACE("%d:%u\n",dto_num_autotune_instances-1,auto_tune_buckets[dto_num_autotune_instances-1]);
+			LOG_TRACE("%d:%u\n",dto_num_autotune_instances-1,auto_tune_buckets[dto_num_autotune_instances-1]);
 
 			uint32_t num_wqs_per_bucket = dto_num_wqs / dto_num_autotune_instances;
 
@@ -2846,7 +2539,7 @@ static bool is_overlapping_buffers (void *dest, const void *src, size_t n)
 	return true;
 }
 
-static uint8_t dto_memcpymove(void *dest, const void *src, size_t n, bool is_memcpy, int *result)
+static void dto_memcpymove(void *dest, const void *src, size_t n, bool is_memcpy, int *result)
 {
 	struct dto_wq *wq = get_wq(dest, n);
 	size_t cpu_size, dsa_size, unsplit_size;
@@ -2899,13 +2592,9 @@ static uint8_t dto_memcpymove(void *dest, const void *src, size_t n, bool is_mem
 		unsplit_size = n;
 		//LOG_TRACE("dto_memcpy size %d \n",unsplit_size);
 		if (is_overlapping){
-			if (dto_overlapping_memmove_action == OVERLAPPING_DSA) {
-				*result = dsa_execute(wq, &thr_desc, &thr_comp.status);
-			} else {
-				thr_bytes_completed = 0;
-				*result = SUCCESS;
-			}
-		} else {
+			*result = dsa_execute(wq, &thr_desc, &thr_comp.status);
+		}
+		else{
 			*result = dsa_submit(wq, &thr_desc, 1);
 			if (*result == SUCCESS) {
 				if (cpu_size) {
@@ -2975,7 +2664,6 @@ static uint8_t dto_memcpymove(void *dest, const void *src, size_t n, bool is_mem
 			 */
 		} while (n >= dsa_min_size);
 	}
-	return is_overlapping;
 }
 
 static int dto_memcmp(const void *s1, const void *s2, size_t n, int *result)
@@ -3093,7 +2781,7 @@ void *memset(void *s1, int c, size_t n)
 	size_t orig_n = n;
 #endif
 
-	LOG_TRACE("memset size %d value %x dest %x\n",n,c,s1);
+	//LOG_TRACE("memset size %d value %x dest %x\n",n,c,s1);
 
 	if (unlikely(dto_initialized == 0)) {
 		/* If there are other constructors in the same binary,
@@ -3128,7 +2816,7 @@ if (unlikely(collect_stats)) {
 		dto_memset(s1, c, n, &result);
 
 #ifdef DTO_STATS_SUPPORT
-		DTO_COLLECT_STATS_DSA_END(collect_stats, st, et, MEMSET, n, 0, thr_bytes_completed, thr_bytes_completed_cpu, result);
+		DTO_COLLECT_STATS_DSA_END(collect_stats, st, et, MEMSET, n, thr_bytes_completed, thr_bytes_completed_cpu, result);
 #endif
 		if (thr_bytes_completed != n) {
 			/* fallback to std call if job is only partially completed */
@@ -3145,7 +2833,7 @@ if (unlikely(collect_stats)) {
 			orig_memset(s1, c, n);
 
 #ifdef DTO_STATS_SUPPORT
-			DTO_COLLECT_STATS_CPU_END(collect_stats, st, et, MEMSET, n, orig_n, 0, use_orig_func);
+			DTO_COLLECT_STATS_CPU_END(collect_stats, st, et, MEMSET, n, orig_n, use_orig_func);
 #endif
 
 		}
@@ -3160,7 +2848,7 @@ if (unlikely(collect_stats)) {
 		orig_memset(s1, c, n);
 
 #ifdef DTO_STATS_SUPPORT
-		DTO_COLLECT_STATS_CPU_END(collect_stats, st, et, MEMSET, n, orig_n, 0, use_orig_func);
+		DTO_COLLECT_STATS_CPU_END(collect_stats, st, et, MEMSET, n, orig_n, use_orig_func);
 #endif
 	}
 	return ret;
@@ -3211,7 +2899,7 @@ void *memcpy(void *dest, const void *src, size_t n)
 		dto_memcpymove(dest, src, n, 1, &result);
 
 #ifdef DTO_STATS_SUPPORT
-		DTO_COLLECT_STATS_DSA_END(collect_stats, st, et, MEMCOPY, n, 0, thr_bytes_completed, thr_bytes_completed_cpu, result);
+		DTO_COLLECT_STATS_DSA_END(collect_stats, st, et, MEMCOPY, n, thr_bytes_completed, thr_bytes_completed_cpu, result);
 #endif
 		if (thr_bytes_completed != n) {
 			/* fallback to std call if job is only partially completed */
@@ -3231,7 +2919,7 @@ void *memcpy(void *dest, const void *src, size_t n)
 			orig_memcpy(dest, src, n);
 
 #ifdef DTO_STATS_SUPPORT
-			DTO_COLLECT_STATS_CPU_END(collect_stats, st, et, MEMCOPY, n, orig_n, 0, use_orig_func);
+			DTO_COLLECT_STATS_CPU_END(collect_stats, st, et, MEMCOPY, n, orig_n, use_orig_func);
 #endif
 
 		}
@@ -3246,7 +2934,7 @@ void *memcpy(void *dest, const void *src, size_t n)
 		orig_memcpy(dest, src, n);
 
 #ifdef DTO_STATS_SUPPORT
-		DTO_COLLECT_STATS_CPU_END(collect_stats, st, et, MEMCOPY, n, orig_n, 0, use_orig_func);
+		DTO_COLLECT_STATS_CPU_END(collect_stats, st, et, MEMCOPY, n, orig_n, use_orig_func);
 #endif
 	}
 	return ret;
@@ -3257,7 +2945,6 @@ void *memmove(void *dest, const void *src, size_t n)
 	int result = 0;
 	void *ret = dest;
 	int use_orig_func = USE_ORIG_FUNC(n, dto_dsa_memmove);
-	uint8_t is_overlapping;
 #ifdef DTO_STATS_SUPPORT
 	struct timespec st, et;
 	size_t orig_n = n;
@@ -3286,10 +2973,10 @@ void *memmove(void *dest, const void *src, size_t n)
 #ifdef DTO_STATS_SUPPORT
 		DTO_COLLECT_STATS_START(collect_stats, st);
 #endif
-		is_overlapping = dto_memcpymove(dest, src, n, 0, &result);
+		dto_memcpymove(dest, src, n, 0, &result);
 
 #ifdef DTO_STATS_SUPPORT
-		DTO_COLLECT_STATS_DSA_END(collect_stats, st, et, MEMMOVE, n, is_overlapping, thr_bytes_completed, thr_bytes_completed_cpu, result);
+		DTO_COLLECT_STATS_DSA_END(collect_stats, st, et, MEMMOVE, n, thr_bytes_completed, thr_bytes_completed_cpu, result);
 #endif
 		if (thr_bytes_completed != n) {
 			/* fallback to std call if job is only partially completed */
@@ -3308,11 +2995,7 @@ void *memmove(void *dest, const void *src, size_t n)
 			orig_memmove(dest, src, n);
 
 #ifdef DTO_STATS_SUPPORT
-			// If we got here due to a DSA error, don't count the overlapping move in the stdlib bucket because it was already counted in DSA bucket
-			if (dto_overlapping_memmove_action != OVERLAPPING_CPU)
-				is_overlapping = 0;
-
-			DTO_COLLECT_STATS_CPU_END(collect_stats, st, et, MEMMOVE, n, orig_n, is_overlapping, use_orig_func);
+			DTO_COLLECT_STATS_CPU_END(collect_stats, st, et, MEMMOVE, n, orig_n, use_orig_func);
 #endif			
 		}
 	}
@@ -3326,7 +3009,7 @@ void *memmove(void *dest, const void *src, size_t n)
 		orig_memmove(dest, src, n);
 
 #ifdef DTO_STATS_SUPPORT
-		DTO_COLLECT_STATS_CPU_END(collect_stats, st, et, MEMMOVE, n, orig_n, 0, use_orig_func);
+		DTO_COLLECT_STATS_CPU_END(collect_stats, st, et, MEMMOVE, n, orig_n, use_orig_func);
 #endif
 	}
 	return ret;
@@ -3358,7 +3041,7 @@ int memcmp(const void *s1, const void *s2, size_t n)
 		ret = dto_memcmp(s1, s2, n, &result);
 
 #ifdef DTO_STATS_SUPPORT
-		DTO_COLLECT_STATS_DSA_END(collect_stats, st, et, MEMCMP, n, 0, thr_bytes_completed, n-thr_bytes_completed, result);
+		DTO_COLLECT_STATS_DSA_END(collect_stats, st, et, MEMCMP, n, thr_bytes_completed, n-thr_bytes_completed, result);
 #endif
 		if (thr_bytes_completed != n) {
 			/* fallback to std call if job is only partially completed */
@@ -3375,7 +3058,7 @@ int memcmp(const void *s1, const void *s2, size_t n)
 			ret = orig_memcmp(s1, s2, n);
 
 #ifdef DTO_STATS_SUPPORT
-			DTO_COLLECT_STATS_CPU_END(collect_stats, st, et, MEMCMP, n, orig_n, 0, use_orig_func);
+			DTO_COLLECT_STATS_CPU_END(collect_stats, st, et, MEMCMP, n, orig_n, use_orig_func);
 #endif			
 		}
 	}
@@ -3389,7 +3072,7 @@ int memcmp(const void *s1, const void *s2, size_t n)
 		ret = orig_memcmp(s1, s2, n);
 
 #ifdef DTO_STATS_SUPPORT
-		DTO_COLLECT_STATS_CPU_END(collect_stats, st, et, MEMCMP, n, orig_n, 0, use_orig_func);
+		DTO_COLLECT_STATS_CPU_END(collect_stats, st, et, MEMCMP, n, orig_n, use_orig_func);
 #endif
 	}
 	return ret;
