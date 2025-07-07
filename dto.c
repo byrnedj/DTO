@@ -28,6 +28,8 @@
 #include <numaif.h>
 #include <numa.h>
 #include <signal.h>
+#include "dto.h"
+#include <nmmintrin.h>  // For _mm_crc32_u32 etc.
 
 #define likely(x)       __builtin_expect((x), 1)
 #define unlikely(x)     __builtin_expect((x), 0)
@@ -421,6 +423,29 @@ static double max_avg_waits = MAX_AVG_POLL_WAITS;
 static uint8_t auto_adjust_knobs = 1;
 
 extern char *__progname;
+
+uint32_t crc32c_hw(const uint8_t* data, size_t len) {
+    uint32_t crc = 0;  // Initial value, can be 0 or 0xFFFFFFFF depending on convention
+
+    while (len >= sizeof(uint64_t)) {
+        crc = _mm_crc32_u64(crc, *(uint64_t*)data);
+        data += sizeof(uint64_t);
+        len -= sizeof(uint64_t);
+    }
+
+    while (len >= sizeof(uint32_t)) {
+        crc = _mm_crc32_u32(crc, *(uint32_t*)data);
+        data += sizeof(uint32_t);
+        len -= sizeof(uint32_t);
+    }
+
+    while (len--) {
+        crc = _mm_crc32_u8(crc, *data++);
+    }
+
+    return crc;
+}
+
 
 static void dto_log(int req_log_level, const char *fmt, ...)
 {
@@ -2421,6 +2446,149 @@ static bool is_overlapping_buffers (void *dest, const void *src, size_t n)
 		return false;
 
 	return true;
+}
+
+__attribute__((visibility("default"))) uint64_t dto_crc(const void *src, size_t n, callback_t cb, void* args) {
+	//submit dsa work if successful, call the callback
+        if (use_std_lib_calls || n < dsa_min_size) {
+                if (cb) {
+		    cb(args);
+                }
+                return crc32c_hw(src, n);
+        }
+	int result = 0;
+	struct dto_wq *wq = get_wq(src);
+	size_t dsa_size = n;
+#ifdef DTO_STATS_SUPPORT
+	struct timespec st, et;
+	size_t orig_n = n;
+	DTO_COLLECT_STATS_START(collect_stats, st);
+#endif
+
+	thr_desc.opcode = DSA_OPCODE_CRCGEN;
+	thr_desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR | IDXD_OP_FLAG_BOF;
+	if (dto_dsa_cc && (wq->dsa_gencap & GENCAP_CC_MEMORY))
+		thr_desc.flags |= IDXD_OP_FLAG_CC;
+	thr_desc.completion_addr = (uint64_t)&thr_comp;
+
+	thr_bytes_completed = 0;
+	thr_desc.src_addr = (uint64_t) src;
+        thr_desc.dst_addr = 0; // dst_addr is not used for CRC generation
+	thr_desc.xfer_size = (uint32_t) dsa_size;
+        thr_desc.crc_seed = 0; // default seed valuie
+        thr_desc.rsvd = 0;
+	thr_comp.status = 0;
+	result = dsa_submit(wq, &thr_desc);
+	if (result == SUCCESS) {
+                if (cb) {
+		    cb(args);
+                }
+		result = dsa_wait(wq, &thr_desc, &thr_comp.status);
+	}
+#ifdef DTO_STATS_SUPPORT
+	DTO_COLLECT_STATS_DSA_END(collect_stats, st, et, MEMCOPY_ASYNC, n, thr_bytes_completed, result);
+#endif
+        if (thr_bytes_completed < n) {
+            return 0;
+        }
+        return thr_comp.crc_val;
+}
+
+__attribute__((visibility("default"))) uint64_t dto_memcpy_crc_async(void *dest, const void *src, size_t n, callback_t cb, void* args) {
+	//submit dsa work if successful, call the callback
+        if (use_std_lib_calls || n < dsa_min_size) {
+                if (cb) {
+		    cb(args);
+                }
+                orig_memcpy(dest, src, n);
+                return crc32c_hw(src, n);
+        }
+	int result = 0;
+	struct dto_wq *wq = get_wq(dest);
+	size_t dsa_size = n;
+#ifdef DTO_STATS_SUPPORT
+	struct timespec st, et;
+	size_t orig_n = n;
+	DTO_COLLECT_STATS_START(collect_stats, st);
+#endif
+
+	thr_desc.opcode = DSA_OPCODE_COPY_CRC;
+	thr_desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR | IDXD_OP_FLAG_BOF;
+	if (dto_dsa_cc && (wq->dsa_gencap & GENCAP_CC_MEMORY))
+		thr_desc.flags |= IDXD_OP_FLAG_CC;
+	thr_desc.completion_addr = (uint64_t)&thr_comp;
+
+	thr_bytes_completed = 0;
+	thr_desc.src_addr = (uint64_t) src;
+	thr_desc.dst_addr = (uint64_t) dest;
+	thr_desc.xfer_size = (uint32_t) dsa_size;
+        thr_desc.crc_seed = 0; // default seed valuie
+        thr_desc.rsvd = 0;
+	thr_comp.status = 0;
+	result = dsa_submit(wq, &thr_desc);
+	if (result == SUCCESS) {
+                if (cb) {
+		    cb(args);
+                }
+		result = dsa_wait(wq, &thr_desc, &thr_comp.status);
+	}
+#ifdef DTO_STATS_SUPPORT
+	DTO_COLLECT_STATS_DSA_END(collect_stats, st, et, MEMCOPY_ASYNC, n, thr_bytes_completed, result);
+#endif
+        if (thr_bytes_completed < n) {
+            return 0;
+        }
+        return thr_comp.crc_val;
+}
+
+__attribute__((visibility("default"))) void dto_memcpy_async(void *dest, const void *src, size_t n, callback_t cb, void* args) {
+	//submit dsa work if successful, call the callback
+	int result = 0;
+	struct dto_wq *wq = get_wq(dest);
+	size_t dsa_size = n;
+#ifdef DTO_STATS_SUPPORT
+	struct timespec st, et;
+	size_t orig_n = n;
+	DTO_COLLECT_STATS_START(collect_stats, st);
+#endif
+
+	thr_desc.opcode = DSA_OPCODE_MEMMOVE;
+	thr_desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
+	if (dto_dsa_cc && (wq->dsa_gencap & GENCAP_CC_MEMORY))
+		thr_desc.flags |= IDXD_OP_FLAG_CC;
+	thr_desc.completion_addr = (uint64_t)&thr_comp;
+
+	thr_bytes_completed = 0;
+
+	thr_desc.src_addr = (uint64_t) src;
+	thr_desc.dst_addr = (uint64_t) dest;
+	thr_desc.xfer_size = (uint32_t) dsa_size;
+	thr_comp.status = 0;
+	result = dsa_submit(wq, &thr_desc);
+	if (result == SUCCESS) {
+		cb(args);
+		result = dsa_wait(wq, &thr_desc, &thr_comp.status);
+	}
+#ifdef DTO_STATS_SUPPORT
+	DTO_COLLECT_STATS_DSA_END(collect_stats, st, et, MEMCOPY_ASYNC, n, thr_bytes_completed, result);
+#endif
+	if (thr_bytes_completed != n) {
+		/* fallback to std call if job is only partially completed */
+		n -= thr_bytes_completed;
+		if (thr_comp.result == 0) {
+			dest = (void *)((uint64_t)dest + thr_bytes_completed);
+			src = (const void *)((uint64_t)src + thr_bytes_completed);
+		}
+#ifdef DTO_STATS_SUPPORT
+		DTO_COLLECT_STATS_START(collect_stats, st);
+#endif
+
+		orig_memcpy(dest, src, n);
+
+#ifdef DTO_STATS_SUPPORT
+		DTO_COLLECT_STATS_CPU_END(collect_stats, st, et, MEMCOPY, n, orig_n);
+#endif
+	}
 }
 
 static bool dto_memcpymove(void *dest, const void *src, size_t n, bool is_memcpy, int *result)

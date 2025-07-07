@@ -9,6 +9,8 @@ extern "C" {
 typedef void(*callback_t)(void*);
 
 void dto_memcpy_async(void *dest, const void *src, size_t n, callback_t cb, void* args);
+uint64_t dto_memcpy_crc_async(void *dest, const void *src, size_t n, callback_t cb, void* args);
+uint64_t dto_crc(const void *src, size_t n, callback_t cb, void* args);
 
 #ifdef __cplusplus
 }
