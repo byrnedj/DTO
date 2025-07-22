@@ -13,6 +13,8 @@
 #include <unistd.h>
 #include <numa.h>
 #include <sched.h>
+#include <x86intrin.h>
+#include <sys/time.h>
 
 //1024*1024*1024*256   A bit over the total memory in both NUMAs
 //#define NUM_BUFS  1024UL*48  //24*1024UL
@@ -55,6 +57,7 @@ struct parms {
     uint64_t burst_size;
     uint32_t time_between_ms;
     uint32_t warmup_time_s;
+	uint64_t cycles;
 };
 
 #ifdef PRINT_OUTPUT
@@ -82,6 +85,65 @@ static __always_inline void swap(uint8_t **a, uint8_t **b) {
     *b = temp;
 }
 
+static inline uint64_t
+get_ms(void)
+{
+	struct timeval tp;
+
+	gettimeofday(&tp, NULL);
+
+	return tp.tv_sec*1000+tp.tv_usec/1000;
+}
+
+static __always_inline uint64_t
+rdtsc(void)
+{
+	uint64_t tsc;
+	unsigned int dummy;
+
+	/*
+	 * https://www.felixcloutier.com/x86/rdtscp
+	 * The RDTSCP instruction is not a serializing instruction, but it
+	 * does wait until all previous instructions have executed and all
+	 * previous loads are globally visible
+	 *
+	 * If software requires RDTSCP to be executed prior to execution of
+	 * any subsequent instruction (including any memory accesses), it can
+	 * execute LFENCE immediately after RDTSCP
+	 */
+	tsc = __rdtscp(&dummy);
+	__builtin_ia32_lfence();
+
+	return tsc;
+}
+
+static void
+calibrate(uint64_t *cycles_per_sec)
+{
+	uint64_t  start;
+	uint64_t  end;
+	uint64_t starttick, endtick;
+	uint64_t ms_diff, cycle_diff;
+
+	endtick = get_ms();
+
+	while (endtick == (starttick = get_ms()))
+		;
+
+	/* Measure cycle diff for 500 ms */
+	start = rdtsc();
+	while ((endtick = get_ms())  < (starttick + 500))
+		;
+	end = rdtsc();
+
+	cycle_diff = end - start;
+	ms_diff = endtick - starttick;
+
+	/* ms * cycles_per_sec = cycle_diff * 1000 */
+
+	*cycles_per_sec = (cycle_diff * (uint64_t)1000)/ms_diff;
+}
+
 int thread_func(void *thr_data)
 {
 
@@ -102,9 +164,13 @@ int thread_func(void *thr_data)
     uint32_t time_between_ms = p->time_between_ms;
     uint32_t warmup_time_s = p->warmup_time_s;
 
+	p->cycles = 0;
+
     uint8_t *s;
 	uint8_t *d;
 
+	uint64_t start;
+	
     //for (uint32_t i=0;i<10;++i) {
     //    printf("%d: src addr %d: %x\n",thread_id, i,src_buffs[i]);
     //}
@@ -124,6 +190,9 @@ int thread_func(void *thr_data)
         s = src_buffs[i%num_mem_bufs];
         d = dst_buffs[i%num_mem_bufs];
 
+
+		start = rdtsc();
+	
 		//printf("next buffers: index %d, src %x, dst %x\n",i%num_mem_bufs,s,d);
 		
 		// issue the memory transactions
@@ -146,6 +215,8 @@ int thread_func(void *thr_data)
 			//printf("memcmp %d\n",transaction_size);
 			memcmp(d, s, transaction_size);
 		}
+
+		p->cycles += (rdtsc() - start);
         
 
 #ifdef PRINT_OUTPUT
@@ -204,6 +275,10 @@ int main(int argc, char **argv)
     uint32_t warmup_time_s;
 	uint32_t percent_src_dst_overlap;
 	uint8_t overlap_probability;
+	uint64_t cycles=0;
+	float latency;
+	float bw;
+	uint64_t cycles_per_sec;
 
 	if (argc != 17) {
 		printf("Usage: dto-test-settable-size num_threads sleep_time_us mem_op transaction_size total_num_iters mem_buf_size num_mem_bufs random_access src_numa_policy dst_numa_policy num_burst_threads burst_size time_between_ms warmup_time_s percent_src_dst_overlap overlap_probability\n");
@@ -229,6 +304,8 @@ int main(int argc, char **argv)
         warmup_time_s = atoi(argv[14]);
 		percent_src_dst_overlap = atoi(argv[15]);
 		overlap_probability = atoi(argv[16]);
+
+		calibrate(&cycles_per_sec);
 
 		//printf("num_threads %d transaction_size %d total_iterations %llu mem_buf_size %llu num_bufs %u random %d\n",num_threads,transaction_size, total_num_iters, mem_buf_size, num_mem_bufs,random_access);
 		
@@ -286,20 +363,25 @@ int main(int argc, char **argv)
 		}
 	}
 
+	size_t page_size = getpagesize();
 
 	uint8_t** src_buffs = calloc(num_mem_bufs, sizeof(uint8_t*));
 	for(uint32_t i=0;i<num_mem_bufs;++i) {
 		if (overlap_probability > 0) {
 			float buf_size_mult = (float)2-(float)percent_src_dst_overlap/100;
 			allocated_src_buf_size = (mem_buf_size*buf_size_mult);
-			src_buffs[i] = calloc(allocated_src_buf_size*BUF_SIZE_BASE, sizeof(uint8_t));
 			//printf("allocated src buffer %u: %llu %f bytes %x\n",i,allocated_src_buf_size*BUF_SIZE_BASE, buf_size_mult, src_buffs[i]);
 	
 		}
 		else {
 			allocated_src_buf_size = mem_buf_size;
-			src_buffs[i] = calloc(allocated_src_buf_size*BUF_SIZE_BASE, sizeof(uint8_t));
 			//printf("allocated src buffer %d: %llu bytes %x\n",i,allocated_src_buf_size*BUF_SIZE_BASE,src_buffs[i]);
+		}
+
+		src_buffs[i] = calloc(allocated_src_buf_size*BUF_SIZE_BASE, sizeof(uint8_t));
+
+		for (size_t ii = 0; ii < allocated_src_buf_size*BUF_SIZE_BASE; ii += page_size) {
+			src_buffs[i][ii] = 0;
 		}
 	}
 
@@ -325,7 +407,12 @@ int main(int argc, char **argv)
 		for(uint32_t i=0;i<num_mem_bufs;++i) {
 			dst_buffs[i] = calloc(mem_buf_size*BUF_SIZE_BASE, sizeof(uint8_t));
 			//printf("allocated dst buffer %d: %x\n",i,dst_buffs[i]);
+
+			for (size_t ii = 0; ii < mem_buf_size*BUF_SIZE_BASE; ii += page_size) {
+				dst_buffs[i][ii] = 0;
+			}
 		}
+
 	}
 
 	// ind_size is the effective number of buffers either allocated explicitly or partitioned from a single buffer
@@ -444,7 +531,7 @@ int main(int argc, char **argv)
     //}
 
 	//printf("finished randomizing index\n");
-    //unsigned long long num_iters_per_thread = total_num_iters / num_threads;
+    unsigned long long num_iters_per_thread = total_num_iters / num_threads;
     //unsigned long long remainder = total_num_iters - (num_iters_per_thread * num_threads);
 
     uint32_t bufs_per_thread = overall_ind_size / num_threads;
@@ -453,7 +540,7 @@ int main(int argc, char **argv)
     //printf("num bufs per thread %d\n",bufs_per_thread);
 
 	for(int t = 0; t < num_threads; ++t) {
-        p[t].max_iters = total_num_iters; //  num_iters_per_thread;
+        p[t].max_iters = num_iters_per_thread;
         p[t].mem_ops = mem_ops;
         p[t].sleep_time_us = sleep_time_us;
         p[t].transaction_size = transaction_size;
@@ -477,6 +564,7 @@ int main(int argc, char **argv)
 	for(int t = 0; t < num_threads; ++t) {
 		thrd_join(threads[t], NULL);
         //printf("thread %d done\n", t);
+		cycles += p[t].cycles;
     }
 
     for(int i=0;i<num_mem_bufs;++i) {
@@ -490,6 +578,17 @@ int main(int argc, char **argv)
 	    free(dst_buffs);
     free(src_addrs);
     free(dst_addrs);
+
+	float secs;
+	latency = 1.0 * cycles / (num_threads*num_iters_per_thread);
+
+	secs = (float)cycles/cycles_per_sec;
+	bw = (num_threads*num_iters_per_thread) * (transaction_size*BUF_SIZE_BASE/secs)/1000000000;
+	float latency_ns = (latency * 1E9)/cycles_per_sec;
+
+	printf("'''\n");
+	printf("# BW %f GB/s Latency %f ns cycles per second %llu\n",bw,latency, cycles_per_sec);
+	printf("micro_stats={'BW':%f, 'latency':%f, 'cycles_per_sec':%llu}\n",bw,latency_ns,cycles_per_sec);
 		
 #ifdef PRINT_OUTPUT	
 	//printf("all threads completed execution\n");

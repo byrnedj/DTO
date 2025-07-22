@@ -12,6 +12,9 @@ libdto: dto.c
 libdtodebug: dto.c
 	gcc -g -shared -fPIC -Wl,-soname,libdtodebug.so dto.c $(DML_LIB_CXX) -DDTO_STATS_SUPPORT -o libdtodebug.so.1.0 -laccel-config -ldl -lnuma
 
+libbare_dto: alldsa_dto.c
+	gcc -shared -fPIC -Wl,-soname,libbare-dto.so alldsa_dto.c $(DML_LIB_CXX) -DDTO_STATS_SUPPORT -o libbare-dto.so.1.0 -laccel-config -ldl -lnuma
+
 libdto-static: dto.c
 	gcc -c -o dto.o dto.c -D_GNU_SOURCE
 	ar rcs libdto.a dto.o
@@ -44,6 +47,9 @@ install-local-dev:
 install-local-nostats:
 	ln -sf ./libdtons.so.1.0 ./libdtons.so.1
 	ln -sf ./libdtons.so.1.0 ./libdtons.so
+
+test-latencies: test_measurement_latency.c
+	gcc -g test_measurement_latency.c $(DML_LIB_CXX) -o test_latencies -lpthread -lnuma -L ./
 
 dto-test: dto-test.c
 	gcc -g dto-test.c $(DML_LIB_CXX) -o dto-test -ldto -lpthread -L ./
@@ -78,8 +84,11 @@ dto-test-set-dev5: dto-test-settable-size5.c
 dto-test-set5: dto-test-settable-size5.c
 	gcc -g dto-test-settable-size5.c $(DML_LIB_CXX) -o dto-test-settable-size5 -ldto -lpthread -lnuma -L ./
 
-dto-test-set-dev5-nodto: dto-test-settable-size5.c
-	gcc -g dto-test-settable-size5.c $(DML_LIB_CXX) -o dto-test-settable-size-dev5-nodto -lpthread -lnuma -L ./
+dto-test-set5-nodto: dto-test-settable-size5.c
+	gcc -g dto-test-settable-size5.c $(DML_LIB_CXX) -o dto-test-settable-size5-nodto -lpthread -lnuma -L ./
+
+dto-test-set5-baredto: dto-test-settable-size5.c
+	gcc -g dto-test-settable-size5.c $(DML_LIB_CXX) -o dto-test-settable-size5-baredto -lbare-dto -lpthread -lnuma -L ./
 
 junk: junk.c
 	gcc -g junk.c $(DML_LIB_CXX) -o junk -lpthread -lnuma -L ./

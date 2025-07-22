@@ -481,19 +481,25 @@ int main(int argc, char **argv)
 		}
 	}
 
+    size_t page_size = getpagesize();
+
 	uint8_t** src_buffs = calloc(num_mem_bufs, sizeof(uint8_t*));
     for(uint32_t i=0;i<num_mem_bufs;++i) {
 		if (overlap_probability > 0) {
 			float buf_size_mult = (float)2-(float)percent_src_dst_overlap/100;
 			allocated_src_buf_size = (mem_buf_size*buf_size_mult);
-			src_buffs[i] = calloc(allocated_src_buf_size*BUF_SIZE_BASE, sizeof(uint8_t));
 			printf("allocated src buffer %u: %llu %f bytes %x\n",i,allocated_src_buf_size*BUF_SIZE_BASE, buf_size_mult, src_buffs[i]);
 	
 		}
 		else {
 			allocated_src_buf_size = mem_buf_size;
-			src_buffs[i] = calloc(allocated_src_buf_size*BUF_SIZE_BASE, sizeof(uint8_t));
 			printf("allocated src buffer %d: %llu bytes %x\n",i,allocated_src_buf_size*BUF_SIZE_BASE,src_buffs[i]);
+		}
+
+        src_buffs[i] = calloc(allocated_src_buf_size*BUF_SIZE_BASE, sizeof(uint8_t));
+
+        for (size_t ii = 0; ii < allocated_src_buf_size*BUF_SIZE_BASE; ii += page_size) {
+			src_buffs[i][ii] = 0;
 		}
 	}
 
@@ -520,6 +526,10 @@ int main(int argc, char **argv)
 		for(uint32_t i=0;i<num_mem_bufs;++i) {
 			dst_buffs[i] = calloc(mem_buf_size*BUF_SIZE_BASE, sizeof(uint8_t));
 			printf("allocated dst buffer %d: %x\n",i,dst_buffs[i]);
+
+            for (size_t ii = 0; ii < mem_buf_size*BUF_SIZE_BASE; ii += page_size) {
+				dst_buffs[i][ii] = 0;
+			}
 		}
 	}
 	
@@ -583,7 +593,7 @@ int main(int argc, char **argv)
         printf("%d: src addr %x dst addr %x overlapping dst %x\n",i,src_addrs[i],dst_addrs[i], overlapping_dst_addrs[i]);
     }
 
-    //unsigned long long num_iters_per_thread = num_iter / num_threads;
+    unsigned long long num_iters_per_thread = num_iter / num_threads;
     //unsigned long long remainder = num_iter - (num_iters_per_thread * num_threads);
 
     uint32_t bufs_per_thread = ind_size / num_threads;
@@ -595,7 +605,7 @@ int main(int argc, char **argv)
 	for(int t = 0; t < num_threads; ++t) {
         p[t].cum_probs = cum_probs;
         p[t].entries = entries;
-        p[t].max_iters = num_iter;  //num_iters_per_thread;
+        p[t].max_iters = num_iters_per_thread;
         p[t].indicees = indicees;
         p[t].overlaping_inds = overlaping_inds;
         p[t].start_ind = t*indicees_per_thread;

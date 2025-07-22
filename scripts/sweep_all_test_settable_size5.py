@@ -14,7 +14,7 @@ from set_frequency import SetCoreFrequency,SetUncoreFrequency
 parser = argparse.ArgumentParser()
 
 # Add arguments
-parser.add_argument('--output-type', type=str, default='perf', help='output type: perf | DTO-python | emon')
+parser.add_argument('--output-type', type=str, default='perf', help='output type: perf | DTO-python | emon | micro')
 parser.add_argument('--run-name', type=str, default='test', help='name to be used in output directory')
 parser.add_argument('--num-threads-override', type=int, default=None, help='override number of threads from config file')
 parser.add_argument('--num-iter', type=int, default=10000000, help='number of iterations')
@@ -36,6 +36,7 @@ parser.add_argument('--perc-buffer-overlap', type=int, default=0, help='percenta
 parser.add_argument('--overlap-probability', type=int, default=0, help='probability of overlap as a percentage between 0 and 100')
 parser.add_argument('--overlapping-move-action', type=str, default='cpu', help='Action to be taken for overlapping memmove')
 parser.add_argument('--control-frequencies', action='store_true', help='control core and uncore frequencies')
+parser.add_argument('--dto-version', type=str, default='dev', help='dto version')
 
 # Parse the arguments
 args = parser.parse_args()
@@ -100,14 +101,11 @@ map_numa_config = {'unaware': 'u', 'buffer': 'b', 'cpu':'c', 'antibuffer': 'ab',
 
 map_wait_method = {'yield': 'y', 'busypoll': 'b', 'umwait': 'uw'}
 
-dto_command_base_settable = ['../dto-test-settable-size-dev5']
-dto_command_base_distribution = ['../dto-test-distribution-multithread-dev5']
-
 run_taskset = True
 dry_run = args.dry_run   #False
 overwrite = args.overwrite
 # Output choices are: 'DTO-python' or  'emon'  or 'perf'
-output_type = args.output_type  #'perf'  #'emon' # 'DTO-python'  #  'perf'
+output_type = args.output_type  #'perf'  #'emon' # 'DTO-python'  #  'perf'  # 'micro'
 cfg_filepath = args.cfg_filepath
 results_dirname = args.results_dirname
 run_name = args.run_name  #'test_perf'
@@ -128,6 +126,17 @@ perc_buffer_overlap = args.perc_buffer_overlap
 overlap_probability = args.overlap_probability
 overlapping_move_action = args.overlapping_move_action
 control_frequencies = args.control_frequencies
+dto_version = args.dto_version
+
+if dto_version == 'dev':
+    dto_command_base_settable = ['../dto-test-settable-size-dev5']  
+elif dto_version == 'extern':
+    dto_command_base_settable = ['../dto-test-settable-size5']  
+else:
+    dto_command_base_settable =  ['../dto-test-settable-size5-nodto'] 
+
+dto_command_base_distribution = ['../dto-test-distribution-multithread-dev5']
+
 
 #if distribution_filepath is not None:
 #    dto_command_base = dto_command_base_distribution
@@ -223,6 +232,7 @@ config = {
     "perc_buffer_overlap" : perc_buffer_overlap,
     "overlap_probability": overlap_probability,
     "overlapping_move_action": overlapping_move_action,
+    "dto_version": dto_version,
 }
 
 if cfg_filepath is not None:
@@ -303,6 +313,9 @@ if cfg_filepath is not None:
         assert("core_frequencies" in loaded_config and "uncore_frequencies" in loaded_config), "Error: frequency control is selected, but core and uncore frequencies not found in config file"
         core_freqs = config["core_frequencies"] = loaded_config["core_frequencies"]
         uncore_freqs = config["uncore_frequencies"] = loaded_config["uncore_frequencies"]
+    else:
+        core_freqs = [None]
+        uncore_freqs = [None]
   
 if scale_buf_sizes_with_tx_size:
     mem_buf_sizes = config["mem_buf_sizes"] = sizes*len(total_buf_sizes)
@@ -405,7 +418,7 @@ if output_type == 'DTO-python':
         dto_env['DTO_COLLECT_ALG_STATS']='1'
         dto_env['DTO_COLLECT_ALG_STATS_LATEST_UPDATES']='1'
         dto_env['DTO_COLLECT_ALG_STATS_LATEST_CPUFRACTS']='1'
-elif output_type == 'perf':
+elif output_type in ['perf', 'micro']:
     dto_env['DTO_STATS_OUTPUT_TYPE']='0'
     if not no_stats:
         dto_env['DTO_COLLECT_STATS']='1'
@@ -594,7 +607,7 @@ for core_freq in core_freqs:
                                                                     print(' '.join(cmd))
                                                                     continue
 
-                                                                if output_type == 'DTO-python':
+                                                                if output_type in ['DTO-python', 'micro']:
                                                                     ext = 'py'
                                                                 else:
                                                                     ext = 'txt'
@@ -608,9 +621,9 @@ for core_freq in core_freqs:
                                                                 if output_type == 'perf':
                                                                     cmd = perf_command + cmd
 
-                                                                if output_type == 'DTO-python':
-                                                                    f.write("'''\n")
-                                                                    f.flush()
+                                                                if output_type in ['DTO-python', 'micro']:
+                                                                    outfiles[p].write("'''\n\n")
+                                                                    outfiles[p].flush()
                                                                 dto_procs.append(subprocess.Popen(cmd, env=dto_env, stdout=outfiles[p], stderr=outfiles[p])) # stdout=1, stderr=1) #
 
                                                             if not dry_run:
