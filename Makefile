@@ -9,6 +9,18 @@ DML_LIB_CXX=-D_GNU_SOURCE
 libdto: dto.c
 	gcc -shared -fPIC -Wl,-soname,libdto.so dto.c $(DML_LIB_CXX) -DDTO_STATS_SUPPORT -o libdto.so.1.0 -laccel-config -ldl -lnuma
 
+libdto-localq: extern_dto.c
+	gcc -shared -fPIC -Wl,-soname,libdto-localq.so dto.c $(DML_LIB_CXX) -DDTO_STATS_SUPPORT -o libdto-localq.so.1.0 -laccel-config -ldl -lnuma -mwaitpkg
+
+libdto-localq-timing: extern_dto.q_selector_timing.c
+	gcc -shared -fPIC -Wl,-soname,libdto-localq-timing.so extern_dto.q_selector_timing.c $(DML_LIB_CXX) -DDTO_STATS_SUPPORT -o libdto-localq-timing.so.1.0 -laccel-config -ldl -lnuma -mwaitpkg
+
+libdto-globalq-timing: extern_dto.q_selector_timing.c
+	gcc -shared -fPIC -Wl,-soname,libdto-globalq-timing.so extern_dto.q_selector_timing.c $(DML_LIB_CXX) -DDTO_STATS_SUPPORT -o libdto-globalq-timing.so.1.0 -laccel-config -ldl -lnuma -mwaitpkg
+
+libdto-autotiming: dto.c
+	gcc -shared -fPIC -Wl,-soname,libdto-autotiming.so extern_dto.autotune_timing.c $(DML_LIB_CXX) -DDTO_STATS_SUPPORT -o libdto-autotiming.so.1.0 -laccel-config -ldl -lnuma -mwaitpkg
+
 libdtodebug: dto.c
 	gcc -g -shared -fPIC -Wl,-soname,libdtodebug.so dto.c $(DML_LIB_CXX) -DDTO_STATS_SUPPORT -o libdtodebug.so.1.0 -laccel-config -ldl -lnuma
 
@@ -24,6 +36,9 @@ libmindto: min_dto.c
 
 libdto-dev: dev-dto.c
 	gcc -shared -fPIC -Wl,-soname,libdevdto.so dev-dto.c $(DML_LIB_CXX) -DDTO_STATS_SUPPORT -o libdevdto.so.1.0 -laccel-config -ldl -lnuma
+
+libdto-dev2: dev-dto_2.c
+	gcc -shared -fPIC -Wl,-soname,libdevdto2.so dev-dto_2.c $(DML_LIB_CXX) -DDTO_STATS_SUPPORT -o libdevdto2.so.1.0 -laccel-config -ldl -lnuma
 
 libdto-dev-debug: dev-dto.c
 	gcc -g -shared -fPIC -Wl,-soname,libdevdtodebug.so dev-dto.c $(DML_LIB_CXX) -DDTO_STATS_SUPPORT -o libdevdtodebug.so.1.0 -laccel-config -ldl -lnuma
@@ -81,8 +96,23 @@ dto-test-set-dev4: dto-test-settable-size4.c
 dto-test-set-dev5: dto-test-settable-size5.c
 	gcc -g dto-test-settable-size5.c $(DML_LIB_CXX) -o dto-test-settable-size-dev5 -ldevdto -lpthread -lnuma -L ./
 
+dto-test-set-dev5_2: dto-test-settable-size5_2.c
+	gcc -g dto-test-settable-size5_2.c $(DML_LIB_CXX) -o dto-test-settable-size-dev5_2 -ldevdto2 -lpthread -lnuma -L ./
+
 dto-test-set5: dto-test-settable-size5.c
 	gcc -g dto-test-settable-size5.c $(DML_LIB_CXX) -o dto-test-settable-size5 -ldto -lpthread -lnuma -L ./
+
+dto-test-set5-localq: dto-test-settable-size5.c
+	gcc -g dto-test-settable-size5.c $(DML_LIB_CXX) -o dto-test-settable-size5-localq -ldto-localq -lpthread -lnuma -L ./
+
+dto-test-set5-globalq-timing: dto-test-settable-size5.c
+	gcc -g dto-test-settable-size5.c $(DML_LIB_CXX) -o dto-test-settable-size5-globalq-timing -ldto-globalq-timing -lpthread -lnuma -L ./
+
+dto-test-set5-localq-timing: dto-test-settable-size5.c
+	gcc -g dto-test-settable-size5.c $(DML_LIB_CXX) -o dto-test-settable-size5-localq-timing -ldto-localq-timing -lpthread -lnuma -L ./
+
+dto-test-set5-autotiming: dto-test-settable-size5.c
+	gcc -g dto-test-settable-size5.c $(DML_LIB_CXX) -o dto-test-settable-size5-autotiming -ldto-autotiming -lpthread -lnuma -L ./
 
 dto-test-set5-nodto: dto-test-settable-size5.c
 	gcc -g dto-test-settable-size5.c $(DML_LIB_CXX) -o dto-test-settable-size5-nodto -lpthread -lnuma -L ./
@@ -93,6 +123,8 @@ dto-test-set5-baredto: dto-test-settable-size5.c
 junk: junk.c
 	gcc -g junk.c $(DML_LIB_CXX) -o junk -lpthread -lnuma -L ./
 
+test-atomic: test_atomic.c
+	gcc -g test_atomic.c $(DML_LIB_CXX) -o junk -lpthread -L ./
 
 dto-test-set-dev6: dto-test-settable-size6.c
 	gcc -g dto-test-settable-size6.c $(DML_LIB_CXX) -o dto-test-settable-size-dev6 -ldevdto -lpthread -lnuma -L ./

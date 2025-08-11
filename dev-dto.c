@@ -114,6 +114,7 @@ static struct dto_device* devices[MAX_NUMA_NODES];
 static uint8_t num_wqs;
 static uint8_t num_wqs_for_cleanup;
 static atomic_uchar next_wq;
+//static __thread uint8_t next_wq;
 static atomic_uchar dto_initialized;
 static atomic_uchar dto_initializing;
 static uint8_t use_std_lib_calls;
@@ -345,7 +346,7 @@ static atomic_ullong global_op_counter = 0;
 static atomic_uint_fast16_t latest_updates[MAX_AUTOTUNE_OP_TYPES*MAX_AUTOTUNE_INSTANCES][NUM_LATEST_UPDATES];
 static atomic_uint_fast8_t latest_cpu_fract[MAX_AUTOTUNE_OP_TYPES*MAX_AUTOTUNE_INSTANCES][NUM_LATEST_UPDATES];
 
-enum stats_output_type {
+enum stats_output_types {
 	STATS_TEXT = 0,
 	STATS_DICT,
 	STATS_TEXT_OLD_FORMAT,
@@ -1263,7 +1264,7 @@ static void print_stats_old_format(void)
 	LOG_STATS("%-17s -- ", "Byte Range");
 	for (int g = 0; g < MAX_STAT_GROUP - 1; ++g) {
 		if (g != DSA_CALL_FAILED_STDC_CALL) {
-			for (int o = 0; o < MAX_MEMOP; ++o)
+			for (int o = 0; o < MAX_MEMOP-1; ++o)
 				LOG_STATS("%-8s ", memop_names[o]);
 			LOG_STATS("%-12s ", "bytes");
 		}
@@ -1277,7 +1278,7 @@ static void print_stats_old_format(void)
 		bool empty = true;
 
 		for (int g = 0; g < MAX_STAT_GROUP; ++g) {
-			for (int o = 0; o < MAX_MEMOP; ++o) {
+			for (int o = 0; o < MAX_MEMOP-1; ++o) {
 				if (op_counter[b][g][o] != 0) {
 					empty = false;
 					break;
@@ -1296,7 +1297,7 @@ static void print_stats_old_format(void)
 
 		for (int g = 0; g < MAX_STAT_GROUP - 1; ++g) {
 			if (g != DSA_CALL_FAILED_STDC_CALL) {
-				for (int o = 0; o < MAX_MEMOP; ++o) {
+				for (int o = 0; o < MAX_MEMOP-1; ++o) {
 					LOG_STATS("%-8d ", op_counter[b][g][o]);
 				}
 		
@@ -2701,6 +2702,36 @@ static void cleanup_dto(void)
 	cleanup_devices();
 }
 
+/*
+static __always_inline  struct dto_wq *get_wq_special(void* buf, size_t n, uint32_t thread_id, uint64_t transaction_num)  //, uint8_t op)
+{
+	struct dto_wq* wq = NULL;
+
+	if (is_numa_aware) {
+		int status[1] = {-1};
+
+		// get the numa node for the target DSA device
+		const int numa_node = get_numa_node(buf);
+		if (numa_node >= 0 && numa_node < MAX_NUMA_NODES) {
+			struct dto_device* dev = devices[numa_node];
+			if (dev != NULL &&
+				dev->num_wqs > 0) {
+				wq = dev->wqs[dev->next_wq++ % dev->num_wqs];
+			}
+		}
+	}
+
+	if (wq == NULL) {
+
+		
+		printf("thread %d transaction %llu next wq %d\n",thread_id, transaction_num, next_wq);
+		wq = &wqs[next_wq++ % num_wqs];
+	}
+
+	return wq;
+}
+*/
+
 static __always_inline  struct dto_wq *get_wq(void* buf, size_t n)  //, uint8_t op)
 {
 	struct dto_wq* wq = NULL;
@@ -2734,7 +2765,7 @@ static __always_inline  struct dto_wq *get_wq(void* buf, size_t n)  //, uint8_t 
 			auto_tune_states[instance].next_wq = ((auto_tune_states[instance].next_wq+1) % auto_tune_states[instance].num_wqs) + auto_tune_states[instance].wq_index_offset;
 		}
 		*/
-		
+		//printf("next wq %d\n",next_wq);
 		wq = &wqs[next_wq++ % num_wqs];
 	}
 
@@ -2845,6 +2876,140 @@ static bool is_overlapping_buffers (void *dest, const void *src, size_t n)
 
 	return true;
 }
+
+/*
+static uint8_t dto_memcpymove_special(void *dest, const void *src, size_t n, bool is_memcpy, int *result, uint32_t thread_id, uint64_t transaction_num)
+{
+	struct dto_wq *wq = get_wq(dest, n);
+	size_t cpu_size, dsa_size, unsplit_size;
+	char is_overlapping = 0;
+
+	//printf("work queue %d \n",wq->index);
+
+	//printf("thread id %d transaction %llu work queue %d \n",thread_id, transaction_num, wq->index);
+
+	thr_desc.opcode = DSA_OPCODE_MEMMOVE;
+	thr_desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
+	if (dto_dsa_cc && (wq->dsa_gencap & GENCAP_CC_MEMORY))
+		thr_desc.flags |= IDXD_OP_FLAG_CC;
+	thr_desc.completion_addr = (uint64_t)&thr_comp;
+
+	uint8_t op;
+	if (is_memcpy)
+		op = MEMCOPY;
+	else
+		op = MEMMOVE;
+
+	size_t cpu_size_fraction = auto_tune_states[get_algorithm_instance(n,op)].cpu_size_fraction;
+
+	//LOG_TRACE("dto_memcpymove size %d cpu fraction %d alg instance %u\n",n,cpu_size_fraction,get_algorithm_instance(n,MEMCOPY));
+	
+	if (!is_memcpy && is_overlapping_buffers(dest, src, n)) {
+		cpu_size = 0;
+		is_overlapping = 1;
+	}
+	else {
+		cpu_size = n * cpu_size_fraction / 100;
+	}
+
+	dsa_size = n - cpu_size;
+
+	thr_bytes_completed = 0;
+
+#ifdef DTO_STATS_SUPPORT
+	thr_bytes_completed_cpu = 0;
+#endif
+
+	int max_transfer_size = dsa_max_size < wq->max_transfer_size ? dsa_max_size : wq->max_transfer_size;  //JJS
+
+	//printf("size %u max tranfer size %u\n",n,max_transfer_size);
+
+	//if (dsa_size <= wq->max_transfer_size) {
+	if (dsa_size <= max_transfer_size) {  //JJS
+		thr_desc.src_addr = (uint64_t) src + cpu_size;
+		thr_desc.dst_addr = (uint64_t) dest + cpu_size;
+		thr_desc.xfer_size = (uint32_t) dsa_size;
+		thr_comp.status = 0;
+		unsplit_size = n;
+		//LOG_TRACE("dto_memcpy size %d \n",unsplit_size);
+		if (is_overlapping){
+			if (dto_overlapping_memmove_action == OVERLAPPING_DSA) {
+				*result = dsa_execute(wq, &thr_desc, &thr_comp.status);
+			} else {
+				thr_bytes_completed = 0;
+				*result = SUCCESS;
+			}
+		} else {
+			*result = dsa_submit(wq, &thr_desc, 1);
+			if (*result == SUCCESS) {
+				if (cpu_size) {
+					if (is_memcpy)
+						orig_memcpy(dest, src, cpu_size);
+					else
+						orig_memmove(dest, src, cpu_size);
+					thr_bytes_completed += cpu_size;
+#ifdef DTO_STATS_SUPPORT
+					thr_bytes_completed_cpu += cpu_size ;
+#endif
+				}
+				*result = dsa_wait(wq, &thr_desc,  unsplit_size, &thr_comp.status,op);
+			}
+		}
+	} else {
+		uint32_t threshold;
+		threshold = max_transfer_size * 100 / (100 - cpu_size_fraction);
+
+		do {
+			size_t len;
+
+			len = n <= threshold ? n : threshold;
+
+			if (!is_memcpy && is_overlapping_buffers(dest, src, len))
+				cpu_size = 0;
+			else
+				cpu_size = len * cpu_size_fraction / 100;
+
+			dsa_size = len - cpu_size;
+
+			thr_desc.src_addr = (uint64_t) src + cpu_size + thr_bytes_completed;
+			thr_desc.dst_addr = (uint64_t) dest + cpu_size + thr_bytes_completed;
+			thr_desc.xfer_size = (uint32_t) dsa_size;
+			thr_comp.status = 0;
+			unsplit_size = len;
+			//LOG_TRACE("dto_memcpy size %d \n",unsplit_size);
+			if (is_overlapping){
+				*result = dsa_execute(wq, &thr_desc, &thr_comp.status);
+			}
+			else{
+				*result = dsa_submit(wq, &thr_desc, 1);
+				if (*result == SUCCESS) {
+					if (cpu_size) {
+						const void *src1 = src + thr_bytes_completed;
+						void *dest1 = dest + thr_bytes_completed;
+
+						if (is_memcpy)
+							orig_memcpy(dest1, src1, cpu_size);
+						else
+							orig_memmove(dest1, src1, cpu_size);
+						thr_bytes_completed += cpu_size;
+#ifdef DTO_STATS_SUPPORT
+						thr_bytes_completed_cpu += cpu_size ;
+#endif
+					}
+					*result = dsa_wait(wq, &thr_desc,  unsplit_size, &thr_comp.status, op);
+				}
+			}
+
+			if (*result != SUCCESS)
+				break;
+			n -= len;
+			
+		} while (n >= dsa_min_size);
+	}
+	return wq->index;
+}
+
+*/
 
 static uint8_t dto_memcpymove(void *dest, const void *src, size_t n, bool is_memcpy, int *result)
 {
@@ -3165,6 +3330,92 @@ if (unlikely(collect_stats)) {
 	}
 	return ret;
 }
+
+/*
+uint8_t memcpy_special(void *dest, const void *src, size_t n, uint32_t thread_id, uint64_t transaction_num)
+{
+	int result = 0;
+	void *ret = dest;
+	int use_orig_func = USE_ORIG_FUNC(n, dto_dsa_memcpy);
+#ifdef DTO_STATS_SUPPORT
+	struct timespec st, et;
+	size_t orig_n = n;
+#endif
+
+	uint8_t wq_index;
+
+	//LOG_TRACE("memcpy size %d src %x dest %x\n",n,src,dest);
+
+	if (unlikely(dto_initialized == 0)) {
+		
+		return dto_internal_memcpymove(dest, src, n);
+	}
+
+
+#ifdef DTO_STATS_SUPPORT
+	if (unlikely(collect_stats)) {
+		if (global_op_counter < dto_stats_num_warmup_ops) {  
+				++ global_op_counter;  
+		}
+		//else { 
+		//	if (n >= dsa_min_size) {
+				//LOG_TRACE("memcpy src numa node %d dest numa node %d\n",get_numa_node_buf((void*)src),get_numa_node_buf(dest));
+		//		numa_node_counts[MEMCPY_DST][get_numa_node_buf(dest)]++;
+		//		numa_node_counts[MEMCPY_SRC][get_numa_node_buf((void*)src)]++;
+		//	}
+		//}
+	}
+#endif
+
+
+	if (!use_orig_func) {
+#ifdef DTO_STATS_SUPPORT
+		DTO_COLLECT_STATS_START(collect_stats, st);
+#endif
+		wq_index = dto_memcpymove_special(dest, src, n, 1, &result,thread_id, transaction_num);
+
+#ifdef DTO_STATS_SUPPORT
+		DTO_COLLECT_STATS_DSA_END(collect_stats, st, et, MEMCOPY, n, 0, thr_bytes_completed, thr_bytes_completed_cpu, result);
+#endif
+		if (thr_bytes_completed != n) {
+			
+			//use_orig_func = 1;
+			n -= thr_bytes_completed;
+			if (thr_comp.result == 0) {
+				dest = (void *)((uint64_t)dest + thr_bytes_completed);
+				src = (const void *)((uint64_t)src + thr_bytes_completed);
+			}
+
+			// Add call to orig_memset here, so we can keep track of the stats for this case separately from the case where
+			// orig_memset was called from the start
+#ifdef DTO_STATS_SUPPORT
+			DTO_COLLECT_STATS_START(collect_stats, st);
+#endif
+
+			orig_memcpy(dest, src, n);
+
+#ifdef DTO_STATS_SUPPORT
+			DTO_COLLECT_STATS_CPU_END(collect_stats, st, et, MEMCOPY, n, orig_n, 0, use_orig_func);
+#endif
+
+		}
+	}
+
+	//if (use_orig_func) {
+	else {
+#ifdef DTO_STATS_SUPPORT
+		DTO_COLLECT_STATS_START(collect_stats, st);
+#endif
+
+		orig_memcpy(dest, src, n);
+
+#ifdef DTO_STATS_SUPPORT
+		DTO_COLLECT_STATS_CPU_END(collect_stats, st, et, MEMCOPY, n, orig_n, 0, use_orig_func);
+#endif
+	}
+	return wq_index;
+}
+*/
 
 void *memcpy(void *dest, const void *src, size_t n)
 {

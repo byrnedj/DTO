@@ -391,6 +391,40 @@
 #python sweep_all_test_settable_size5.py --output-type micro --run-name size-sweep-turbo-extern-no_2 --cfg-filepath ./configs/junk4.json  --dto-version extern --no-stats --num-iter 10000000 --exclude-pfs --num-dsas 1 --results-dirname  128k_turbo_dsa10_cstates_uncmax_extern_no_stats_full_2
 #python sweep_all_test_settable_size5.py --output-type micro --run-name size-sweep-turbo-extern-no_3 --cfg-filepath ./configs/junk4.json  --dto-version extern --no-stats --num-iter 10000000 --exclude-pfs --num-dsas 1 --results-dirname  128k_turbo_dsa10_cstates_uncmax_extern_no_stats_full_3
 
-python sweep_all_test_settable_size5.py --output-type perf --run-name size-sweep-turbo-dev-alg-stats_1 --cfg-filepath ./configs/junk5.json  --dto-version dev --alg-stats --num-iter 10000000 --exclude-pfs --num-dsas 1 --results-dirname  128k_turbo_dsa10_cstates_uncmax_dev_alg_stats_full_1
+#python sweep_all_test_settable_size5.py --output-type perf --run-name size-sweep-turbo-dev-alg-stats_1 --cfg-filepath ./configs/junk5.json  --dto-version dev --alg-stats --num-iter 10000000 --exclude-pfs --num-dsas 1 --results-dirname  128k_turbo_dsa10_cstates_uncmax_dev_alg_stats_full_1
 
 #python sweep_all_test_settable_size5.py --output-type perf --run-name size-sweep-bf-dev-alg-stats_1 --cfg-filepath ./configs/junk5.json  --dto-version dev --alg-stats --num-iter 10000000 --exclude-pfs --num-dsas 1 --results-dirname  128k_bf_dsa10_cstates_uncmax_dev_alg_stats_full_1
+
+
+#python sweep_all_test_settable_size5.py --output-type micro --run-name global-q-selector-bf-extern-single --cfg-filepath ./configs/q_selector.json  --dto-version extern --no-stats --num-iter 10000000 --exclude-pfs --num-dsas 8 --results-dirname  global_q_selector_bf_singlenuma
+
+#python sweep_all_test_settable_size5.py --output-type micro --run-name local-q-selector-bf-extern-single --cfg-filepath ./configs/q_selector.json  --dto-version extern_localq --no-stats --num-iter 10000000 --exclude-pfs --num-dsas 8 --results-dirname  local_q_selector_bf_singlenuma
+
+#python sweep_all_test_settable_size5.py --output-type micro --run-name global-q-selector-bf-extern-cross --cfg-filepath ./configs/q_selector.json  --dto-version extern --no-stats --num-iter 10000000 --exclude-pfs --num-dsas 8 --cross-numa --results-dirname  global_q_selector_bf_crossnuma
+
+#python sweep_all_test_settable_size5.py --output-type micro --run-name local-q-selector-bf-extern-cross --cfg-filepath ./configs/q_selector.json  --dto-version extern_localq --no-stats --num-iter 10000000 --exclude-pfs --num-dsas 8 --cross-numa --results-dirname  local_q_selector_bf_crossnuma
+
+
+#python sweep_all_test_settable_size5.py --output-type micro --run-name global-q-selector-bf-extern --cfg-filepath ./configs/q_selector2.json --dto-version extern --no-stats --num-iter 10000000 --exclude-pfs --num-dsas 8 --start-cpu 1 --results-dirname  global_q_selector_bf_2
+
+#python sweep_all_test_settable_size5.py --output-type micro --run-name local-q-selector-bf-extern  --cfg-filepath ./configs/q_selector2.json --dto-version extern --no-stats --num-iter 10000000 --exclude-pfs --num-dsas 8 --start-cpu 1 --results-dirname local_q_selector_bf_2
+
+
+#python sweep_all_test_settable_size5.py --output-type micro --run-name redis-bf-extern-no-stats --cfg-filepath ./configs/reddis_sizes.json  --dto-version extern --no-stats --num-iter 10000000 --exclude-pfs --num-dsas 1 --results-dirname  bf_redis_no_stats
+#python sweep_all_test_settable_size5.py --output-type perf --run-name redis-bf-extern-with-stats --cfg-filepath ./configs/reddis_sizes.json  --dto-version extern --num-iter 10000000 --exclude-pfs --num-dsas 1 --results-dirname  bf_redis_with_stats
+#python sweep_all_test_settable_size5.py --output-type micro --run-name redis-bf-extern-no-dto --cfg-filepath ./configs/reddis_sizes.json  --dto-version no --no-stats --num-iter 10000000 --exclude-pfs --num-dsas 1 --results-dirname  bf_redis_no_dto
+
+
+#python sweep_all_test_settable_size5.py --output-type perf --run-name size-sweep-o2-extern-with-stats_1 --cfg-filepath ./configs/tx_size_comparison_subset.json  --dto-version extern --num-iter 10000000 --exclude-pfs --num-dsas 1 --results-dirname  tx_size_bf_o2_extern_with_stats
+#python sweep_all_test_settable_size5.py --output-type micro --run-name size-sweep-o2-extern-no-stats_1 --cfg-filepath ./configs/tx_size_comparison_subset.json  --dto-version extern --no-stats --num-iter 10000000 --exclude-pfs --num-dsas 1 --results-dirname  tx_size_bf_o2_extern_no_stats 
+#python sweep_all_test_settable_size5.py --output-type perf --run-name size-sweep-o2-extern-with-stats_2 --cfg-filepath ./configs/tx_size_comparison_subset.json  --dto-version extern --num-iter 10000000 --exclude-pfs --num-dsas 1 --results-dirname  tx_size_bf_o2_extern_with_stats
+#python sweep_all_test_settable_size5.py --output-type micro --run-name size-sweep-o2-extern-no-stats_2 --cfg-filepath ./configs/tx_size_comparison_subset.json  --dto-version extern --no-stats --num-iter 10000000 --exclude-pfs --num-dsas 1 --results-dirname  tx_size_bf_o2_extern_no_stats
+#python sweep_all_test_settable_size5.py --output-type micro --run-name size-sweep-o2-extern-no-stats_3 --cfg-filepath ./configs/tx_size_comparison_subset.json  --dto-version extern --no-stats --num-iter 10000000 --exclude-pfs --num-dsas 1 --results-dirname  tx_size_bf_o2_extern_no_stats
+#python sweep_all_test_settable_size5.py --output-type perf --run-name size-sweep-o2-extern-with-stats_3 --cfg-filepath ./configs/tx_size_comparison_subset.json  --dto-version extern --num-iter 10000000 --exclude-pfs --num-dsas 1 --results-dirname  tx_size_bf_o2_extern_with_stats
+
+#python sweep_all_test_settable_size5.py --output-type perf --run-name size-sweep-unopt-extern-with-stats_1 --cfg-filepath ./configs/tx_size_comparison_subset.json  --dto-version extern --num-iter 10000000 --exclude-pfs --num-dsas 1 --results-dirname  tx_size_bf_unopt_extern_with_stats 
+python sweep_all_test_settable_size5.py --output-type micro --run-name size-sweep-unopt-extern-no-stats_1 --cfg-filepath ./configs/tx_size_comparison_subset.json  --dto-version extern --no-stats --num-iter 10000000 --exclude-pfs --num-dsas 1 --results-dirname  tx_size_bf_unopt_extern_no_stats 
+#python sweep_all_test_settable_size5.py --output-type perf --run-name size-sweep-unopt-extern-with-stats_2 --cfg-filepath ./configs/tx_size_comparison_subset.json  --dto-version extern --num-iter 10000000 --exclude-pfs --num-dsas 1 --results-dirname  tx_size_bf_unopt_extern_with_stats
+#python sweep_all_test_settable_size5.py --output-type micro --run-name size-sweep-unopt-extern-no-stats_2 --cfg-filepath ./configs/tx_size_comparison_subset.json  --dto-version extern --no-stats --num-iter 10000000 --exclude-pfs --num-dsas 1 --results-dirname  tx_size_bf_unopt_extern_no_stats
+#python sweep_all_test_settable_size5.py --output-type micro --run-name size-sweep-unopt-extern-no-stats_3 --cfg-filepath ./configs/tx_size_comparison_subset.json  --dto-version extern --no-stats --num-iter 10000000 --exclude-pfs --num-dsas 1 --results-dirname  tx_size_bf_unopt_extern_no_stats
+#python sweep_all_test_settable_size5.py --output-type perf --run-name size-sweep-unopt-extern-with-stats_3 --cfg-filepath ./configs/tx_size_comparison_subset.json  --dto-version extern --num-iter 10000000 --exclude-pfs --num-dsas 1 --results-dirname  tx_size_bf_unopt_extern_with_stats

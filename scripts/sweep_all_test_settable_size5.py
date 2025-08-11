@@ -37,6 +37,8 @@ parser.add_argument('--overlap-probability', type=int, default=0, help='probabil
 parser.add_argument('--overlapping-move-action', type=str, default='cpu', help='Action to be taken for overlapping memmove')
 parser.add_argument('--control-frequencies', action='store_true', help='control core and uncore frequencies')
 parser.add_argument('--dto-version', type=str, default='dev', help='dto version')
+parser.add_argument('--start-cpu', type=int, default=56, help='starting cpu number for taskset')
+parser.add_argument('--cross-numa', action='store_true', help='spread threads onto cpu cores on both numas')
 
 # Parse the arguments
 args = parser.parse_args()
@@ -127,13 +129,17 @@ overlap_probability = args.overlap_probability
 overlapping_move_action = args.overlapping_move_action
 control_frequencies = args.control_frequencies
 dto_version = args.dto_version
+taskset_startcpu = args.start_cpu
+cross_numa = args.cross_numa
 
 if dto_version == 'dev':
     dto_command_base_settable = ['../dto-test-settable-size-dev5']  
 elif dto_version == 'extern':
     dto_command_base_settable = ['../dto-test-settable-size5']  
-else:
+elif dto_version == 'no':
     dto_command_base_settable =  ['../dto-test-settable-size5-nodto'] 
+elif dto_version == 'extern_localq':
+    dto_command_base_settable =  ['../dto-test-settable-size5-localq']
 
 dto_command_base_distribution = ['../dto-test-distribution-multithread-dev5']
 
@@ -148,7 +154,7 @@ scale_buf_sizes_with_tx_size = False
 total_buf_sizes = [8*1024] # [64, 8*1024]  # [8*1024] #in MB
 
 
-taskset_startcpu = 56
+
 
 #sizes = [2**x for x in range(3,11)]   #8-1024
 sizes = [2**x for x in range(4,11)]  #16-1024
@@ -430,7 +436,10 @@ elif output_type in ['perf', 'micro']:
 
 
 if control_frequencies and not dry_run:
-    cores = list(range(taskset_startcpu,taskset_startcpu+np.max(thread_counts)+1))
+    if cross_numa:
+        cores = list(range(taskset_startcpu-int(np.ceil(np.max(thread_counts)/2)),taskset_startcpu+int(np.ceil(np.max(thread_counts)/2)-1)))
+    else:
+        cores = list(range(taskset_startcpu,taskset_startcpu+np.max(thread_counts)))
     set_uncore_freq = SetUncoreFrequency()
     set_core_freq = SetCoreFrequency(cores)
 
@@ -445,17 +454,23 @@ for core_freq in core_freqs:
             name = base_name
 
         for num_threads, num_bursting_threads in zip(thread_counts,bursting_thread_counts):
+
+            if cross_numa:
+                cores = list(range(taskset_startcpu-int(np.ceil(num_threads/2)),taskset_startcpu+int(np.ceil(num_threads/2)-1)))
+            else:
+                cores = list(range(taskset_startcpu,taskset_startcpu+num_threads))
+
             if separate_processes:
                 nt=1
                 nbt=0
                 taskset_commands = []
                 for p in range(num_threads):
-                    taskset_commands.append(['taskset', '-c', '{}'.format(taskset_startcpu+p)])
+                    taskset_commands.append(['taskset', '-c', '{}'.format(cores[p])])
                 ni = int(round(num_iter / num_threads,0))
             else:
                 nt = num_threads
                 nbt = num_bursting_threads
-                taskset_commands = [['taskset', '-c', '{}-{}'.format(taskset_startcpu,taskset_startcpu+num_threads)]]
+                taskset_commands = [['taskset', '-c', '{}-{}'.format(cores[0],cores[-1])]]
                 ni = num_iter
 
             for burst_size in burst_sizes:

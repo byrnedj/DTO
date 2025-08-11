@@ -157,6 +157,8 @@ int thread_func(void *thr_data)
 		sleep(warmup_time_s);
 	}
 
+    // max_iters is the total iters for all threads. If number of threads is > 1 this loop will never complete.
+	// atomic variable no_ops keeps track of the total across all trheads and There is a check against no_op with a break which causes the loop to exit.
     for (unsigned long long i=0; i < max_iters; ++i) {
         ind = indicees[(start_ind+i)%num_indicees];
         overlapping = overlaping_inds[(start_ind+i)%num_indicees];
@@ -593,8 +595,6 @@ int main(int argc, char **argv)
         printf("%d: src addr %x dst addr %x overlapping dst %x\n",i,src_addrs[i],dst_addrs[i], overlapping_dst_addrs[i]);
     }
 
-    unsigned long long num_iters_per_thread = num_iter / num_threads;
-    //unsigned long long remainder = num_iter - (num_iters_per_thread * num_threads);
 
     uint32_t bufs_per_thread = ind_size / num_threads;
     uint32_t indicees_per_thread = index_length / num_threads;
@@ -605,7 +605,7 @@ int main(int argc, char **argv)
 	for(int t = 0; t < num_threads; ++t) {
         p[t].cum_probs = cum_probs;
         p[t].entries = entries;
-        p[t].max_iters = num_iters_per_thread;
+        p[t].max_iters = num_iter;  // We pass the total number and the threads use an atomic to track how many total ops have been performed
         p[t].indicees = indicees;
         p[t].overlaping_inds = overlaping_inds;
         p[t].start_ind = t*indicees_per_thread;

@@ -24,7 +24,7 @@
 //#define ALLOC_SIZE (2*1024UL*1024UL)
 #define MEMSET_PATTERN 'a'
 
-#define MAX_THREADS 50 
+#define MAX_THREADS 200 
 #define LOG_COUNT 100000
 #define PRINT_OUTPUT 1
 
@@ -185,7 +185,8 @@ int thread_func(void *thr_data)
 
     //uint64_t incr = max_iters/sleep_time_us;
 
-
+	// max_iters is the total iters for all threads. If number of threads is > 1 this loop will never complete.
+	// atomic variable no_ops keeps track of the total across all trheads and There is a check against no_op with a break which causes the loop to exit.
 	for (unsigned long long i=0; i < max_iters; ++i) {
         s = src_buffs[i%num_mem_bufs];
         d = dst_buffs[i%num_mem_bufs];
@@ -531,8 +532,6 @@ int main(int argc, char **argv)
     //}
 
 	//printf("finished randomizing index\n");
-    unsigned long long num_iters_per_thread = total_num_iters / num_threads;
-    //unsigned long long remainder = total_num_iters - (num_iters_per_thread * num_threads);
 
     uint32_t bufs_per_thread = overall_ind_size / num_threads;
 
@@ -540,7 +539,7 @@ int main(int argc, char **argv)
     //printf("num bufs per thread %d\n",bufs_per_thread);
 
 	for(int t = 0; t < num_threads; ++t) {
-        p[t].max_iters = num_iters_per_thread;
+        p[t].max_iters = total_num_iters;  // We pass the total number and the threads use an atomic to track how many total ops have been performed
         p[t].mem_ops = mem_ops;
         p[t].sleep_time_us = sleep_time_us;
         p[t].transaction_size = transaction_size;
@@ -580,14 +579,14 @@ int main(int argc, char **argv)
     free(dst_addrs);
 
 	float secs;
-	latency = 1.0 * cycles / (num_threads*num_iters_per_thread);
+	latency = 1.0 * cycles / total_num_iters;
 
 	secs = (float)cycles/cycles_per_sec;
-	bw = (num_threads*num_iters_per_thread) * (transaction_size*BUF_SIZE_BASE/secs)/1000000000;
+	bw = total_num_iters * (transaction_size*BUF_SIZE_BASE/secs)/1000000000;
 	float latency_ns = (latency * 1E9)/cycles_per_sec;
 
 	printf("'''\n");
-	printf("# BW %f GB/s Latency %f ns cycles per second %llu\n",bw,latency, cycles_per_sec);
+	printf("# BW %f GB/s Latency %f ns cycles per second %llu\n",bw,latency_ns, cycles_per_sec);
 	printf("micro_stats={'BW':%f, 'latency':%f, 'cycles_per_sec':%llu}\n",bw,latency_ns,cycles_per_sec);
 		
 #ifdef PRINT_OUTPUT	
