@@ -140,6 +140,8 @@ elif dto_version == 'no':
     dto_command_base_settable =  ['../dto-test-settable-size5-nodto'] 
 elif dto_version == 'extern_localq':
     dto_command_base_settable =  ['../dto-test-settable-size5-localq']
+elif dto_version == 'dev_localq':
+    dto_command_base_settable =  ['../dto-test-settable-size-dev5-localq']
 
 dto_command_base_distribution = ['../dto-test-distribution-multithread-dev5']
 

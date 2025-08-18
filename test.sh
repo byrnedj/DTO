@@ -22,13 +22,13 @@
 #accel-config enable-wq dsa4/wq4.0
 #accel-config enable-wq dsa6/wq6.0
 
-export DTO_USESTDC_CALLS=1
-export DTO_COLLECT_STATS=0
+export DTO_USESTDC_CALLS=0
+export DTO_COLLECT_STATS=1
 export DTO_COLLECT_ALG_STATS=0
 export DTO_COLLECT_ALG_STATS_LATEST_UPDATES=1
 export DTO_COLLECT_ALG_STATS_LATEST_CPUFRACTS=1
 export DTO_STATS_PREFIX=''
-export DTO_STATS_OUTPUT_TYPE=1
+export DTO_STATS_OUTPUT_TYPE=2
 
 #export DTO_NUM_AUTOTUNE_INSTANCES=1
 export DTO_PER_OP_AUTOTUNE_INSTANCES=0
@@ -42,11 +42,11 @@ export DTO_WAIT_METHOD=busypoll  #yield  #
 #export DTO_WAIT_METHOD=sleep
 export DTO_MIN_BYTES=8192 # 65536  # 28672 #   16384  #              32768  #  16384  #
 export DTO_MAX_BYTES=2097152  #  8192  # 32768  #65536 #16384  #
-export DTO_CPU_SIZE_FRACTION=0.0  #0.33 # 0.64 # 0.0  #0.60  # 0.60 #
-export DTO_AUTO_ADJUST_KNOBS=0
+export DTO_CPU_SIZE_FRACTION=0.33 # 0.64 # 0.0  #0.60  # 0.60 #
+export DTO_AUTO_ADJUST_KNOBS=1
 export DTO_DSA_CC=1
 
-export DTO_LOG_LEVEL=0
+export DTO_LOG_LEVEL=2
 export DTO_MAKE_ADJ=0
 
 export DTO_SLEEP_DELAY_NS=100000
@@ -158,9 +158,28 @@ export DTO_OVERLAPPING_MEMMOVE_ACTION=1  # 0-CPU, 1-DSA
 
 #taskset -c 56-57 ./dto-test-settable-size-dev5 1 0 2 8 1000000 8388608 1 0 0 0 0 1 0 0 0 0
 
-#taskset -c 56-57 ./dto-test-settable-size-dev5 1 0 2 128 1000000 4194304 1 1 0 0 0 1 0 0 0 0
+taskset -c 56-57 ./dto-test-settable-size-dev5 1 0 2 128 100000 4194304 1 1 0 0 0 1 0 0 0 0
 
-/usr/bin/time taskset -c 56-57 ./dto-test-settable-size5        1 0 2 128 10000000 2097152 1 1 0 0 0 1 0 0 0 0
+#/usr/bin/time taskset -c 56-57 ./dto-test-settable-size5        1 0 2 128 10000000 2097152 1 1 0 0 0 1 0 0 0 0
+
+#taskset -c 56-88 ./dto-test-settable-size5-localq 32 0 2 128 1000000 2097152 1 1 0 0 0 1 0 0 0 0
+
+#taskset -c 1-49 ./dto-test-settable-size5 48 0 2 128 10000000 2097152 1 1 0 0 0 1 0 0 0 0
+
+#taskset -c 56-104 ./dto-test-settable-size5 48 0 2 128 10000000 2097152 1 1 0 0 0 1 0 0 0 0
+
+#taskset -c 56-71 ./dto-test-settable-size5 16 0 2 64 10000000 2097152 1 1 0 0 0 1 0 0 0 0
+
+#taskset -c 48-63 ./dto-test-settable-size5 16 0 2 128 10000000 2097152 1 1 0 0 0 1 0 0 0 0
+
+#taskset -c 56 ./dto-test-settable-size5 1 0 2 128 10000000 2097152 1 1 0 0 0 1 0 0 0 0
+
+#taskset -c 56-64 ./dto-test-settable-size-dev5_2 8 0 2 128 1000000 1024 1 1 0 0 0 1 0 0 0 0
+
+#taskset -c 56-63 ./dto-test-settable-size5-autotiming 8 0 2 64 10000000 1024 1 1 0 0 0 1 0 0 0 0
+
+#taskset -c 40-71 ./dto-test-settable-size5-autotiming 32 0 2 64 10000000 2097152 1 1 0 0 0 1 0 0 0 0
+
 #/usr/bin/time taskset -c 56-57 ./dto-test-settable-size5-nodto 1 0 2 128 10000000 2097152 1 1 0 0 0 1 0 0 0 0
 
 #/usr/bin/time taskset -c 56-57 ./dto-test-settable-size5-baredto 1 0 2 8 10000000 8 1 1 0 0 0 1 0 0 0 0
