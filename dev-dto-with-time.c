@@ -1180,13 +1180,13 @@ static void print_alg_stats_dict(void)
 		}
 		LOG_STATS("},\n");
 
-		LOG_STATS("'raw_wait_time_samples': {");
+		LOG_STATS("'all_wait_times': {");
 		for (uint64_t i=0;i<global_op_counter;++i){
 			LOG_STATS("%llu, ", raw_wait_times[i]);
 		}
 		LOG_STATS("],\n");
 
-        LOG_STATS("'sampled_wait_time_samples': {");
+        LOG_STATS("'wait_time_samples': {");
 		for (uint64_t i=0;i<sample_counter;++i){
 			LOG_STATS("%llu, ", sampled_wait_times[i]);
 		}
