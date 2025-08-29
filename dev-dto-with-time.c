@@ -414,6 +414,7 @@ static atomic_uint_fast16_t latest_updates[MAX_AUTOTUNE_OP_TYPES*MAX_AUTOTUNE_IN
 static atomic_uint_fast8_t latest_cpu_fract[MAX_AUTOTUNE_OP_TYPES*MAX_AUTOTUNE_INSTANCES][NUM_LATEST_UPDATES];
 static atomic_uint_fast16_t latest_avg_times[MAX_AUTOTUNE_OP_TYPES*MAX_AUTOTUNE_INSTANCES][NUM_LATEST_UPDATES];
 static atomic_uint_fast16_t raw_wait_times[MAX_OPS];
+static atomic_uint_fast16_t sampled_wait_times[MAX_OPS];
 
 enum stats_output_types {
 	STATS_TEXT = 0,
@@ -712,15 +713,17 @@ static __always_inline void dsa_wait_and_adjust(const volatile uint8_t *comp, si
 	uint16_t bucket = get_algorithm_instance(unsplit_size, op);
 	//LOG_TRACE("get_algorithm_instance returned %u\n",bucket);
 
+    start = rdtsc();
 	if ((++auto_tune_states[bucket].num_descs & DESCS_PER_RUN) != DESCS_PER_RUN) {
 		//LOG_TRACE("dsa_wait_and_adjust size %lu instance %u num_descs %u returning\n",unsplit_size, bucket, auto_tune_states[bucket].num_descs);
 		while (*comp == 0)
 			__dsa_wait(comp);
 
+        cycles = (rdtsc() - start);
+        raw_wait_times[global_op_counter] = cycles;
 		return;
 	}
 	
-	start = rdtsc();
 		
 	/* Run the heuristics as well as wait for DSA */
 	while (*comp == 0) {
@@ -730,7 +733,7 @@ static __always_inline void dsa_wait_and_adjust(const volatile uint8_t *comp, si
 
 	cycles = (rdtsc() - start);
 	//printf("%llu\n",cycles);
-	raw_wait_times[sample_counter++] = cycles;
+	sampled_wait_times[sample_counter++] = cycles;
 
 	if(autotune_exclude_failed && *comp != DSA_COMP_SUCCESS) {
 		return;
@@ -1178,8 +1181,14 @@ static void print_alg_stats_dict(void)
 		LOG_STATS("},\n");
 
 		LOG_STATS("'raw_wait_time_samples': {");
-		for (uint64_t i=0;i<sample_counter;++i){
+		for (uint64_t i=0;i<global_op_counter;++i){
 			LOG_STATS("%llu, ", raw_wait_times[i]);
+		}
+		LOG_STATS("],\n");
+
+        LOG_STATS("'sampled_wait_time_samples': {");
+		for (uint64_t i=0;i<sample_counter;++i){
+			LOG_STATS("%llu, ", sampled_wait_times[i]);
 		}
 		LOG_STATS("],\n");
 
@@ -3395,9 +3404,9 @@ void *memset(void *s1, int c, size_t n)
 
 #ifdef DTO_STATS_SUPPORT
 if (unlikely(collect_stats)) {
-	if (global_op_counter < dto_stats_num_warmup_ops) {  
+	//if (global_op_counter < dto_stats_num_warmup_ops) {  
 			++ global_op_counter;  
-	}
+	//}
 	/*
 	else {
 		if (unlikely(collect_stats)) {
@@ -3565,9 +3574,9 @@ void *memcpy(void *dest, const void *src, size_t n)
 
 #ifdef DTO_STATS_SUPPORT
 	if (unlikely(collect_stats)) {
-		if (global_op_counter < dto_stats_num_warmup_ops) {  
+		//if (global_op_counter < dto_stats_num_warmup_ops) {  
 				++ global_op_counter;  
-		}
+		//}
 		//else { 
 		//	if (n >= dsa_min_size) {
 				//LOG_TRACE("memcpy src numa node %d dest numa node %d\n",get_numa_node_buf((void*)src),get_numa_node_buf(dest));
@@ -3651,9 +3660,9 @@ void *memmove(void *dest, const void *src, size_t n)
 
 #ifdef DTO_STATS_SUPPORT
 	if (unlikely(collect_stats)) {
-		if (global_op_counter < dto_stats_num_warmup_ops) {  
+		//if (global_op_counter < dto_stats_num_warmup_ops) {  
 				++ global_op_counter;  
-		}
+		//}
 	}
 #endif
 

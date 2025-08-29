@@ -37,6 +37,9 @@ libmindto: min_dto.c
 libdto-dev: dev-dto.c
 	gcc -shared -fPIC -Wl,-soname,libdevdto.so dev-dto.c $(DML_LIB_CXX) -DDTO_STATS_SUPPORT -o libdevdto.so.1.0 -laccel-config -ldl -lnuma
 
+libdto-dev-with-time: dev-dto.c
+	gcc -shared -fPIC -Wl,-soname,libdevdto.so dev-dto-with-time.c $(DML_LIB_CXX) -DDTO_STATS_SUPPORT -o libdevdto.so.1.0 -laccel-config -ldl -lnuma
+
 libdto-dev-localq: dev-dto.c
 	gcc -shared -fPIC -Wl,-soname,libdevdto-localq.so dev-dto.c $(DML_LIB_CXX) -DDTO_STATS_SUPPORT -o libdevdto-localq.so.1.0 -laccel-config -ldl -lnuma
 
