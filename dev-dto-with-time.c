@@ -1180,13 +1180,13 @@ static void print_alg_stats_dict(void)
 		}
 		LOG_STATS("},\n");
 
-		LOG_STATS("'all_wait_times': {");
+		LOG_STATS("'all_wait_times': [");
 		for (uint64_t i=0;i<global_op_counter;++i){
 			LOG_STATS("%llu, ", raw_wait_times[i]);
 		}
 		LOG_STATS("],\n");
 
-        LOG_STATS("'wait_time_samples': {");
+        LOG_STATS("'wait_time_samples': [");
 		for (uint64_t i=0;i<sample_counter;++i){
 			LOG_STATS("%llu, ", sampled_wait_times[i]);
 		}
@@ -1194,7 +1194,7 @@ static void print_alg_stats_dict(void)
 
 		uint64_t cycles_per_sec;
 		calibrate(&cycles_per_sec);
-		LOG_STATS("'cycles_per_sec' = %llu,\n",cycles_per_sec);
+		LOG_STATS("'cycles_per_sec': %llu,\n",cycles_per_sec);
 	}
 
 }
