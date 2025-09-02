@@ -1,0 +1,3811 @@
+/*******************************************************************************
+ * Copyright (C) 2023 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ ******************************************************************************/
+
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <cpuid.h>
+#include <linux/idxd.h>
+#include <x86intrin.h>
+#include <sched.h>
+#include <sys/stat.h>
+#include <stdatomic.h>
+#include <stdbool.h>
+#include <pthread.h>
+#include <dlfcn.h>
+#include <accel-config/libaccel_config.h>
+#include <numaif.h>
+#include <numa.h>
+
+#define likely(x)       __builtin_expect((x), 1)
+#define unlikely(x)     __builtin_expect((x), 0)
+
+// DSA capabilities
+#define GENCAP_CC_MEMORY  0x4
+
+#define UMWAIT_DELAY_DEFAULT 100000
+/* C0.1 state */
+#define UMWAIT_STATE 1
+
+#define DEFAULT_SLEEP_TIME_USEC 8  //20 //sleep mode wait
+
+#define USE_ORIG_FUNC(n, use_dsa) (use_std_lib_calls == 1 || !use_dsa || n < dsa_min_size)
+#define TS_NS(s, e) (((e.tv_sec*1000000000) + e.tv_nsec) - ((s.tv_sec*1000000000) + s.tv_nsec))
+
+#define DTO_STATS_SUPPORT 1
+
+/* Maximum WQs that DTO will use. It is rather an arbitrary limit
+ * to keep things simple and avoid having to dynamically allocate memory.
+ * Allocating memory dynamically may create cyclic dependency and may cause
+ * a hang (e.g., memset --> malloc --> alloc library calls memset --> memset)
+ */
+#define MAX_WQS 32
+#define MAX_NUMA_NODES 32
+#define DTO_DEFAULT_MIN_SIZE 8192
+#define DTO_DEFAULT_MAX_SIZE 2097152 //JJS
+#define DTO_INITIALIZED 0
+#define DTO_INITIALIZING 1
+
+// thread specific variables
+static __thread struct dsa_hw_desc thr_desc;
+static __thread struct dsa_completion_record thr_comp __attribute__((aligned(32)));
+static __thread uint64_t thr_bytes_completed;
+
+// orignal std memory functions
+static void * (*orig_memset)(void *s, int c, size_t n);
+static void * (*orig_memcpy)(void *dest, const void *src, size_t n);
+static void * (*orig_memmove)(void *dest, const void *src, size_t n);
+static int (*orig_memcmp)(const void *s1, const void *s2, size_t n);
+
+struct dto_wq {
+	struct accfg_wq *acc_wq;
+	char wq_path[PATH_MAX];
+	uint64_t dsa_gencap;
+	int wq_size;
+	uint32_t max_transfer_size;
+	int wq_fd;
+	void *wq_portal;
+	bool wq_mmapped;
+	int index;
+};
+
+struct dto_device {
+	struct dto_wq* wqs[MAX_WQS];
+	uint8_t num_wqs;
+	atomic_uchar next_wq;
+};
+
+enum wait_options {
+	WAIT_BUSYPOLL = 0,
+	WAIT_UMWAIT,
+	WAIT_YIELD, 	//sleep mode wait
+	WAIT_SLEEP
+};
+
+enum numa_aware {
+	NA_NONE = 0,
+	NA_BUFFER_CENTRIC,
+	NA_CPU_CENTRIC,
+	NA_LAST_ENTRY
+};
+
+enum overlapping_memmove_actions {
+	OVERLAPPING_CPU = 0,
+	OVERLAPPING_DSA,
+	OVERLAPPING_LAST_ENTRY
+};
+
+static const char * const numa_aware_names[] = {
+	[NA_NONE] = "none",
+	[NA_BUFFER_CENTRIC] = "buffer-centric",
+	[NA_CPU_CENTRIC] = "cpu-centric"
+};
+
+static atomic_ullong cycles;
+static atomic_ullong c_ops;
+
+static inline uint64_t
+get_ms(void)
+{
+	struct timeval tp;
+
+	gettimeofday(&tp, NULL);
+
+	return tp.tv_sec*1000+tp.tv_usec/1000;
+}
+
+static __always_inline uint64_t
+rdtsc(void)
+{
+	uint64_t tsc;
+	unsigned int dummy;
+
+	/*
+	 * https://www.felixcloutier.com/x86/rdtscp
+	 * The RDTSCP instruction is not a serializing instruction, but it
+	 * does wait until all previous instructions have executed and all
+	 * previous loads are globally visible
+	 *
+	 * If software requires RDTSCP to be executed prior to execution of
+	 * any subsequent instruction (including any memory accesses), it can
+	 * execute LFENCE immediately after RDTSCP
+	 */
+	tsc = __rdtscp(&dummy);
+	__builtin_ia32_lfence();
+
+	return tsc;
+}
+
+static void
+calibrate(uint64_t *cycles_per_sec)
+{
+	uint64_t  start;
+	uint64_t  end;
+	uint64_t starttick, endtick;
+	uint64_t ms_diff, cycle_diff;
+
+	endtick = get_ms();
+
+	while (endtick == (starttick = get_ms()))
+		;
+
+	// Measure cycle diff for 500 ms 
+	start = rdtsc();
+	while ((endtick = get_ms())  < (starttick + 500))
+		;
+	end = rdtsc();
+
+	cycle_diff = end - start;
+	ms_diff = endtick - starttick;
+
+	// ms * cycles_per_sec = cycle_diff * 1000 
+
+	*cycles_per_sec = (cycle_diff * (uint64_t)1000)/ms_diff;
+}
+
+
+
+// global workqueue variables
+static struct dto_wq wqs[MAX_WQS];
+static struct dto_device* devices[MAX_NUMA_NODES];
+static uint8_t num_wqs;
+static uint8_t num_wqs_for_cleanup;
+static atomic_uchar next_wq;
+//static __thread uint8_t next_wq;
+static atomic_uchar dto_initialized;
+static atomic_uchar dto_initializing;
+static uint8_t use_std_lib_calls;
+static enum numa_aware is_numa_aware;
+static uint8_t opposite_numa = 0;
+static size_t dsa_min_size = DTO_DEFAULT_MIN_SIZE;
+static size_t dsa_max_size = DTO_DEFAULT_MAX_SIZE;  //JJS
+static int wait_method = WAIT_YIELD;
+//static size_t cpu_size_fraction;
+
+static uint8_t dto_dsa_memcpy = 1;
+static uint8_t dto_dsa_memmove = 1;
+static uint8_t dto_dsa_memset = 1;
+static uint8_t dto_dsa_memcmp = 1;
+
+static uint8_t dto_dsa_cc = 1;
+
+static uint8_t make_adjustments = 1;
+
+static uint8_t dto_num_autotune_instances = 1;
+static uint8_t dto_per_op_autotune_instances = 0;
+
+static uint64_t dto_stats_num_warmup_ops = 0;
+
+
+static unsigned long dto_umwait_delay = UMWAIT_DELAY_DEFAULT;
+static unsigned int dto_sleep_time_usec = DEFAULT_SLEEP_TIME_USEC; //sleep mode wait
+
+static uint8_t autotune_exclude_failed = 0;
+
+static uint8_t dto_overlapping_memmove_action = OVERLAPPING_CPU;
+
+static uint8_t fork_handler_registered;
+
+enum memop {
+	MEMSET = 0x0,
+	MEMCOPY,
+	MEMMOVE,
+	MEMCMP,
+	MOVOVERLAP,
+	MAX_MEMOP,
+};
+
+static const char * const memop_names[] = {
+	[MEMSET] = "set",
+	[MEMCOPY] = "cpy",
+	[MEMMOVE] = "mov",
+	[MEMCMP] = "cmp",
+	[MOVOVERLAP] = "ovr",
+};
+
+// memory stats
+#define HIST_BUCKET_SIZE 4096
+#define HIST_NO_BUCKETS 512
+
+// update stats - JJS
+#define HIST_AVG_WAIT_BUCKET_SIZE 0.1
+#define HIST_AVG_WAIT_BUCKETS 512
+#define HIST_CPU_FRACT_BUCKET_SIZE 1
+#define HIST_CPU_FRACT_BUCKETS 100
+#define HIST_MIN_SIZE_BUCKET_SIZE 1024
+#define HIST_MIN_SIZE_BUCKETS 64
+
+#define HIST_NO_REQS 50
+
+#define MAX_AUTOTUNE_INSTANCES 1    // If we are using separate instances of the autotune algorithm for size different size transactions, increase this to the max number of bucket
+#define MAX_AUTOTUNE_OP_TYPES 3  // Number of operations for which autotuning is done (set,cpy,mov) cmp operations are not split, so no autotuning.
+
+enum stat_group {
+	STDC_CALL = 0x0,
+	DSA_CALL_SUCCESS,
+	DSA_CALL_FAILED,
+	DSA_CALL_FAILED_STDC_CALL,  // stats group for leftover ops performed using stdc from dsa failures (mainly page faults)
+	DSA_FAIL_CODES,
+	MAX_STAT_GROUP
+};
+
+static const char * const stat_group_names[] = {
+	[STDC_CALL] = "stdc calls",
+	[DSA_CALL_SUCCESS] = "dsa (success)",
+	[DSA_CALL_FAILED] = "dsa (failed)",
+	[DSA_CALL_FAILED_STDC_CALL] = "dsa (failed) stdc",
+	[DSA_FAIL_CODES] = "failure reason"
+};
+
+static const char * const stat_group_names2[] = {  //JJS
+	[STDC_CALL] = "stdc",
+	[DSA_CALL_SUCCESS] = "dsa_success",
+	[DSA_CALL_FAILED] = "dsa_failed",
+	[DSA_CALL_FAILED_STDC_CALL] = "dsa_failed_stdc",
+	[DSA_FAIL_CODES] = "failure_reason"
+};
+
+enum return_code {
+	SUCCESS = 0x0,
+	RETRY,
+	PAGE_FAULT,
+	FAIL_OTHERS,
+	MAX_FAILURES,
+};
+
+static const char * const failure_names[] = {
+	[SUCCESS] = "Success",
+	[RETRY] = "Retry",
+	[PAGE_FAULT] = "PFs",
+	[FAIL_OTHERS] = "Others",
+};
+
+static const char * const wait_names[] = {
+	[WAIT_BUSYPOLL] = "busypoll",
+	[WAIT_UMWAIT] = "umwait",
+	[WAIT_YIELD] = "yield",
+	[WAIT_SLEEP] = "sleep",  //sleep mode wait
+};
+
+static int collect_stats;
+static int collect_alg_stats;
+static int collect_alg_stats_latest_updates;
+static int collect_alg_stats_latest_cpufracts;
+
+static char dto_log_path[PATH_MAX];
+static int log_fd = -1;
+//static struct timespec cpu_start_time;
+//static struct timespec cpu_end_time;
+//static struct timespec dsa_end_time;
+
+enum update_type { 
+	INVALID_UPDATE_TYPE = 0x0,
+	NO_CHANGE,
+ 	INCR_FRACT,
+	INCR_MIN_SIZE,
+	DECR_FRACT,
+	DECR_MIN_SIZE,
+	MAX_UPDATE_TYPE,
+};
+
+#define INVALID_NUM_WAITS 100000
+#define INVALID_CPU_FRACT 101
+#define INVALID_WAIT_TIME 65535
+
+
+enum numa_stats_type { 
+	MEMSET_DST = 0x0,
+	MEMCPY_DST,
+	MEMCPY_SRC,
+	MAX_NUMA_STATS_TYPE,
+};
+
+#ifdef DTO_STATS_SUPPORT
+static struct timespec dto_start_time;
+static __thread uint64_t thr_bytes_completed_cpu;
+
+#define DTO_COLLECT_STATS_START(cs, st)				\
+	do {							\
+		if (unlikely(cs)) {				\
+			clock_gettime(CLOCK_BOOTTIME, &st);	\
+		}						\
+	} while (0)						\
+
+
+#define DTO_COLLECT_STATS_DSA_END(cs, st, et, op, n, overlap, tbc, tbc_cpu, r)				\
+	do {										\
+		if (unlikely(cs)) {	\
+			if (global_op_counter >= dto_stats_num_warmup_ops) {   						\
+				uint64_t t;							\
+				clock_gettime(CLOCK_BOOTTIME, &et);				\
+				t = (((et.tv_sec*1000000000) + et.tv_nsec) -			\
+						((st.tv_sec*1000000000) + st.tv_nsec));		\
+				if (unlikely(r != SUCCESS))					\
+					update_stats(op, n, overlap, tbc, tbc_cpu, t, DSA_CALL_FAILED, r);	\
+				else								\
+					update_stats(op, n, overlap, tbc, tbc_cpu, t, DSA_CALL_SUCCESS, 0);	\
+			} \
+		}									\
+	} while (0)									\
+
+#define DTO_COLLECT_STATS_CPU_END(cs, st, et, op, n, orig_n, overlap, use_orig_func)			\
+	do {									\
+		if (unlikely(cs)) {	\
+			if (global_op_counter >= dto_stats_num_warmup_ops) {  \
+				uint64_t t;						\
+				clock_gettime(CLOCK_BOOTTIME, &et);			\
+				t = (((et.tv_sec*1000000000) + et.tv_nsec) -		\
+					((st.tv_sec*1000000000) + st.tv_nsec));		\
+				if (use_orig_func)                             \
+					update_stats(op, orig_n, overlap, n, n, t, STDC_CALL, 0);		\
+				else                                                        \
+					update_stats(op, orig_n, overlap, n, n, t, DSA_CALL_FAILED_STDC_CALL, 0);		\
+			}             \
+		}								\
+	} while (0)								\
+
+static void update_alg_stats(double avg_num_waits, uint16_t avg_wait_time, int update_type, int cpu_size_fraction, int dsa_min_size, size_t n, uint8_t alg_instance);
+
+//update stats collection - JJS
+#define DTO_COLLECT_ALG_STATS(cs, avg_num_waits, avg_times, update_type, cpu_size_fraction, dsa_min_size, trans_size, bucket)			\
+	do {	\
+		if (unlikely(cs)) {							\
+			if (global_op_counter >= dto_stats_num_warmup_ops) {   \
+				update_alg_stats(avg_num_waits, avg_times, update_type, cpu_size_fraction, dsa_min_size, trans_size, bucket);						\
+			} \
+		}  \
+	} while (0)								\
+
+static atomic_ullong op_counter[HIST_NO_BUCKETS][MAX_STAT_GROUP][MAX_MEMOP];
+static atomic_ullong bytes_counter[HIST_NO_BUCKETS][MAX_STAT_GROUP];
+static atomic_ullong bytes_counter_cpu[HIST_NO_BUCKETS][MAX_STAT_GROUP];
+static atomic_ullong lat_counter[HIST_NO_BUCKETS][MAX_STAT_GROUP][MAX_MEMOP];
+static atomic_int fail_counter[HIST_NO_BUCKETS][MAX_FAILURES];
+
+//static atomic_ullong numa_node_counts[MAX_NUMA_STATS_TYPE][MAX_NUMA_NODES];
+//static int num_numa_nodes;
+
+static atomic_int dto_wq_depth[MAX_WQS];
+static atomic_ulong num_dto_requests[HIST_NO_REQS][MAX_WQS];
+
+//update stats collection - JJS
+static atomic_ullong avg_waits_counter[HIST_NO_BUCKETS][HIST_AVG_WAIT_BUCKETS];
+static atomic_ullong cpu_fract_counter[HIST_CPU_FRACT_BUCKETS];
+static atomic_ullong min_size_counter[HIST_MIN_SIZE_BUCKETS];
+static atomic_ullong update_type_counter[MAX_UPDATE_TYPE];
+static atomic_ullong num_adjustment_ops[MAX_AUTOTUNE_OP_TYPES*MAX_AUTOTUNE_INSTANCES];
+
+//static atomic_ullong num_queue_full;
+
+static atomic_ullong global_op_counter = 0; 
+static atomic_ullong dto_op_counter = 0; 
+static atomic_ullong sample_counter = 0;
+
+#define NUM_LATEST_UPDATES 100000
+#define MAX_OPS 1000000
+
+static atomic_uint_fast16_t latest_updates[MAX_AUTOTUNE_OP_TYPES*MAX_AUTOTUNE_INSTANCES][NUM_LATEST_UPDATES];
+static atomic_uint_fast8_t latest_cpu_fract[MAX_AUTOTUNE_OP_TYPES*MAX_AUTOTUNE_INSTANCES][NUM_LATEST_UPDATES];
+static atomic_uint_fast16_t latest_avg_times[MAX_AUTOTUNE_OP_TYPES*MAX_AUTOTUNE_INSTANCES][NUM_LATEST_UPDATES];
+static atomic_uint_fast16_t raw_wait_times[MAX_OPS];
+static atomic_uint_fast16_t sampled_wait_times[MAX_OPS];
+
+enum stats_output_types {
+	STATS_TEXT = 0,
+	STATS_DICT,
+	STATS_TEXT_OLD_FORMAT,
+	STATS_OUTPUT_TYPE_MAX
+};
+
+static uint8_t stats_output_type = STATS_TEXT_OLD_FORMAT;
+
+static char stats_prefix[100] = "";
+
+static void update_num_dto_requests(int index, int a) {
+	dto_wq_depth[index] += a;
+}
+
+static int get_num_dto_requests(int index) {
+	return dto_wq_depth[index];
+}
+
+#endif
+
+
+/* call initialize/cleanup functions when library is loaded/unloaded */
+static int init_dto(void) __attribute__((constructor));
+static void cleanup_dto(void) __attribute__((destructor));
+
+static int umwait_support;
+
+static enum {
+	LOG_LEVEL_FATAL,
+	LOG_LEVEL_ERROR,
+	LOG_LEVEL_STATS,
+	LOG_LEVEL_TRACE
+} log_levels;
+
+#define LOG_FATAL(...) dto_log(LOG_LEVEL_FATAL, __VA_ARGS__)
+#define LOG_ERROR(...) dto_log(LOG_LEVEL_ERROR, __VA_ARGS__)
+#define LOG_STATS(...) dto_log(LOG_LEVEL_STATS, __VA_ARGS__)
+#define LOG_TRACE(...) dto_log(LOG_LEVEL_TRACE, __VA_ARGS__)
+
+static unsigned int log_level = LOG_LEVEL_FATAL;
+
+/* Auto tune heuristics magic numbers */
+#define DESCS_PER_RUN 0xF0
+#define NUM_DESCS 16
+#define MIN_AVG_YIELD_WAITS 1.0
+#define MAX_AVG_YIELD_WAITS 2.0
+#define MIN_AVG_POLL_WAITS 5.0
+#define MAX_AVG_POLL_WAITS 20.0
+#define MAX_CPU_SIZE_FRACTION 90 //0.9
+#define CSF_STEP_INCREMENT 1 //0.01
+#define CSF_STEP_DECREMENT 1 //0.01
+#define MAX_DSA_MIN_SIZE 65536
+#define MIN_DSA_MIN_SIZE 6144
+#define DMS_STEP_INCREMENT 1024
+#define DMS_STEP_DECREMENT 1024
+
+
+/* Auto tuning variables */
+//static atomic_ullong num_descs;
+//static atomic_ullong adjust_num_descs;
+//static atomic_ullong adjust_num_waits;
+
+struct auto_tune_state {
+	atomic_ullong num_descs;
+	atomic_ullong adjust_num_descs;
+	atomic_ullong adjust_num_waits;
+	size_t cpu_size_fraction;
+	uint32_t wq_index_offset;
+	uint32_t num_wqs;
+	uint32_t adjust_wait_time;
+	atomic_uchar next_wq;
+};
+
+static struct auto_tune_state auto_tune_states[MAX_AUTOTUNE_OP_TYPES*MAX_AUTOTUNE_INSTANCES];
+static size_t auto_tune_buckets[MAX_AUTOTUNE_INSTANCES];
+
+
+/* default waits are for yield because yield is default waiting method */
+static double min_avg_waits = MIN_AVG_YIELD_WAITS;
+static double max_avg_waits = MAX_AVG_YIELD_WAITS;
+static uint8_t auto_adjust_knobs = 1;
+//static __thread uint8_t adjust = 0;
+//static atomic_uchar dto_updating = 0;
+
+extern char *__progname;
+
+static void dto_log(int req_log_level, const char *fmt, ...)
+{
+	char buf[512];
+	va_list args;
+
+	if (req_log_level > log_level)
+		return;
+
+	va_start(args, fmt);
+	if (log_fd == -1)
+		vprintf(fmt, args);
+	else {
+		vsnprintf(buf, sizeof(buf), fmt, args);
+		write(log_fd, buf, strlen(buf));
+	}
+	va_end(args);
+}
+
+/* Reinitialize DTO in the child process. */
+static void child (void)
+{
+#ifdef DTO_STATS_SUPPORT
+	int i, j, k;
+
+	/* Reset the counters */
+	for (i = 0; i < HIST_NO_BUCKETS; i++) {
+		for (j = 0; j < MAX_STAT_GROUP; j++) {
+			for (k = 0; k < MAX_MEMOP; k++) {
+				op_counter[i][j][k] = 0;
+			}
+			for (k = 0; k < MAX_MEMOP-1; k++) {
+				lat_counter[i][j][k] = 0;
+			}
+			bytes_counter[i][j] = 0;
+		}
+		for (j = 0; j < MAX_FAILURES; j++)
+			fail_counter[i][j] = 0;
+	}
+#endif
+	dto_initializing = 0;
+	dto_initialized = 0;
+	log_fd = -1;
+
+	init_dto();
+}
+
+static __always_inline unsigned char enqcmd(struct dsa_hw_desc *desc, volatile void *reg)
+{
+	unsigned char retry;
+
+	asm volatile(".byte 0xf2, 0x0f, 0x38, 0xf8, 0x02\t\n"
+			"setz %0\t\n"
+			: "=r"(retry) : "a" (reg), "d" (desc));
+	return retry;
+}
+
+static __always_inline void movdir64b(struct dsa_hw_desc *desc, volatile void *reg)
+{
+	asm volatile(".byte 0x66, 0x0f, 0x38, 0xf8, 0x02\t\n"
+		: : "a" (reg), "d" (desc));
+}
+
+static __always_inline void umonitor(const volatile void *addr)
+{
+	asm volatile(".byte 0xf3, 0x48, 0x0f, 0xae, 0xf0" : : "a"(addr));
+}
+
+static __always_inline int umwait(unsigned long timeout, unsigned int state)
+{
+	uint8_t r;
+	uint32_t timeout_low = (uint32_t)timeout;
+	uint32_t timeout_high = (uint32_t)(timeout >> 32);
+
+	asm volatile(".byte 0xf2, 0x48, 0x0f, 0xae, 0xf1\t\n"
+		"setc %0\t\n"
+		: "=r"(r)
+		: "c"(state), "a"(timeout_low), "d"(timeout_high));
+	return r;
+}
+
+static __always_inline void dsa_wait_yield(const volatile uint8_t *comp)
+{
+	while (*comp == 0) {
+		sched_yield();
+	}
+}
+
+static __always_inline void dsa_wait_busy_poll(const volatile uint8_t *comp)
+{
+	while (*comp == 0) {
+		_mm_pause();
+	}
+}
+
+static __always_inline void __dsa_wait_umwait(const volatile uint8_t *comp)
+{
+	umonitor(comp);
+
+	// Hardware never writes 0 to this field. Software should initialize this field to 0
+	// so it can detect when the completion record has been written
+	if (*comp == 0) {
+		uint64_t delay = __rdtsc() + dto_umwait_delay;
+
+		umwait(delay, UMWAIT_STATE);
+	}
+}
+
+static __always_inline void dsa_wait_umwait(const volatile uint8_t *comp)
+{
+
+	while (*comp == 0)
+		__dsa_wait_umwait(comp);
+}
+
+//sleep mode wait
+static __always_inline void dsa_wait_sleep(const volatile uint8_t *comp)
+{
+	//int count=0;
+	while (*comp == 0) {
+	//		++count;
+	        usleep(dto_sleep_time_usec);	
+        }
+	//if(count>1)
+	//	printf("slept %d\n",count);
+}
+
+static __always_inline void __dsa_wait(const volatile uint8_t *comp)
+{
+	if (wait_method == WAIT_YIELD)
+		sched_yield();
+	else if (wait_method == WAIT_UMWAIT)
+		__dsa_wait_umwait(comp);
+	else if (wait_method == WAIT_SLEEP)  //sleep mode wait
+		dsa_wait_sleep(comp);
+	else
+		_mm_pause();
+}
+
+static __always_inline void dsa_wait_no_adjust(const volatile uint8_t *comp)
+{
+	if (wait_method == WAIT_YIELD)
+		dsa_wait_yield(comp);
+	else if (wait_method == WAIT_UMWAIT)
+		dsa_wait_umwait(comp);
+	else
+		dsa_wait_busy_poll(comp);
+}
+
+/*
+static __always_inline uint16_t get_request_size_bucket(size_t size) {
+	for (int i = 0; i < dto_num_autotune_instances; ++i) {
+		//LOG_TRACE("get_bucket size %lu i %d bucket edge %lu\n",size,i,auto_tune_buckets[i]);
+		if (size < auto_tune_buckets[i]) {
+			return i;
+		}
+	}
+
+	return dto_num_autotune_instances-1;
+}
+*/
+
+static __always_inline uint16_t get_algorithm_instance(size_t size, uint8_t op) {
+
+	int instance=0;
+
+	/*	
+	if (dto_num_autotune_instances == 1)
+		instance = 0;
+	else
+		instance = get_request_size_bucket(size);
+	*/
+
+	if (dto_per_op_autotune_instances) {
+		//if (op != MEMSET)
+		instance = op;
+	}
+
+	//LOG_TRACE("get_algorithm_instance size %lu op %u instance %u\n",size, op, instance );
+	
+	return instance;
+}
+
+
+/* A simple auto-tuning heuristic.
+ * Goal of the Heuristic:
+ *   - CPU and DSA should complete their fraction of the job roughly simultaneously.
+ *     This minimizes the thread's wait time for DSA while maximizing DSA utilization
+ *  Approximating the goal:
+ *   - Threads waiting for DSA completion (e.g., by yielding), keep avg. no. of
+ *     waits (i.e., yields) between min_avg_waits and max_avg_waits
+ *     (see local_num_waits variable below)
+ * Heuristic
+ *   1) Sample number of waits (local_num_waits) for NUM_DESCS descriptors
+ *   every DESCS_PER_RUN descriptors
+ *   2) If the avg. number of waits per descriptor > max_avg_waits, decrease load on DSA
+ *      - If cpu_size_fraction not too high, increase it by CSF_STEP_INCREMENT
+ *      - else if dsa_min_size not too high, increase it by DMS_STEP_INCREMENT
+ *   3) If the avg. number of waits per descriptor < min_avg_waits, increase load on DSA
+ *      - If cpu_size_fraction not too low, decrease it by CSF_STEP_DECREMENT
+ *      - else if dsa_min_size not too low, decrease it by DMS_STEP_DECREMENT
+ */
+static __always_inline void dsa_wait_and_adjust(const volatile uint8_t *comp, size_t transaction_size, size_t unsplit_size, uint8_t op)
+{
+	uint64_t local_num_waits = 0;
+	uint64_t start, cycles;
+
+	//LOG_TRACE("calling get_algorithm_instance\n");
+	uint16_t bucket = get_algorithm_instance(unsplit_size, op);
+	//LOG_TRACE("get_algorithm_instance returned %u\n",bucket);
+
+    start = rdtsc();
+	if ((++auto_tune_states[bucket].num_descs & DESCS_PER_RUN) != DESCS_PER_RUN) {
+		//LOG_TRACE("dsa_wait_and_adjust size %lu instance %u num_descs %u returning\n",unsplit_size, bucket, auto_tune_states[bucket].num_descs);
+		while (*comp == 0)
+			__dsa_wait(comp);
+
+        cycles = (rdtsc() - start);
+        raw_wait_times[dto_op_counter++] = cycles;
+		return;
+	}
+	
+		
+	/* Run the heuristics as well as wait for DSA */
+	while (*comp == 0) {
+		__dsa_wait(comp);
+		local_num_waits++;
+	}
+
+	cycles = (rdtsc() - start);
+	//printf("%llu\n",cycles);
+	sampled_wait_times[sample_counter++] = cycles;
+
+	if(autotune_exclude_failed && *comp != DSA_COMP_SUCCESS) {
+		return;
+	}
+
+
+	auto_tune_states[bucket].adjust_num_descs++;
+	auto_tune_states[bucket].adjust_num_waits += local_num_waits;
+	
+	
+	auto_tune_states[bucket].adjust_wait_time += cycles;
+
+	//adjust_num_descs++;
+	//adjust_num_waits += local_num_waits;
+
+	//printf("bucket %d local_num_waits %d adjust num waits %d adjust num desc %d\n", bucket,local_num_waits, auto_tune_states[bucket].adjust_num_waits, auto_tune_states[bucket].adjust_num_descs);
+
+	if (auto_tune_states[bucket].adjust_num_descs >= NUM_DESCS) {
+		//LOG_TRACE("dsa_wait_and_adjust size %lu instance %u num_descs %u adj_num_desc %u num_waits %u running alg\n",
+		//			unsplit_size, bucket, auto_tune_states[bucket].num_descs, auto_tune_states[bucket].adjust_num_descs,auto_tune_states[bucket].adjust_num_waits);
+		unsigned long long temp = auto_tune_states[bucket].adjust_num_descs;
+
+		if (temp && atomic_compare_exchange_strong(&auto_tune_states[bucket].adjust_num_descs, &temp, 0)) {
+			double avg_num_waits = (double)auto_tune_states[bucket].adjust_num_waits / temp;
+			//double avg_num_waits2 = (double)adjust_num_waits / temp;
+			
+			//if(avg_num_waits != avg_num_waits2)
+			//	printf("avg_num_waits is different\n");
+			//printf("In algorithm bucket %d adjust num waits %d temp %d adjust num desc %d\n", bucket, auto_tune_states[bucket].adjust_num_waits, temp, auto_tune_states[bucket].adjust_num_descs);
+
+			//adjust_num_descs_lt += temp;
+			//adjust_num_waits_lt += adjust_num_waits;
+			//double avg_num_waits_lt = (double)adjust_num_waits_lt / adjust_num_descs_lt;
+
+			int ut = NO_CHANGE;
+
+			auto_tune_states[bucket].adjust_num_waits = 0;
+			//adjust_num_waits = 0;
+			if (make_adjustments) {
+				if (avg_num_waits > max_avg_waits) {
+					if (auto_tune_states[bucket].cpu_size_fraction < MAX_CPU_SIZE_FRACTION) {
+						auto_tune_states[bucket].cpu_size_fraction += CSF_STEP_INCREMENT;
+						//printf("avg num waits %d new cpu fract increased to %d\n",avg_num_waits,auto_tune_states[bucket].cpu_size_fraction);
+						ut = INCR_FRACT;
+					}
+				} else if (avg_num_waits < min_avg_waits) {
+					if (auto_tune_states[bucket].cpu_size_fraction >= CSF_STEP_DECREMENT) {
+						auto_tune_states[bucket].cpu_size_fraction -= CSF_STEP_DECREMENT;
+						//printf("avg num waits %d new cpu fract decreased to %d\n",avg_num_waits,auto_tune_states[bucket].cpu_size_fraction);
+						ut = DECR_FRACT;
+					}
+				}
+				//LOG_TRACE("dsa_wait_and_adjust instance %u cpu fract %u\n", bucket, auto_tune_states[bucket].cpu_size_fraction);
+			}
+#ifdef DTO_STATS_SUPPORT
+			uint16_t avg_wait_time = auto_tune_states[bucket].adjust_wait_time / temp;
+			auto_tune_states[bucket].adjust_wait_time = 0;
+			DTO_COLLECT_ALG_STATS(collect_alg_stats, avg_num_waits, avg_wait_time, ut, auto_tune_states[bucket].cpu_size_fraction, dsa_min_size, unsplit_size, bucket);
+#endif
+		}
+	}
+	//else {
+	//	LOG_TRACE("dsa_wait_and_adjust size %lu instance %u num_descs %u adj_num_desc %u num_waits %u not running alg\n",
+	//				unsplit_size, bucket, auto_tune_states[bucket].num_descs, auto_tune_states[bucket].adjust_num_descs,auto_tune_states[bucket].adjust_num_waits);
+	//}
+}   
+
+static __always_inline int dsa_wait(struct dto_wq *wq,
+	struct dsa_hw_desc *hw, size_t unsplit_size, volatile uint8_t *comp, uint8_t op)
+{
+	if (auto_adjust_knobs)
+		dsa_wait_and_adjust(comp, hw->xfer_size, unsplit_size, op);
+	else
+		dsa_wait_no_adjust(comp);
+
+#ifdef DTO_STATS_SUPPORT
+			if(collect_stats) {
+				update_num_dto_requests(wq->index, -1);
+				//LOG_TRACE("%lu: dsa_wait for wq %d num_requests %d\n",(uint64_t)&thr_bytes_completed_cpu, wq->index, get_num_dto_requests(wq->index));
+			}
+#endif
+
+	if (likely(*comp == DSA_COMP_SUCCESS)) {
+		thr_bytes_completed += hw->xfer_size;
+		return SUCCESS;
+	} else if ((*comp & DSA_COMP_STATUS_MASK) == DSA_COMP_PAGE_FAULT_NOBOF) {
+		//printf("page fault bytes completed %d\n",thr_comp.bytes_completed);
+		thr_bytes_completed += thr_comp.bytes_completed;
+		return PAGE_FAULT;
+	}
+	LOG_ERROR("failed status %x xfersz %x\n", *comp, hw->xfer_size);
+	return FAIL_OTHERS;
+}
+
+static __always_inline int dsa_submit(struct dto_wq *wq,
+	struct dsa_hw_desc *hw, int count)
+{
+
+	int ret;
+	//LOG_TRACE("desc flags: 0x%x, opcode: 0x%x\n", hw->flags, hw->opcode);
+	__builtin_ia32_sfence();
+
+	if (wq->wq_mmapped) {
+		ret = enqcmd(hw, wq->wq_portal);
+		if (!ret) {
+#ifdef DTO_STATS_SUPPORT
+			if(collect_stats && count) {
+				num_dto_requests[get_num_dto_requests(wq->index)][wq->index] += 1;
+				//LOG_TRACE("%lu: dsa_submit for wq %d num_requests %d\n",(uint64_t)&thr_bytes_completed_cpu, wq->index, get_num_dto_requests(wq->index));
+				update_num_dto_requests(wq->index, 1);
+			}
+#endif
+		
+			return SUCCESS;
+		}
+		/*
+		else {
+			//LOG_TRACE("DSA Submit failed with ret code %x\n",ret);
+			if (collect_stats) {
+				num_queue_full++;
+			}
+		}
+		*/
+	} else {
+		ret = write(wq->wq_fd, hw, sizeof(*hw));
+		if (ret == sizeof(*hw))
+			return SUCCESS;
+		else
+			return FAIL_OTHERS;
+	}
+	return RETRY;
+}
+
+
+static __always_inline int dsa_execute(struct dto_wq *wq,
+	struct dsa_hw_desc *hw, volatile uint8_t *comp)
+{
+	int ret;
+	*comp = 0;
+	//LOG_TRACE("desc flags: 0x%x, opcode: 0x%x\n", hw->flags, hw->opcode);
+	__builtin_ia32_sfence();
+
+	if (wq->wq_mmapped)
+		ret = enqcmd(hw, wq->wq_portal);
+
+	else {
+		ret = write(wq->wq_fd, hw, sizeof(*hw));
+		if (ret != sizeof(*hw))
+			return FAIL_OTHERS;
+		else
+			ret = 0;
+	}
+	if (!ret) {
+		//if (auto_adjust_knobs)
+		//	dsa_wait_and_adjust(comp);
+		//else
+		dsa_wait_no_adjust(comp);
+
+		if (*comp == DSA_COMP_SUCCESS) {
+			thr_bytes_completed += hw->xfer_size;
+			return SUCCESS;
+		} else if ((*comp & DSA_COMP_STATUS_MASK) == DSA_COMP_PAGE_FAULT_NOBOF) {
+			thr_bytes_completed += thr_comp.bytes_completed;
+			return PAGE_FAULT;
+		}
+		LOG_ERROR("failed status %x xfersz %x\n", *comp, hw->xfer_size);
+		return FAIL_OTHERS;
+	}
+	return RETRY;
+}
+
+#ifdef DTO_STATS_SUPPORT
+static void update_stats(int op, size_t n, uint8_t overlapping, size_t bytes_completed, size_t bytes_completed_cpu,
+		uint64_t elapsed_ns, int group, int error_code)
+{
+	int bucket = (n / HIST_BUCKET_SIZE);
+
+	// dto_memcpymove didn't actually submit the request to DSA, so there is nothing to log. This will be captured by a second call
+	if(op==MEMMOVE && overlapping && dto_overlapping_memmove_action==OVERLAPPING_CPU && group==DSA_CALL_SUCCESS)
+		return;
+
+	if (stats_output_type == STATS_TEXT_OLD_FORMAT && group == DSA_CALL_FAILED_STDC_CALL)
+		group = STDC_CALL;
+
+	if (bucket >= HIST_NO_BUCKETS)  /* last bucket includes remaining sizes */
+		bucket = HIST_NO_BUCKETS-1;
+	++op_counter[bucket][group][op];
+	if (overlapping && op == MEMMOVE)
+		++op_counter[bucket][group][MOVOVERLAP];
+	bytes_counter[bucket][group] += bytes_completed;
+	bytes_counter_cpu[bucket][group] += bytes_completed_cpu;
+	lat_counter[bucket][group][op] += elapsed_ns;
+	if (group == DSA_CALL_FAILED)
+		++fail_counter[bucket][error_code];
+
+}
+
+static void update_alg_stats(double avg_num_waits, uint16_t avg_wait_time, int update_type, int cpu_size_fraction, int dsa_min_size, size_t n, uint8_t alg_instance)
+{
+
+	int size_bucket = (n / HIST_BUCKET_SIZE);
+
+	if (size_bucket >= HIST_NO_BUCKETS)  /* last bucket includes remaining sizes */
+		size_bucket = HIST_NO_BUCKETS-1;
+
+	int bucket = (avg_num_waits / HIST_AVG_WAIT_BUCKET_SIZE);
+	if (bucket >= HIST_AVG_WAIT_BUCKETS)  /* last bucket includes remaining sizes */
+		bucket = HIST_AVG_WAIT_BUCKETS-1;
+
+	++avg_waits_counter[size_bucket][bucket];
+
+	//printf("n %u average num waits %f size bucket %d bucket %d value %llu\n ",n, avg_num_waits, size_bucket,bucket, avg_waits_counter[size_bucket][bucket]);
+
+	bucket = (cpu_size_fraction / HIST_CPU_FRACT_BUCKET_SIZE);
+	if (bucket >= HIST_CPU_FRACT_BUCKETS)  /* last bucket includes remaining sizes */
+		bucket = HIST_CPU_FRACT_BUCKETS-1;
+	++cpu_fract_counter[bucket];
+
+	bucket = (dsa_min_size / HIST_MIN_SIZE_BUCKET_SIZE);
+	if (bucket >= HIST_MIN_SIZE_BUCKETS)  /* last bucket includes remaining sizes */
+		bucket = HIST_MIN_SIZE_BUCKETS-1;
+	++min_size_counter[bucket];
+
+	++update_type_counter[update_type];
+
+	if (collect_alg_stats_latest_updates) {
+		if ((uint16_t) avg_num_waits == INVALID_NUM_WAITS)
+			avg_num_waits = avg_num_waits-1;
+		latest_updates[alg_instance][num_adjustment_ops[alg_instance] % NUM_LATEST_UPDATES] = (uint16_t) avg_num_waits;  //update_type;
+		
+	}
+	if (collect_alg_stats_latest_cpufracts)
+		latest_cpu_fract[alg_instance][num_adjustment_ops[alg_instance] % NUM_LATEST_UPDATES] = cpu_size_fraction;
+
+	latest_avg_times[alg_instance][num_adjustment_ops[alg_instance] % NUM_LATEST_UPDATES] = avg_wait_time;
+
+	++num_adjustment_ops[alg_instance];
+}
+
+static void print_alg_stats(void)
+{
+	LOG_STATS("avg_num_waits: ");
+
+	for (int b = 0; b < HIST_NO_BUCKETS; ++b) {
+			bool empty = true;
+
+		for (int g = 0; g < MAX_STAT_GROUP; ++g) {
+			for (int o = 0; o < MAX_MEMOP; ++o) {
+				if (op_counter[b][g][o] != 0) {
+					empty = false;
+					break;
+				}
+			}
+			if (!empty)
+				break;
+		}
+		if (empty)
+			continue;
+
+		if (b < (HIST_NO_BUCKETS-1))
+			LOG_STATS("% 8d-%-8d: ", b*4096, ((b+1)*4096)-1);
+		else
+			LOG_STATS(" >=%-12d: ", b*4096);
+
+
+		for (int i=0; i<HIST_AVG_WAIT_BUCKETS; ++i) {
+			LOG_STATS("%lld, ",avg_waits_counter[b][i]);
+		}
+
+		LOG_STATS("\n");
+	}
+
+	LOG_STATS("\n");
+
+	LOG_STATS("cpu_fraction: ");
+	for (int i=0; i<HIST_CPU_FRACT_BUCKETS; ++i) {
+		LOG_STATS("%lld, ", cpu_fract_counter[i]);
+	}
+	LOG_STATS("\n");
+
+	LOG_STATS("min_size: ");
+	for (int i=0; i<HIST_MIN_SIZE_BUCKETS; ++i) {
+		LOG_STATS("%lld, ", min_size_counter[i]);
+	}
+	LOG_STATS("\n");
+
+	LOG_STATS("update_type: ");
+	for (int i=0; i<MAX_UPDATE_TYPE; ++i) {
+		LOG_STATS("%lld, ", update_type_counter[i]);
+	}
+	LOG_STATS("\n");
+
+	/*
+	LOG_STATS("num_adjustment_ops: %lld,\n",num_adjustment_ops);
+
+	LOG_STATS("latest_updates: ");
+	u_int64_t last;
+	if ((num_adjustment_ops % NUM_LATEST_UPDATES) != 0)
+		last = (num_adjustment_ops % NUM_LATEST_UPDATES) - 1;
+	else
+		last = NUM_LATEST_UPDATES - 1;
+
+	num_adjustment_ops = num_adjustment_ops % NUM_LATEST_UPDATES;
+
+	while (num_adjustment_ops != last) {
+		if (latest_updates[num_adjustment_ops] != INVALID_UPDATE_TYPE)
+			LOG_STATS("%lld, ", latest_updates[num_adjustment_ops]);
+		
+		num_adjustment_ops = (num_adjustment_ops + 1) % NUM_LATEST_UPDATES;
+	}
+	LOG_STATS("%lld, ", latest_updates[last]);
+	LOG_STATS("\n");
+	*/
+	
+}
+
+static void print_alg_stats_dict(void)
+{
+	LOG_STATS("'avg_num_waits': {");
+
+	for (int b = 0; b < HIST_NO_BUCKETS; ++b) {
+			bool empty = true;
+
+		for (int g = 0; g < MAX_STAT_GROUP; ++g) {
+			for (int o = 0; o < MAX_MEMOP; ++o) {
+				if (op_counter[b][g][o] != 0) {
+					empty = false;
+					break;
+				}
+			}
+			if (!empty)
+				break;
+		}
+		if (empty)
+			continue;
+
+
+		LOG_STATS("%d:[", b*4096);
+
+
+		for (int i=0; i<HIST_AVG_WAIT_BUCKETS; ++i) {
+			LOG_STATS("%lld, ",avg_waits_counter[b][i]);
+		}
+		LOG_STATS("],\n");
+	}
+
+	LOG_STATS("},\n");
+
+	LOG_STATS("'cpu_fraction': [");
+	for (int i=0; i<HIST_CPU_FRACT_BUCKETS; ++i) {
+		LOG_STATS("%lld, ", cpu_fract_counter[i]);
+	}
+	LOG_STATS("],\n");
+
+	LOG_STATS("'min_size': [");
+	for (int i=0; i<HIST_MIN_SIZE_BUCKETS; ++i) {
+		LOG_STATS("%lld, ", min_size_counter[i]);
+	}
+	LOG_STATS("],\n");
+
+	LOG_STATS("'update_type': [");
+	for (int i=0; i<MAX_UPDATE_TYPE; ++i) {
+		LOG_STATS("%lld, ", update_type_counter[i]);
+	}
+	LOG_STATS("],\n");
+
+	LOG_STATS("'num_adjustment_ops': [");
+	for (int i=0;i<MAX_AUTOTUNE_OP_TYPES*MAX_AUTOTUNE_INSTANCES;++i) {
+		LOG_STATS("%lld,",num_adjustment_ops[i]);
+	}
+	LOG_STATS("],\n");
+
+	if (collect_alg_stats_latest_updates) {
+		LOG_STATS("'latest_avg_num_waits': {");
+		for (int i=0;i<MAX_AUTOTUNE_OP_TYPES*MAX_AUTOTUNE_INSTANCES;++i) {
+			LOG_STATS("%d:[",i);
+			u_int64_t last;
+			u_int64_t num = num_adjustment_ops[i];
+			if ((num % NUM_LATEST_UPDATES) != 0)
+				last = (num % NUM_LATEST_UPDATES) - 1;
+			else
+				last = NUM_LATEST_UPDATES - 1;
+
+			num = num % NUM_LATEST_UPDATES;
+
+			while (num != last) {
+				if (latest_updates[i][num] != INVALID_NUM_WAITS)
+					LOG_STATS("%u, ", latest_updates[i][num]);
+				
+				num = (num + 1) % NUM_LATEST_UPDATES;
+			}
+			LOG_STATS("%u, ", latest_updates[i][last]);
+			LOG_STATS("],\n");
+		}
+		LOG_STATS("},\n");
+	}
+
+	if (collect_alg_stats_latest_cpufracts) {
+		LOG_STATS("'latest_cpu_fracs': {");
+		for (int i=0;i<MAX_AUTOTUNE_OP_TYPES*MAX_AUTOTUNE_INSTANCES;++i) {
+			LOG_STATS("%d:[",i);
+			u_int64_t last;
+			u_int64_t num = num_adjustment_ops[i];
+			if ((num % NUM_LATEST_UPDATES) != 0)
+				last = (num % NUM_LATEST_UPDATES) - 1;
+			else
+				last = NUM_LATEST_UPDATES - 1;
+
+			num = num % NUM_LATEST_UPDATES;
+
+			while (num != last) {
+				if (latest_cpu_fract[i][num] != INVALID_CPU_FRACT)
+					LOG_STATS("%lld, ", latest_cpu_fract[i][num]);
+				
+				num = (num + 1) % NUM_LATEST_UPDATES;
+			}
+			LOG_STATS("%lld, ", latest_cpu_fract[i][last]);
+			LOG_STATS("],\n");
+		}
+		LOG_STATS("},\n");
+	}
+
+	if (true) {
+		LOG_STATS("'latest_avg_wait_times': {");
+		for (int i=0;i<MAX_AUTOTUNE_OP_TYPES*MAX_AUTOTUNE_INSTANCES;++i) {
+			LOG_STATS("%d:[",i);
+			u_int64_t last;
+			u_int64_t num = num_adjustment_ops[i];
+			if ((num % NUM_LATEST_UPDATES) != 0)
+				last = (num % NUM_LATEST_UPDATES) - 1;
+			else
+				last = NUM_LATEST_UPDATES - 1;
+
+			num = num % NUM_LATEST_UPDATES;
+
+			while (num != last) {
+				if (latest_avg_times[i][num] != INVALID_WAIT_TIME)
+					LOG_STATS("%lld, ", latest_avg_times[i][num]);
+				
+				num = (num + 1) % NUM_LATEST_UPDATES;
+			}
+			LOG_STATS("%lld, ", latest_avg_times[i][last]);
+			LOG_STATS("],\n");
+		}
+		LOG_STATS("},\n");
+
+		LOG_STATS("'all_wait_times': [");
+		for (uint64_t i=0;i<dto_op_counter;++i){
+			LOG_STATS("%llu, ", raw_wait_times[i]);
+		}
+		LOG_STATS("],\n");
+
+        LOG_STATS("'wait_time_samples': [");
+		for (uint64_t i=0;i<sample_counter;++i){
+			LOG_STATS("%llu, ", sampled_wait_times[i]);
+		}
+		LOG_STATS("],\n");
+
+		uint64_t cycles_per_sec;
+		calibrate(&cycles_per_sec);
+		LOG_STATS("'cycles_per_sec': %llu,\n",cycles_per_sec);
+	}
+
+}
+
+static void print_stats(void)
+{
+	struct timespec dto_end_time;
+	uint64_t total_memop_time=0;
+
+	if (likely(!collect_stats))
+		return;
+
+	clock_gettime(CLOCK_BOOTTIME, &dto_end_time);
+
+	LOG_STATS("DTO Run Time: %ld ms\n", TS_NS(dto_start_time, dto_end_time)/1000000);
+
+	// display stats
+
+
+	LOG_STATS("\n******** Number of Memory Operations ********\n");
+	
+	LOG_STATS("%17s    ", "");
+	for (int g = 0; g < MAX_STAT_GROUP; ++g) {
+		if (g == DSA_FAIL_CODES)
+			LOG_STATS("<***** %-13s *****> ", stat_group_names[g]);
+		else
+			LOG_STATS("<*************************************** %-13s ****************************************> ", stat_group_names[g]);
+	}
+	LOG_STATS("\n");
+
+	LOG_STATS("%-17s -- ", "Byte Range");
+	for (int g = 0; g < MAX_STAT_GROUP - 1; ++g) {
+		for (int o = 0; o < MAX_MEMOP; ++o)
+			LOG_STATS("%-13s ", memop_names[o]);
+		LOG_STATS("%-13s ", "bytes");
+		LOG_STATS("%-13s ", "bytes_cpu");
+	}
+	for (int o = 1; o < MAX_FAILURES; ++o)
+		LOG_STATS("%-6s ", failure_names[o]);
+	LOG_STATS("\n");
+
+	for (int b = 0; b < HIST_NO_BUCKETS; ++b) {
+		bool empty = true;
+
+		for (int g = 0; g < MAX_STAT_GROUP; ++g) {
+			for (int o = 0; o < MAX_MEMOP; ++o) {
+				if (op_counter[b][g][o] != 0) {
+					empty = false;
+					break;
+				}
+			}
+			if (!empty)
+				break;
+		}
+		if (empty)
+			continue;
+
+		if (b < (HIST_NO_BUCKETS-1))
+			LOG_STATS("% 8d-%-8d -- ", b*4096, ((b+1)*4096)-1);
+		else
+			LOG_STATS("   >=%-12d -- ", b*4096);
+
+		for (int g = 0; g < MAX_STAT_GROUP - 1; ++g) {
+			for (int o = 0; o < MAX_MEMOP; ++o) {
+				LOG_STATS("%-13lld ", op_counter[b][g][o]);
+			}
+
+			LOG_STATS("%-13lld ", bytes_counter[b][g]);
+			LOG_STATS("%-13lld ", bytes_counter_cpu[b][g]);
+		}
+
+		for (int o = 1; o < MAX_FAILURES; ++o)
+			LOG_STATS("%-6d ", fail_counter[b][o]);
+		LOG_STATS("\n");
+	}
+
+	LOG_STATS("\n******** Average Memory Operation Latency (us)  ********\n");
+
+	LOG_STATS("%17s    ", "");
+	for (int g = 0; g < MAX_STAT_GROUP; ++g) {
+		if (g != DSA_FAIL_CODES)
+			LOG_STATS("<******** %-13s ********> ", stat_group_names[g]);
+	}
+	LOG_STATS("\n");
+
+	LOG_STATS("%-17s -- ", "Byte Range");
+	for (int g = 0; g < MAX_STAT_GROUP - 1; ++g) {
+		for (int o = 0; o < MAX_MEMOP-1; ++o)
+			LOG_STATS("%-8s ", memop_names[o]);
+	}
+
+	LOG_STATS("\n");
+
+	for (int b = 0; b < HIST_NO_BUCKETS; ++b) {
+		bool empty = true;
+
+		for (int g = 0; g < MAX_STAT_GROUP; ++g) {
+			for (int o = 0; o < MAX_MEMOP-1; ++o) {
+				if (op_counter[b][g][o] != 0) {
+					empty = false;
+					break;
+				}
+			}
+			if (!empty)
+				break;
+		}
+		if (empty)
+			continue;
+
+		if (b < (HIST_NO_BUCKETS-1))
+			LOG_STATS("% 8d-%-8d -- ", b*4096, ((b+1)*4096)-1);
+		else
+			LOG_STATS("   >=%-12d -- ", b*4096);
+
+		for (int g = 0; g < MAX_STAT_GROUP - 1; ++g) {
+			for (int o = 0; o < MAX_MEMOP-1; ++o) {
+				if (op_counter[b][g][o] != 0) {
+					total_memop_time += (lat_counter[b][g][o]/1000);
+					double avg_us = ((double) lat_counter[b][g][o])/(((double) op_counter[b][g][o]) * 1000.0);
+
+					LOG_STATS("%-8.2f ", avg_us);
+				} else {
+					LOG_STATS("%-8d ", 0);
+				}
+			}
+			
+		}
+
+		LOG_STATS("\n");
+	}
+
+	LOG_STATS("Total memory op time %llu\n ",total_memop_time);
+
+	for(int i=0; i < num_wqs; ++i) {
+		LOG_STATS("Work Queue Occupancy %d: ", i);
+		for( int j=0; j<HIST_NO_REQS;++j) {
+			LOG_STATS("%d,",num_dto_requests[j][i]);
+		}
+		LOG_STATS("\n");
+	}
+
+	/*
+	LOG_STATS("Numa node counts\n");
+	LOG_STATS("    MEMESET Destination\n");
+	for (int i=0;i<num_numa_nodes;++i) 
+		LOG_STATS("        Numa %d: %lu\n",i,numa_node_counts[MEMSET_DST][i]);
+	
+	LOG_STATS("    MEMECPY Source\n");
+	for (int i=0;i<num_numa_nodes;++i)
+		LOG_STATS("        Numa %d: %lu\n",i,numa_node_counts[MEMCPY_SRC][i]);
+	
+	LOG_STATS("    MEMECPY Destination\n");
+	for (int i=0;i<num_numa_nodes;++i)
+		LOG_STATS("        Numa %d: %lu\n",i,numa_node_counts[MEMCPY_DST][i]);
+
+	*/
+
+	//LOG_STATS("Number of DSA Queue Full: %llu\n", num_queue_full);
+
+	if(collect_alg_stats)
+		print_alg_stats();
+}
+
+
+static void print_stats_old_format(void)
+{
+	struct timespec dto_end_time;
+
+	if (likely(!collect_stats))
+		return;
+
+	clock_gettime(CLOCK_BOOTTIME, &dto_end_time);
+
+	LOG_STATS("DTO Run Time: %ld ms\n", TS_NS(dto_start_time, dto_end_time)/1000000);
+
+	// display stats
+	LOG_STATS("\n******** Number of Memory Operations ********\n");
+	
+
+	LOG_STATS("%17s    ", "");
+	for (int g = 0; g < MAX_STAT_GROUP; ++g) {
+		if (g == DSA_FAIL_CODES)
+			LOG_STATS("<***** %-13s *****> ", stat_group_names[g]);
+		else if(g != DSA_CALL_FAILED_STDC_CALL)
+			LOG_STATS("<******************** %-13s ********************> ", stat_group_names[g]);
+	}
+	LOG_STATS("\n");
+
+	LOG_STATS("%-17s -- ", "Byte Range");
+	for (int g = 0; g < MAX_STAT_GROUP - 1; ++g) {
+		if (g != DSA_CALL_FAILED_STDC_CALL) {
+			for (int o = 0; o < MAX_MEMOP-1; ++o)
+				LOG_STATS("%-8s ", memop_names[o]);
+			LOG_STATS("%-12s ", "bytes");
+		}
+	}
+
+	for (int o = 1; o < MAX_FAILURES; ++o)
+		LOG_STATS("%-6s ", failure_names[o]);
+	LOG_STATS("\n");
+
+	for (int b = 0; b < HIST_NO_BUCKETS; ++b) {
+		bool empty = true;
+
+		for (int g = 0; g < MAX_STAT_GROUP; ++g) {
+			for (int o = 0; o < MAX_MEMOP-1; ++o) {
+				if (op_counter[b][g][o] != 0) {
+					empty = false;
+					break;
+				}
+			}
+			if (!empty)
+				break;
+		}
+		if (empty)
+			continue;
+
+		if (b < (HIST_NO_BUCKETS-1))
+			LOG_STATS("% 8d-%-8d -- ", b*4096, ((b+1)*4096)-1);
+		else
+			LOG_STATS("   >=%-12d -- ", b*4096);
+
+		for (int g = 0; g < MAX_STAT_GROUP - 1; ++g) {
+			if (g != DSA_CALL_FAILED_STDC_CALL) {
+				for (int o = 0; o < MAX_MEMOP-1; ++o) {
+					LOG_STATS("%-8d ", op_counter[b][g][o]);
+				}
+		
+				LOG_STATS("%-12lld ", bytes_counter[b][g]);
+
+			}
+		}
+
+		for (int o = 1; o < MAX_FAILURES; ++o)
+			LOG_STATS("%-6d ", fail_counter[b][o]);
+		LOG_STATS("\n");
+	}
+	 
+	LOG_STATS("\n******** Average Memory Operation Latency (us)  ********\n");
+
+	LOG_STATS("%17s    ", "");
+	for (int g = 0; g < MAX_STAT_GROUP; ++g) {
+		if (g != DSA_FAIL_CODES && g != DSA_CALL_FAILED_STDC_CALL)
+			LOG_STATS("<******** %-13s ********> ", stat_group_names[g]);
+	}
+	LOG_STATS("\n");
+
+	LOG_STATS("%-17s -- ", "Byte Range");
+	for (int g = 0; g < MAX_STAT_GROUP - 1; ++g) {
+		if (g != DSA_CALL_FAILED_STDC_CALL) {
+			for (int o = 0; o < MAX_MEMOP-1; ++o)
+				LOG_STATS("%-8s ", memop_names[o]);
+		}
+	}
+
+	LOG_STATS("\n");
+
+	for (int b = 0; b < HIST_NO_BUCKETS; ++b) {
+		bool empty = true;
+
+		for (int g = 0; g < MAX_STAT_GROUP; ++g) {
+			for (int o = 0; o < MAX_MEMOP-1; ++o) {
+				if (op_counter[b][g][o] != 0) {
+					empty = false;
+					break;
+				}
+			}
+			if (!empty)
+				break;
+		}
+		if (empty)
+			continue;
+
+		if (b < (HIST_NO_BUCKETS-1))
+			LOG_STATS("% 8d-%-8d -- ", b*4096, ((b+1)*4096)-1);
+		else
+			LOG_STATS("   >=%-12d -- ", b*4096);
+
+		for (int g = 0; g < MAX_STAT_GROUP - 1; ++g) {
+			if (g != DSA_CALL_FAILED_STDC_CALL) {
+				for (int o = 0; o < MAX_MEMOP-1; ++o) {
+					if (op_counter[b][g][o] != 0) {
+						double avg_us = ((double) lat_counter[b][g][o])/(((double) op_counter[b][g][o]) * 1000.0);
+
+						LOG_STATS("%-8.2f ", avg_us);
+					} else {
+						LOG_STATS("%-8d ", 0);
+					}
+				}
+			}
+		}
+		LOG_STATS("\n");
+	}
+}
+
+/*
+
+static void print_stats_backup(void)
+{
+	struct timespec dto_end_time;
+	uint64_t total_memop_time=0;
+
+	if (likely(!collect_stats))
+		return;
+
+	clock_gettime(CLOCK_BOOTTIME, &dto_end_time);
+
+	LOG_STATS("DTO Run Time: %ld ms\n", TS_NS(dto_start_time, dto_end_time)/1000000);
+
+	// display stats
+	for (int t = 0; t < 2; ++t) {
+		if (t == 0)
+			LOG_STATS("\n******** Number of Memory Operations ********\n");
+		else
+			LOG_STATS("\n******** Average Memory Operation Latency (us)  ********\n");
+
+		LOG_STATS("%17s    ", "");
+		for (int g = 0; g < MAX_STAT_GROUP; ++g) {
+			if (t == 0) {
+				if (g == DSA_FAIL_CODES)
+					LOG_STATS("<***** %-13s *****> ", stat_group_names[g]);
+				else
+					LOG_STATS("<******************************** %-13s *********************************> ", stat_group_names[g]);
+			} else {
+				if (g != DSA_FAIL_CODES)
+					LOG_STATS("<******** %-13s ********> ", stat_group_names[g]);
+
+			}
+		}
+		LOG_STATS("\n");
+
+		LOG_STATS("%-17s -- ", "Byte Range");
+		for (int g = 0; g < MAX_STAT_GROUP - 1; ++g) {
+			for (int o = 0; o < MAX_MEMOP; ++o)
+				LOG_STATS("%-13s ", memop_names[o]);
+			if (t == 0) {
+				LOG_STATS("%-13s ", "bytes");
+				LOG_STATS("%-13s ", "bytes_cpu");
+			}
+		}
+		if (t == 0)
+			for (int o = 1; o < MAX_FAILURES; ++o)
+				LOG_STATS("%-6s ", failure_names[o]);
+		LOG_STATS("\n");
+
+		for (int b = 0; b < HIST_NO_BUCKETS; ++b) {
+			bool empty = true;
+
+			for (int g = 0; g < MAX_STAT_GROUP; ++g) {
+				for (int o = 0; o < MAX_MEMOP; ++o) {
+					if (op_counter[b][g][o] != 0) {
+						empty = false;
+						break;
+					}
+				}
+				if (!empty)
+					break;
+			}
+			if (empty)
+				continue;
+
+			if (b < (HIST_NO_BUCKETS-1))
+				LOG_STATS("% 8d-%-8d -- ", b*4096, ((b+1)*4096)-1);
+			else
+				LOG_STATS("   >=%-12d -- ", b*4096);
+
+			for (int g = 0; g < MAX_STAT_GROUP - 1; ++g) {
+				for (int o = 0; o < MAX_MEMOP; ++o) {
+					if (t == 0) {
+						LOG_STATS("%-13lld ", op_counter[b][g][o]);
+						continue;
+					}
+					if (op_counter[b][g][o] != 0) {
+						total_memop_time += (lat_counter[b][g][o]/1000);
+						double avg_us = ((double) lat_counter[b][g][o])/(((double) op_counter[b][g][o]) * 1000.0);
+
+						LOG_STATS("%-8.2f ", avg_us);
+					} else {
+						LOG_STATS("%-8d ", 0);
+					}
+				}
+				if (t == 0) {
+					LOG_STATS("%-13lld ", bytes_counter[b][g]);
+					LOG_STATS("%-13lld ", bytes_counter_cpu[b][g]);
+				}
+			}
+			if (t == 0)
+				for (int o = 1; o < MAX_FAILURES; ++o)
+					LOG_STATS("%-6d ", fail_counter[b][o]);
+			LOG_STATS("\n");
+		}
+	}
+
+	LOG_STATS("Total memory op time %llu\n ",total_memop_time);
+
+	for(int i=0; i < num_wqs; ++i) {
+		LOG_STATS("Work Queue Occupancy %d: ", i);
+		for( int j=0; j<HIST_NO_REQS;++j) {
+			LOG_STATS("%d,",num_dto_requests[j][i]);
+		}
+		LOG_STATS("\n");
+	}
+
+	
+	//LOG_STATS("Numa node counts\n");
+	//LOG_STATS("    MEMESET Destination\n");
+	//for (int i=0;i<num_numa_nodes;++i) 
+	//	LOG_STATS("        Numa %d: %lu\n",i,numa_node_counts[MEMSET_DST][i]);
+	
+	//LOG_STATS("    MEMECPY Source\n");
+	//for (int i=0;i<num_numa_nodes;++i)
+	//	LOG_STATS("        Numa %d: %lu\n",i,numa_node_counts[MEMCPY_SRC][i]);
+	
+	//LOG_STATS("    MEMECPY Destination\n");
+	//for (int i=0;i<num_numa_nodes;++i)
+	//	LOG_STATS("        Numa %d: %lu\n",i,numa_node_counts[MEMCPY_DST][i]);
+
+	
+
+	//LOG_STATS("Number of DSA Queue Full: %llu\n", num_queue_full);
+
+	if(collect_alg_stats)
+		print_alg_stats();
+}
+
+static void print_stats_old_format_backup(void)
+{
+	struct timespec dto_end_time;
+
+	if (likely(!collect_stats))
+		return;
+
+	clock_gettime(CLOCK_BOOTTIME, &dto_end_time);
+
+	LOG_STATS("DTO Run Time: %ld ms\n", TS_NS(dto_start_time, dto_end_time)/1000000);
+
+	// display stats
+	for (int t = 0; t < 2; ++t) {
+		if (t == 0)
+			LOG_STATS("\n******** Number of Memory Operations ********\n");
+		else 
+			LOG_STATS("\n******** Average Memory Operation Latency (us)  ********\n");
+
+		LOG_STATS("%17s    ", "");
+		for (int g = 0; g < MAX_STAT_GROUP; ++g) {
+			if (t == 0) {
+				if (g == DSA_FAIL_CODES)
+					LOG_STATS("<***** %-13s *****> ", stat_group_names[g]);
+				else if(g != DSA_CALL_FAILED_STDC_CALL)
+					LOG_STATS("<*************** %-13s ***************> ", stat_group_names[g]);
+			} else {
+				if (g != DSA_FAIL_CODES && g != DSA_CALL_FAILED_STDC_CALL)
+					LOG_STATS("<******** %-13s ********> ", stat_group_names[g]);
+
+			}
+		}
+		LOG_STATS("\n");
+
+		LOG_STATS("%-17s -- ", "Byte Range");
+		for (int g = 0; g < MAX_STAT_GROUP - 1; ++g) {
+			if (g != DSA_CALL_FAILED_STDC_CALL) {
+				for (int o = 0; o < MAX_MEMOP; ++o)
+					LOG_STATS("%-8s ", memop_names[o]);
+				if (t == 0)
+					LOG_STATS("%-12s ", "bytes");
+			}
+		}
+		if (t == 0)
+			for (int o = 1; o < MAX_FAILURES; ++o)
+				LOG_STATS("%-6s ", failure_names[o]);
+		LOG_STATS("\n");
+
+		for (int b = 0; b < HIST_NO_BUCKETS; ++b) {
+			bool empty = true;
+
+			for (int g = 0; g < MAX_STAT_GROUP; ++g) {
+				for (int o = 0; o < MAX_MEMOP; ++o) {
+					if (op_counter[b][g][o] != 0) {
+						empty = false;
+						break;
+					}
+				}
+				if (!empty)
+					break;
+			}
+			if (empty)
+				continue;
+
+			if (b < (HIST_NO_BUCKETS-1))
+				LOG_STATS("% 8d-%-8d -- ", b*4096, ((b+1)*4096)-1);
+			else
+				LOG_STATS("   >=%-12d -- ", b*4096);
+
+			for (int g = 0; g < MAX_STAT_GROUP - 1; ++g) {
+				if (g != DSA_CALL_FAILED_STDC_CALL) {
+					for (int o = 0; o < MAX_MEMOP; ++o) {
+						if (t == 0) {
+							LOG_STATS("%-8d ", op_counter[b][g][o]);
+							continue;
+						}
+						if (op_counter[b][g][o] != 0) {
+							double avg_us = ((double) lat_counter[b][g][o])/(((double) op_counter[b][g][o]) * 1000.0);
+
+							LOG_STATS("%-8.2f ", avg_us);
+						} else {
+							LOG_STATS("%-8d ", 0);
+						}
+					}
+				}
+				if (t == 0)
+					LOG_STATS("%-12lld ", bytes_counter[b][g]);
+			}
+			if (t == 0)
+				for (int o = 1; o < MAX_FAILURES; ++o)
+					LOG_STATS("%-6d ", fail_counter[b][o]);
+			LOG_STATS("\n");
+		}
+	}
+}
+*/
+
+static void print_stats_dict(void)
+{
+	struct timespec dto_end_time;
+	uint64_t total_memop_time=0;
+
+	if (likely(!collect_stats))
+		return;
+
+	clock_gettime(CLOCK_BOOTTIME, &dto_end_time);
+
+	LOG_STATS("%s\n",stats_prefix);
+
+	LOG_STATS("stats={'run_time':%ld,\n", TS_NS(dto_start_time, dto_end_time)/1000000);
+
+	// display stats
+
+	
+	LOG_STATS("'mem_ops': {");
+		
+	for (int b = 0; b < HIST_NO_BUCKETS; ++b) {
+		bool empty = true;
+
+		for (int g = 0; g < MAX_STAT_GROUP; ++g) {
+			for (int o = 0; o < MAX_MEMOP; ++o) {
+				if (op_counter[b][g][o] != 0) {
+					empty = false;
+					break;
+				}
+			}
+			if (!empty)
+				break;
+		}
+		if (empty)
+			continue;
+
+		LOG_STATS("%d:{", b*4096);
+		
+		for (int g = 0; g < MAX_STAT_GROUP - 1; ++g) {
+			LOG_STATS("'%s':{",stat_group_names2[g]);
+			for (int o = 0; o < MAX_MEMOP; ++o) {
+				LOG_STATS("'%s':%llu,\n",  memop_names[o], op_counter[b][g][o]);
+			}
+		
+			LOG_STATS("'bytes':%lld,\n", bytes_counter[b][g]);
+			LOG_STATS("'bytes_cpu':%lld},\n", bytes_counter_cpu[b][g]);
+		}
+
+		LOG_STATS("'failure_reasons':{\n");
+		LOG_STATS("'%s':%d,\n", failure_names[1],fail_counter[b][1]);
+		LOG_STATS("'%s':%d,\n", failure_names[2],fail_counter[b][2]);
+		LOG_STATS("'%s':%d},\n", failure_names[3],fail_counter[b][3]);
+			
+		LOG_STATS("},\n");
+	}
+
+	LOG_STATS("},\n");
+	
+
+	LOG_STATS("'mem_latency': {");
+	//printf("'mem_latency': {");
+	for (int b = 0; b < HIST_NO_BUCKETS; ++b) {
+		bool empty = true;
+
+		for (int g = 0; g < MAX_STAT_GROUP; ++g) {
+			for (int o = 0; o < MAX_MEMOP-1; ++o) {
+				if (op_counter[b][g][o] != 0) {
+					empty = false;
+					break;
+				}
+			}
+			if (!empty)
+				break;
+		}
+		if (empty)
+			continue;
+
+		//LOG_STATS("%d:{", b*4096);
+		LOG_STATS("%d:{", b*4096);
+		
+		for (int g = 0; g < MAX_STAT_GROUP - 1; ++g) {
+			LOG_STATS("'%s':{",stat_group_names2[g]);
+			for (int o = 0; o < MAX_MEMOP-1; ++o) {
+				
+				if (op_counter[b][g][o] != 0) {
+					total_memop_time += (lat_counter[b][g][o]/1000);
+					double avg_us = ((double) lat_counter[b][g][o])/(((double) op_counter[b][g][o]) * 1000.0);
+
+					LOG_STATS("'%s':%f,\n", memop_names[o], avg_us);
+				} else {
+					LOG_STATS("'%s':%d,\n", memop_names[o], 0);
+				}
+			}
+			LOG_STATS("},\n");
+		}
+
+		LOG_STATS("},\n");
+	}
+
+	LOG_STATS("},\n");
+
+	LOG_STATS("'total_op_time_ms': %llu,\n",total_memop_time);
+
+	LOG_STATS("'wq_occupance': {");
+	for(int i=0; i < num_wqs; ++i) {
+		LOG_STATS("%d:[", i);
+		for( int j=0; j<HIST_NO_REQS;++j) {
+			LOG_STATS("%d,",num_dto_requests[j][i]);
+		}
+		LOG_STATS("],\n");
+	}
+	LOG_STATS("},\n");
+
+	//LOG_STATS("'num_q_full': %llu,\n", num_queue_full);
+
+	float secs;
+	float latency = 1.0 * cycles / c_ops;
+	uint64_t cycles_per_sec;
+	calibrate(&cycles_per_sec);
+
+	secs = (float)cycles/cycles_per_sec;
+	float latency_ns = (latency * 1E9)/cycles_per_sec;
+
+
+
+	if(collect_alg_stats)
+		print_alg_stats_dict();
+	LOG_STATS("}\n");
+}
+#endif
+
+#define DTO_MAX_PARAM_LEN 16
+static void dto_get_param_string(int dir_fd, char *path, char *out)
+{
+	int fd;
+	char buffer[DTO_MAX_PARAM_LEN];
+	int bytes;
+
+	out[0] = '\0';
+	fd = openat(dir_fd, path, O_RDONLY);
+
+	if (fd < 0)
+		return;
+
+	bytes = read(fd, buffer, DTO_MAX_PARAM_LEN - 1);
+
+	if (bytes <= 0) {
+		close(fd);
+		return;
+	}
+
+	if (buffer[bytes - 1] == '\n')
+		buffer[bytes - 1] = '\0';
+	else
+		buffer[bytes] = '\0';
+
+	strncpy(out, buffer, DTO_MAX_PARAM_LEN);
+	close(fd);
+}
+
+static unsigned long long dto_get_param_ullong(int dir_fd, char *path, int *err)
+{
+	int fd;
+	char buffer[DTO_MAX_PARAM_LEN];
+	int bytes;
+	unsigned long long val;
+
+	fd = openat(dir_fd, path, O_RDONLY);
+
+	if (fd < 0) {
+		*err = -errno;
+		return -errno;
+	}
+
+	bytes = read(fd, buffer, DTO_MAX_PARAM_LEN - 1);
+
+	if (bytes <= 0) {
+		*err = -errno;
+		close(fd);
+		return -errno;
+	}
+
+	errno = 0;
+	val = strtoull(buffer, NULL, 0);
+
+	*err = -errno;
+	close(fd);
+
+	return val;
+}
+
+static struct dto_device* get_dto_device(int dev_numa_node) {
+	struct dto_device* dev = NULL;
+
+	if (devices[dev_numa_node] == NULL) {
+		dev = calloc(1, sizeof(struct dto_device));
+		devices[dev_numa_node] = dev;
+	} else {
+		dev = devices[dev_numa_node];
+	}
+
+	return dev;
+}
+
+static void correct_devices_list() {
+	struct dto_device* dev = NULL;
+	for (uint8_t i = 0; i < MAX_NUMA_NODES; i++) {
+		if (devices[i] != NULL) {
+			dev = devices[i];
+		} else {
+			devices[i] = dev;
+		}
+	}
+}
+
+/*
+static __always_inline  int get_numa_node_buf(void* buf) {
+	int numa_node = -1;
+	if (buf != NULL) {
+
+		int status[1] = {-1};
+		// get numa node of memory pointed by buf
+		//if (move_pages(0, 1, &buf, NULL, status, 0) == 0) {
+		//	numa_node = status[0];
+		//} else {
+		//	LOG_ERROR("move_pages call error: %d - %s", errno, strerror(errno));
+		//}
+
+		// alternatively get_mempolicy can be used
+		if (get_mempolicy(&numa_node, NULL, 0, (void *)buf, MPOL_F_NODE | MPOL_F_ADDR) != 0) {
+		 	LOG_ERROR("get_mempolicy call error: %d - %s", errno, strerror(errno));
+		 }
+	} else {
+		LOG_ERROR("NULL buffer delivered. Unable to detect numa node");
+	}
+	return numa_node;
+}
+*/
+
+
+static __always_inline  int get_numa_node(void* buf) {
+	int numa_node = -1;
+
+	switch (is_numa_aware) {
+        case NA_BUFFER_CENTRIC: {
+			if (buf != NULL) {
+				int status[1] = {-1};
+
+				// get numa node of memory pointed by buf
+				if (move_pages(0, 1, &buf, NULL, status, 0) == 0) {
+					numa_node = status[0];
+				} else {
+					LOG_ERROR("move_pages call error: %d - %s", errno, strerror(errno));
+				}
+
+				// alternatively get_mempolicy can be used
+				// if (get_mempolicy(&numa_node, NULL, 0, (void *)buf, MPOL_F_NODE | MPOL_F_ADDR) != 0) {
+				// 	LOG_ERROR("get_mempolicy call error: %d - %s", errno, strerror(errno));
+				// }
+			} else {
+				LOG_ERROR("NULL buffer delivered. Unable to detect numa node");
+			}
+		}
+		break;
+		case NA_CPU_CENTRIC: {
+			const int cpu = sched_getcpu();
+			if (cpu != -1) {
+				numa_node = numa_node_of_cpu(cpu);
+			}
+			else {
+				LOG_ERROR("sched_getcpu call error: %d - %s", errno, strerror(errno));
+			}
+		}
+		break;
+        default:
+		break;
+        }
+
+		//LOG_TRACE("numa node %d\n", numa_node);
+
+		if (opposite_numa) {
+			numa_node = (numa_node + 1) % 2;
+			//LOG_TRACE("updated numa node %d\n ", numa_node);
+		}
+
+        return numa_node;
+}
+
+static void cleanup_devices() {
+	struct dto_device* dev = NULL;
+	for (uint i = 0; i < MAX_NUMA_NODES; i++) {
+		if (devices[i] != dev) {
+			dev = devices[i];
+			free(devices[i]);
+		}
+		devices[i] = NULL;
+	}
+}
+
+static bool test_write_syscall(struct dto_wq *wq)
+{
+	struct dsa_hw_desc desc = {0};
+	struct dsa_completion_record comp __attribute__((aligned(32)));
+	int retry = 0;
+
+	desc.opcode = DSA_OPCODE_NOOP;
+	desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
+	comp.status = 0;
+
+	desc.completion_addr = (unsigned long)&comp;
+
+	if (dsa_submit(wq, &desc, 0) == SUCCESS) {
+		while (comp.status == 0 && retry++ < 10000)
+			_mm_pause();
+
+		if (comp.status == DSA_COMP_SUCCESS)
+			return true;
+	}
+
+	return false;
+}
+
+static int dsa_init_from_wq_list(char *wq_list)
+{
+	char *wq;
+	char file_path[PATH_MAX];
+	int dsa_id, wq_id;
+	int dir_fd;
+	int rc;
+
+	num_wqs = 0;
+
+	wq = strtok(wq_list, ";");
+	while (wq != NULL) {
+		char wq_mode[DTO_MAX_PARAM_LEN];
+
+		if (sscanf(wq, "wq%d.%d", &dsa_id, &wq_id) != 2) {
+			LOG_ERROR("Invalid WQ format %s\n", wq);
+			rc = -EINVAL;
+			goto fail_wq;
+		}
+
+		snprintf(file_path, PATH_MAX, "/sys/bus/dsa/devices/dsa%d", dsa_id);
+
+		dir_fd = open(file_path, O_PATH);
+		if (dir_fd == -1) {
+			LOG_ERROR("dir %s open failed: %s\n", file_path, strerror(errno));
+			rc = -errno;
+			goto fail_wq;
+		}
+
+		wqs[num_wqs].index = num_wqs;
+
+		wqs[num_wqs].dsa_gencap = dto_get_param_ullong(dir_fd, "gen_cap", &rc);
+		if (rc) {
+			close(dir_fd);
+			goto fail_wq;
+		}
+
+		const int dev_numa_node = (int)dto_get_param_ullong(dir_fd, "numa_node", &rc);
+		if (rc) {
+			close(dir_fd);
+			goto fail_wq;
+		}
+
+		close(dir_fd);
+
+		snprintf(file_path, PATH_MAX, "/sys/bus/dsa/devices/%s", wq);
+
+		dir_fd = open(file_path, O_PATH);
+		if (dir_fd == -1) {
+			LOG_ERROR("dir %s open failed: %s\n", file_path, strerror(errno));
+			rc = -errno;
+			goto fail_wq;
+		}
+
+		wqs[num_wqs].max_transfer_size = dto_get_param_ullong(dir_fd, "max_transfer_size", &rc);
+		if (rc) {
+			close(dir_fd);
+			goto fail_wq;
+		}
+
+		dto_get_param_string(dir_fd, "mode", wq_mode);
+
+		if (wq_mode[0] == '\0') {
+			close(dir_fd);
+			rc = -ENOTSUP;
+			goto fail_wq;
+		}
+
+		if (strcmp(wq_mode, "shared") != 0) {
+			continue;
+		}
+
+		wqs[num_wqs].wq_size = dto_get_param_ullong(dir_fd, "size", &rc);
+		close(dir_fd);
+
+		if (rc)
+			goto fail_wq;
+
+		snprintf(wqs[num_wqs].wq_path, PATH_MAX, "/dev/dsa/%s", wq);
+
+		// open DSA WQ
+		wqs[num_wqs].wq_fd = open(wqs[num_wqs].wq_path, O_RDWR);
+		if (wqs[num_wqs].wq_fd < 0) {
+			LOG_ERROR("DSA WQ %s open error: %s\n", wqs[num_wqs].wq_path, strerror(errno));
+			rc = -errno;
+			goto fail_wq;
+		}
+
+		// map DSA WQ portal
+		wqs[num_wqs].wq_portal = mmap(NULL, 0x1000, PROT_WRITE, MAP_SHARED | MAP_POPULATE,
+				wqs[num_wqs].wq_fd, 0);
+
+		if (wqs[num_wqs].wq_portal == MAP_FAILED) {
+			/* In case the driver doesn't support mmap, test if it
+			 * supports write system call for work submission, and
+			 * if yes, fallback to using write syscall.
+			 */
+
+			rc = -errno;
+			if (test_write_syscall(&wqs[num_wqs]))
+				wqs[num_wqs].wq_mmapped = false;
+			else {
+				LOG_ERROR("mmap error for DSA wq: %s, error: %s\n", wqs[num_wqs].wq_path, strerror(errno));
+				goto fail_wq;
+			}
+		} else {
+			wqs[num_wqs].wq_mmapped = true;
+			close(wqs[num_wqs].wq_fd);
+		}
+
+		if (is_numa_aware) {
+			struct dto_device* dev = get_dto_device(dev_numa_node);
+			if (dev != NULL &&
+				dev->num_wqs < MAX_WQS) {
+				dev->wqs[dev->num_wqs++] = &wqs[num_wqs];
+			}
+		}
+
+		++num_wqs;
+		if (num_wqs == MAX_WQS)
+			break;
+
+		wq = strtok(NULL, ";");
+	}
+
+	if (num_wqs == 0) {
+		rc = -EINVAL;
+		goto fail;
+	}
+
+	if (is_numa_aware) {
+		correct_devices_list();
+	}
+
+	return 0;
+
+fail_wq:
+	for (int j = 0; j < num_wqs; j++)
+		munmap(wqs[j].wq_portal, 0x1000);
+	num_wqs = 0;
+
+	cleanup_devices();
+
+fail:
+	return rc;
+}
+
+static int dsa_init_from_accfg(void)
+{
+	int used_devids[MAX_WQS];
+	struct accfg_device *device;
+	struct accfg_wq *wq;
+	struct accfg_ctx *dto_ctx = NULL;
+	int rc;
+	int i;
+
+	//LOG_TRACE("dsa_init_from_accfg\n");
+
+	for (i = 0; i < MAX_WQS; i++) {
+		wqs[i].acc_wq = NULL;
+		used_devids[i] = -1;
+	}
+
+	rc = accfg_new(&dto_ctx);
+	if (rc < 0)
+		return rc;
+	num_wqs = 0;
+
+	accfg_device_foreach(dto_ctx, device) {
+		enum accfg_device_state dstate;
+
+		/* use dsa devices only*/
+		if (strncmp(accfg_device_get_devname(device), "dsa", 3)!= 0)
+			continue;
+
+		/* Make sure that the device is enabled */
+		dstate = accfg_device_get_state(device);
+		if (dstate != ACCFG_DEVICE_ENABLED)
+			continue;
+
+		/* Check if we have already used a wq on this device */
+		for (i = 0; i < num_wqs; i++)
+			if (accfg_device_get_id(device) == used_devids[i])
+				break;
+		if (i != num_wqs)
+			continue;
+
+		struct dto_device* dev = NULL;
+
+		if (is_numa_aware) {
+			const int dev_numa_node = accfg_device_get_numa_node(device);
+			dev = get_dto_device(dev_numa_node);
+			LOG_TRACE("Device %s numa node %d\n",accfg_device_get_devname(device),dev_numa_node);
+		}
+
+		accfg_wq_foreach(device, wq) {
+			enum accfg_wq_state wstate;
+			enum accfg_wq_mode mode;
+			enum accfg_wq_type type;
+
+			/* Get a workqueue that's enabled */
+			wstate = accfg_wq_get_state(wq);
+			if (wstate != ACCFG_WQ_ENABLED)
+				continue;
+
+			/* The wq type should be user */
+			type = accfg_wq_get_type(wq);
+			if (type != ACCFG_WQT_USER)
+				continue;
+
+			/* the wq mode should be shared work queue */
+			mode = accfg_wq_get_mode(wq);
+			if (mode != ACCFG_WQ_SHARED)
+				continue;
+
+			wqs[num_wqs].index = num_wqs;
+			//LOG_TRACE("inited index %d\n",num_wqs);
+
+			wqs[num_wqs].wq_size = accfg_wq_get_size(wq);
+			wqs[num_wqs].max_transfer_size = accfg_wq_get_max_transfer_size(wq);
+			//if (wqs[num_wqs].max_transfer_size > max_transfer_size) {
+			//	max_transfer_size = wqs[num_wqs].max_transfer_size;
+			//}
+
+			wqs[num_wqs].acc_wq = wq;
+			wqs[num_wqs].dsa_gencap = accfg_device_get_gen_cap(device);
+
+			used_devids[num_wqs] = accfg_device_get_id(device);
+
+			if (is_numa_aware &&
+				dev != NULL &&
+				dev->num_wqs < MAX_WQS) {
+				dev->wqs[dev->num_wqs++] = &wqs[num_wqs];
+			}
+
+			num_wqs++;
+		}
+
+		if (num_wqs == MAX_WQS)
+			break;
+	}
+
+	if (num_wqs == 0) {
+		rc = -EINVAL;
+		goto fail;
+	}
+
+	for (i = 0; i < num_wqs; i++) {
+		struct accfg_wq *acc_wq = wqs[i].acc_wq;
+
+		rc = accfg_wq_get_user_dev_path(acc_wq, wqs[i].wq_path, PATH_MAX);
+		if (rc) {
+			LOG_ERROR("Error getting device path\n");
+			goto fail_wq;
+		}
+
+		// open DSA WQ
+		wqs[i].wq_fd = open(wqs[i].wq_path, O_RDWR);
+		if (wqs[i].wq_fd < 0) {
+			LOG_ERROR("DSA WQ %s open error: %s\n", wqs[i].wq_path, strerror(errno));
+			rc = -errno;
+			goto fail_wq;
+		}
+
+		// map DSA WQ portal
+		wqs[i].wq_portal = mmap(NULL, 0x1000, PROT_WRITE, MAP_SHARED | MAP_POPULATE, wqs[i].wq_fd, 0);
+
+		if (wqs[i].wq_portal == MAP_FAILED) {
+			/* In case the driver doesn't support mmap, test if it
+			 * supports write system call for work submission, and
+			 * if yes, fallback to using write syscall.
+			 */
+			rc = -errno;
+			if (test_write_syscall(&wqs[i]))
+				wqs[num_wqs].wq_mmapped = false;
+			else {
+				LOG_ERROR("mmap error for DSA wq: %s, error: %s\n", wqs[i].wq_path, strerror(errno));
+				goto fail_wq;
+			}
+		} else {
+			wqs[i].wq_mmapped = true;
+			close(wqs[i].wq_fd);
+		}
+	}
+
+	if (is_numa_aware) {
+		correct_devices_list();
+	}
+
+	accfg_unref(dto_ctx);
+	return 0;
+
+fail_wq:
+	for (int j = 0; j < i; j++)
+		munmap(wqs[j].wq_portal, 0x1000);
+	num_wqs = 0;
+
+	cleanup_devices();
+fail:
+	accfg_unref(dto_ctx);
+	return rc;
+}
+
+static int dsa_init(void)
+{
+	unsigned int unused[2];
+	unsigned int leaf, waitpkg;
+	const char *env_str;
+	char wq_list[256];
+
+	/* detect umwait support */
+	leaf = 7;
+	waitpkg = 0;
+	if (__get_cpuid(0, &leaf, unused, &waitpkg, unused + 1)) {
+		if (waitpkg & 0x20) {
+			LOG_TRACE("umwait supported\n");
+			umwait_support = 1;
+		}
+	}
+
+	env_str = getenv("DTO_WAIT_METHOD");
+	if (env_str != NULL) {
+		if (!strncmp(env_str, wait_names[WAIT_BUSYPOLL], strlen(wait_names[WAIT_BUSYPOLL]))) {
+			wait_method = WAIT_BUSYPOLL;
+			min_avg_waits = MIN_AVG_POLL_WAITS;
+			max_avg_waits = MAX_AVG_POLL_WAITS;
+		} else if (!strncmp(env_str, wait_names[WAIT_UMWAIT], strlen(wait_names[WAIT_UMWAIT]))) {
+			if (umwait_support) {
+				wait_method = WAIT_UMWAIT;
+				/* Use the same waits as busypoll for now */
+				min_avg_waits = MIN_AVG_POLL_WAITS;
+				max_avg_waits = MAX_AVG_POLL_WAITS;
+			} else
+				LOG_ERROR("umwait not supported. Falling back to default wait method\n");
+		
+		} else if (!strncmp(env_str, wait_names[WAIT_SLEEP], strlen(wait_names[WAIT_SLEEP]))) {
+                    wait_method = WAIT_SLEEP;
+		}
+	}
+
+	env_str = getenv("DTO_WQ_LIST");
+	if (env_str == NULL)
+		return dsa_init_from_accfg();
+
+	strncpy(wq_list, env_str, sizeof(wq_list) - 1);
+	/* ensure wq_list is null terminated */
+	wq_list[sizeof(wq_list) - 1] = '\0';
+
+	return dsa_init_from_wq_list(wq_list);
+}
+
+static int init_dto(void)
+{
+	uint8_t init_notcomplete = 0;
+	//LOG_TRACE("init_dto\n");
+
+	if (atomic_compare_exchange_strong(&dto_initializing, &init_notcomplete, 1)) {
+		char *env_str;
+
+		env_str = getenv("DTO_STATS_OUTPUT_TYPE");
+		if (env_str != NULL) {
+			errno = 0;
+			stats_output_type = strtoul(env_str, NULL, 10);
+			if (errno)
+				stats_output_type = STATS_TEXT_OLD_FORMAT;
+
+		}
+
+		env_str = getenv("DTO_LOG_FILE");
+		if (env_str != NULL) {
+			char temp[PATH_MAX];
+			struct stat st;
+
+			strncpy(dto_log_path, env_str, PATH_MAX - 1);
+			/* ensure dto_log_path is null terminated */
+			dto_log_path[PATH_MAX - 1] = '\0';
+
+			snprintf(temp, sizeof(temp), ".%s.%d", __progname, getpid());
+			strncat(dto_log_path, temp, PATH_MAX - strlen(dto_log_path) - 1);
+
+			/* Open the log file only if it doesn't exist or if it is a regular file */
+			if (lstat(dto_log_path, &st) == -1 ||
+					(st.st_mode & S_IFMT) == S_IFREG)
+				log_fd = open(dto_log_path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+			/* No need to handle the open() error. It will automatically fallback
+			 * to using standard output if log file open failed
+			 */
+		}
+
+		env_str = getenv("DTO_LOG_LEVEL");
+		if (env_str != NULL) {
+			errno = 0;
+			log_level = strtoul(env_str, NULL, 10);
+			if (errno)
+				log_level = LOG_LEVEL_FATAL;
+
+			if (log_level > LOG_LEVEL_TRACE)
+				log_level = LOG_LEVEL_TRACE;
+		}
+
+		// save std c lib function pointers
+		orig_memset = dlsym(RTLD_NEXT, "memset");
+		orig_memcpy = dlsym(RTLD_NEXT, "memcpy");
+		orig_memmove = dlsym(RTLD_NEXT, "memmove");
+		orig_memcmp = dlsym(RTLD_NEXT, "memcmp");
+
+		env_str = getenv("DTO_USESTDC_CALLS");
+		if (env_str != NULL) {
+			errno = 0;
+			use_std_lib_calls = strtoul(env_str, NULL, 10);
+			if (errno)
+				use_std_lib_calls = 0;
+
+			use_std_lib_calls = !!use_std_lib_calls;
+		}
+
+		env_str = getenv("DTO_DSA_MEMCPY");
+		if (env_str != NULL) {
+			errno = 0;
+			dto_dsa_memcpy = strtoul(env_str, NULL, 10);
+			if (errno)
+				dto_dsa_memcpy = 0;
+
+			dto_dsa_memcpy = !!dto_dsa_memcpy;
+		}
+
+		env_str = getenv("DTO_DSA_CC");
+		if (env_str != NULL) {
+			errno = 0;
+			dto_dsa_cc = strtoul(env_str, NULL, 10);
+			if (errno)
+				dto_dsa_cc = 0;
+
+			dto_dsa_cc = !!dto_dsa_cc;
+		}
+
+		env_str = getenv("DTO_DSA_MEMMOVE");
+		if (env_str != NULL) {
+			errno = 0;
+			dto_dsa_memmove = strtoul(env_str, NULL, 10);
+			if (errno)
+				dto_dsa_memmove = 0;
+
+			dto_dsa_memmove = !!dto_dsa_memmove;
+		}
+
+		env_str = getenv("DTO_DSA_MEMSET");
+		if (env_str != NULL) {
+			errno = 0;
+			dto_dsa_memset = strtoul(env_str, NULL, 10);
+			if (errno)
+				dto_dsa_memset = 0;
+
+			dto_dsa_memset = !!dto_dsa_memset;
+		}
+
+		env_str = getenv("DTO_DSA_MEMCMP");
+		if (env_str != NULL) {
+			errno = 0;
+			dto_dsa_memcmp = strtoul(env_str, NULL, 10);
+			if (errno)
+				dto_dsa_memcmp = 0;
+
+			dto_dsa_memcmp = !!dto_dsa_memcmp;
+		}
+
+		env_str = getenv("DTO_MAKE_ADJ");
+		if (env_str != NULL) {
+			errno = 0;
+			make_adjustments = strtoul(env_str, NULL, 10);
+			if (errno)
+				make_adjustments = 1;
+
+			make_adjustments = !!make_adjustments;
+		}
+
+#ifdef DTO_STATS_SUPPORT
+		env_str = getenv("DTO_COLLECT_STATS");
+		if (env_str != NULL) {
+			errno = 0;
+			collect_stats = strtoul(env_str, NULL, 10);
+			if (errno)
+				collect_stats = 0;
+
+			collect_stats = !!collect_stats;
+		}
+
+		if (collect_stats) {
+			clock_gettime(CLOCK_BOOTTIME, &dto_start_time);
+			/* Change the log level to 'trace' so that the
+			 * stats can be logged
+			 */
+			if(log_level < LOG_LEVEL_STATS)
+				log_level = LOG_LEVEL_STATS;
+		
+
+			for (int i=0;i<MAX_AUTOTUNE_OP_TYPES*MAX_AUTOTUNE_INSTANCES;++i){
+				num_adjustment_ops[i] = 0;
+			}
+
+			env_str = getenv("DTO_COLLECT_ALG_STATS");
+			if (env_str != NULL) {
+				errno = 0;
+				collect_alg_stats = strtoul(env_str, NULL, 10);
+				if (errno)
+					collect_alg_stats = 0;
+
+				collect_alg_stats = !!collect_alg_stats;
+			}
+
+			env_str = getenv("DTO_STATS_NUM_WARMUP_OPS");
+			if (env_str != NULL) {
+				errno = 0;
+				dto_stats_num_warmup_ops = strtoul(env_str, NULL, 10);
+				if (errno)
+					dto_stats_num_warmup_ops = 0;
+			}
+
+
+			for(int j=0;j<MAX_AUTOTUNE_OP_TYPES*MAX_AUTOTUNE_INSTANCES;++j)
+			{
+				for(int i=0;i<NUM_LATEST_UPDATES;++i) {
+					latest_updates[j][i] = INVALID_NUM_WAITS;
+					latest_cpu_fract[j][i] = INVALID_CPU_FRACT;
+					latest_avg_times[j][i] = INVALID_WAIT_TIME;
+				}
+			}
+
+			env_str = getenv("DTO_STATS_PREFIX");
+			if (env_str != NULL) {
+				char temp[PATH_MAX];
+				struct stat st;
+
+				strncpy(stats_prefix, env_str, 99);
+				/* ensure dto_log_path is null terminated */
+				stats_prefix[99] = '\0';
+			}
+
+			env_str = getenv("DTO_COLLECT_ALG_STATS_LATEST_UPDATES");
+			if (env_str != NULL) {
+				errno = 0;
+				collect_alg_stats_latest_updates = strtoul(env_str, NULL, 10);
+				if (errno)
+					collect_alg_stats_latest_updates = 0;
+
+				collect_alg_stats_latest_updates = !!collect_alg_stats_latest_updates;
+			}
+
+			env_str = getenv("DTO_COLLECT_ALG_STATS_LATEST_CPUFRACTS");
+			if (env_str != NULL) {
+				errno = 0;
+				collect_alg_stats_latest_cpufracts = strtoul(env_str, NULL, 10);
+				if (errno)
+					collect_alg_stats_latest_cpufracts = 0;
+
+				collect_alg_stats_latest_cpufracts = !!collect_alg_stats_latest_cpufracts;
+			}
+		}
+		//num_numa_nodes = numa_num_configured_nodes();
+
+#endif
+		/*
+		env_str = getenv("DTO_NUM_AUTOTUNE_INSTANCES");
+		if (env_str != NULL) {
+			errno = 0;
+			dto_num_autotune_instances = strtoul(env_str, NULL, 10);
+			if (errno)
+				dto_num_autotune_instances = 1;
+			else if (dto_num_autotune_instances > MAX_AUTOTUNE_INSTANCES)
+				dto_num_autotune_instances = MAX_AUTOTUNE_INSTANCES;
+		}
+		*/
+		
+		env_str = getenv("DTO_PER_OP_AUTOTUNE_INSTANCES");
+		if (env_str != NULL) {
+			errno = 0;
+			dto_per_op_autotune_instances = strtoul(env_str, NULL, 10);
+			if (errno)
+				dto_per_op_autotune_instances = 0;
+
+			dto_per_op_autotune_instances = !!dto_per_op_autotune_instances;
+		}
+
+		env_str = getenv("DTO_AUTOTUNE_EXCLUDE_FAILED");
+		if (env_str != NULL) {
+			errno = 0;
+			autotune_exclude_failed = strtoul(env_str, NULL, 10);
+			if (errno)
+				autotune_exclude_failed = 0;
+
+			autotune_exclude_failed = !!autotune_exclude_failed;
+		}
+
+		env_str = getenv("DTO_OVERLAPPING_MEMMOVE_ACTION");
+		if (env_str != NULL) {
+			errno = 0;
+			dto_overlapping_memmove_action = strtoul(env_str, NULL, 10);
+			if (errno)
+				dto_overlapping_memmove_action = OVERLAPPING_CPU;
+		}
+
+		/* Register fork handler for the child process */
+		if (!fork_handler_registered) {
+			/* If pthread_atfork fails, and process calls fork,
+			 * the child may crash when using DSA offload. Dont
+			 * take that risk and disable DSA offload for parent
+			 * as well.
+			 */
+			if (!pthread_atfork(NULL, NULL, child))
+				fork_handler_registered = 1;
+			else {
+				LOG_ERROR("Setting fork() handler failed. "
+					"Falling back to using CPUs.\n");
+				use_std_lib_calls = 1;
+			}
+		}
+
+		// initialize DSA
+		if (!use_std_lib_calls) {
+			// check environment variables
+			env_str = getenv("DTO_MIN_BYTES");
+
+			if (env_str != NULL) {
+				errno = 0;
+				dsa_min_size = strtoul(env_str, NULL, 10);
+				if (errno)
+					dsa_min_size = DTO_DEFAULT_MIN_SIZE;
+			}
+
+
+			env_str = getenv("DTO_MAX_BYTES");   //JJS
+
+			if (env_str != NULL) {
+				errno = 0;
+				dsa_max_size = strtoul(env_str, NULL, 10);
+				if (errno)
+					dsa_max_size = DTO_DEFAULT_MAX_SIZE;
+			}
+
+
+			env_str = getenv("DTO_CPU_SIZE_FRACTION");
+			size_t cpu_size_fraction = 33;
+
+			if (env_str != NULL) {
+				errno = 0;
+				double cpu_size_fraction_float = strtod(env_str, NULL);
+
+				if (errno || cpu_size_fraction_float < 0 || cpu_size_fraction_float >= 1) {
+					LOG_ERROR("Invalid DTO_CPU_SIZE_FRACTION %s, "
+						"Must be >= 0 and < 1. "
+						"Falling back to default 0.0\n", env_str);
+					cpu_size_fraction_float = 0.0;
+				}
+				/* Use only 2 digits after decimal point */
+				cpu_size_fraction = 100 * cpu_size_fraction_float;
+			}
+
+			env_str = getenv("DTO_AUTO_ADJUST_KNOBS");
+
+			if (env_str != NULL) {
+				errno = 0;
+				auto_adjust_knobs = strtoul(env_str, NULL, 10);
+				if (errno)
+					auto_adjust_knobs = 1;
+
+				auto_adjust_knobs = !!auto_adjust_knobs;
+			}
+
+			if (numa_available() != -1) {
+				env_str = getenv("DTO_IS_NUMA_AWARE");
+				if (env_str != NULL) {
+					errno = 0;
+					is_numa_aware = strtoul(env_str, NULL, 10);
+					if (errno || is_numa_aware >= NA_LAST_ENTRY) {
+						is_numa_aware = NA_NONE;
+					}
+				}
+			}
+
+			env_str = getenv("DTO_OPPOSITE_NUMA");
+
+			if (env_str != NULL) {
+				errno = 0;
+				opposite_numa = strtoul(env_str, NULL, 10);
+				if (errno)
+					opposite_numa = 0;
+
+				opposite_numa = !!opposite_numa;
+			}
+
+			env_str = getenv("DTO_UMWAIT_DELAY");
+
+			if (env_str != NULL) {
+				errno = 0;
+				dto_umwait_delay = strtoul(env_str, NULL, 10);
+				if (errno || dto_umwait_delay == 0)
+					dto_umwait_delay = UMWAIT_DELAY_DEFAULT;
+			}
+
+			if (dsa_init()) {
+				LOG_ERROR("Didn't find any usable DSAs. Falling back to using CPUs.\n");
+				use_std_lib_calls = 1;
+			}
+
+			//sleep mode wait
+			env_str = getenv("DTO_SLEEP_DELAY_US");
+			if (env_str != NULL) {
+				errno = 0;
+				dto_sleep_time_usec = strtoul(env_str, NULL, 10);
+				if (errno || dto_sleep_time_usec == 0)
+					dto_sleep_time_usec = DEFAULT_SLEEP_TIME_USEC;
+			}
+
+			//Allow user to set the number of DSAs to use without having to change the configuration. 
+			// THIS ASSUMES that there is one WQ for each DSA, which doesn't have to be the case!!!!!!!!!!!!!
+			env_str = getenv("DTO_NUM_WQS");
+			uint32_t dto_num_wqs = 0;
+			if (env_str != NULL) {
+				errno = 0;
+				dto_num_wqs = strtoul(env_str, NULL, 10);
+				if (errno)
+					dto_num_wqs = 0;
+			}
+
+			num_wqs_for_cleanup = num_wqs;
+
+			if (dto_num_wqs > 0)
+				num_wqs = num_wqs < dto_num_wqs ? num_wqs : dto_num_wqs;
+
+			uint32_t range = dsa_max_size - dsa_min_size;
+			uint32_t step_size = range / dto_num_autotune_instances;
+			auto_tune_buckets[dto_num_autotune_instances-1] = dsa_max_size;
+			
+			//LOG_TRACE("min size %u max size %u range %u step_size %u\n", dsa_min_size, dsa_max_size, range, step_size);
+			//LOG_TRACE("%d:%u\n",0,auto_tune_buckets[0]);
+			for(int i=0; i < dto_num_autotune_instances-1; ++i) {
+				auto_tune_buckets[i] = dsa_min_size + (i+1)*step_size;
+				LOG_TRACE("%d:%u\n",i,auto_tune_buckets[i]);
+			}
+			//LOG_TRACE("%d:%u\n",dto_num_autotune_instances-1,auto_tune_buckets[dto_num_autotune_instances-1]);
+
+			uint32_t num_wqs_per_bucket = dto_num_wqs / dto_num_autotune_instances;
+
+			//for(int i=0; i < 2*MAX_AUTOTUNE_INSTANCES; ++i) {
+			//	auto_tune_states[i].cpu_size_fraction = cpu_size_fraction;
+			//}
+
+			for(int i=0; i < dto_num_autotune_instances; ++i) {
+				for(int j=0; j < MAX_AUTOTUNE_OP_TYPES; ++j) {
+					auto_tune_states[i+(j*MAX_AUTOTUNE_INSTANCES)].cpu_size_fraction = cpu_size_fraction;
+					auto_tune_states[i+(j*MAX_AUTOTUNE_INSTANCES)].wq_index_offset = i*num_wqs_per_bucket;
+					auto_tune_states[i+(j*MAX_AUTOTUNE_INSTANCES)].num_wqs = num_wqs_per_bucket;
+					auto_tune_states[i+(j*MAX_AUTOTUNE_INSTANCES)].next_wq = 0;
+				}
+			}
+
+			// display configuration
+			LOG_TRACE("log_level: %d, collect_stats: %d, use_std_lib_calls: %d, dsa_min_size: %lu, "
+				"cpu_size_fraction: %.2f, wait_method: %s, auto_adjust_knobs: %d, numa_awareness: %s, dto_dsa_cc: %d\n",
+				log_level, collect_stats, use_std_lib_calls, dsa_min_size,
+				(float)cpu_size_fraction/100, wait_names[wait_method], auto_adjust_knobs, numa_aware_names[is_numa_aware], dto_dsa_cc);
+
+			for (int i = 0; i < num_wqs; i++)
+				LOG_TRACE("[%d] wq_path: %s, wq_size: %d, dsa_cap: %lx, index %d, mmapped %d\n", i,
+					wqs[i].wq_path, wqs[i].wq_size, wqs[i].dsa_gencap, wqs[i].index,wqs[i].wq_mmapped);
+		}
+		dto_initialized = 1;
+
+		return DTO_INITIALIZED;
+	}
+
+	return DTO_INITIALIZING;
+}
+
+static void cleanup_dto(void)
+{
+	// unmap and close wq portal
+	for (int i = 0; i < num_wqs_for_cleanup; i++) {
+		if (wqs[i].wq_mmapped) {
+			munmap(wqs[i].wq_portal, 0x1000);
+			wqs[i].wq_mmapped = false;
+		}
+			close(wqs[i].wq_fd);
+	}
+#ifdef DTO_STATS_SUPPORT
+	if(stats_output_type == STATS_TEXT)
+		print_stats();
+	else if (stats_output_type == STATS_DICT)
+		print_stats_dict();
+	else if (stats_output_type == STATS_TEXT_OLD_FORMAT)
+		print_stats_old_format();
+#endif
+	if (log_fd != -1)
+		close(log_fd);
+
+	cleanup_devices();
+}
+
+/*
+static __always_inline  struct dto_wq *get_wq_special(void* buf, size_t n, uint32_t thread_id, uint64_t transaction_num)  //, uint8_t op)
+{
+	struct dto_wq* wq = NULL;
+
+	if (is_numa_aware) {
+		int status[1] = {-1};
+
+		// get the numa node for the target DSA device
+		const int numa_node = get_numa_node(buf);
+		if (numa_node >= 0 && numa_node < MAX_NUMA_NODES) {
+			struct dto_device* dev = devices[numa_node];
+			if (dev != NULL &&
+				dev->num_wqs > 0) {
+				wq = dev->wqs[dev->next_wq++ % dev->num_wqs];
+			}
+		}
+	}
+
+	if (wq == NULL) {
+
+		
+		printf("thread %d transaction %llu next wq %d\n",thread_id, transaction_num, next_wq);
+		wq = &wqs[next_wq++ % num_wqs];
+	}
+
+	return wq;
+}
+*/
+
+static __always_inline  struct dto_wq *get_wq(void* buf, size_t n)  //, uint8_t op)
+{
+	struct dto_wq* wq = NULL;
+
+	if (is_numa_aware) {
+		int status[1] = {-1};
+
+		// get the numa node for the target DSA device
+		const int numa_node = get_numa_node(buf);
+		if (numa_node >= 0 && numa_node < MAX_NUMA_NODES) {
+			struct dto_device* dev = devices[numa_node];
+			if (dev != NULL &&
+				dev->num_wqs > 0) {
+				wq = dev->wqs[dev->next_wq++ % dev->num_wqs];
+			}
+		}
+	}
+
+	if (wq == NULL) {
+
+		/*
+		if (dto_num_autotune_instances == 1)
+			wq = &wqs[next_wq++ % num_wqs];
+
+		else {
+
+			uint16_t instance = get_algorithm_instance(n, 0);  //uint8_t op);
+			wq = &wqs[auto_tune_states[instance].next_wq];
+			//printf("size %d alg instance %d wq %d\n",n,instance,auto_tune_states[instance].next_wq);
+
+			auto_tune_states[instance].next_wq = ((auto_tune_states[instance].next_wq+1) % auto_tune_states[instance].num_wqs) + auto_tune_states[instance].wq_index_offset;
+		}
+		*/
+		//printf("next wq %d\n",next_wq);
+		wq = &wqs[next_wq++ % num_wqs];
+	}
+
+	return wq;
+}
+
+static void dto_memset(void *s, int c, size_t n, int *result)
+{
+	//LOG_TRACE("dto_memset size %d value %x pointer %x descriptor %x\n",n,c,s,&thr_desc);
+	
+	uint64_t memset_pattern;
+	size_t cpu_size, dsa_size, unsplit_size;
+	struct dto_wq *wq = get_wq(s, n);
+
+	for (int i = 0; i < 8; ++i)
+		((uint8_t *) &memset_pattern)[i] = (uint8_t) c;
+
+	thr_desc.opcode = DSA_OPCODE_MEMFILL;
+	thr_desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
+	if (dto_dsa_cc && (wq->dsa_gencap & GENCAP_CC_MEMORY)) 
+		thr_desc.flags |= IDXD_OP_FLAG_CC;
+	thr_desc.completion_addr = (uint64_t)&thr_comp;
+	thr_desc.pattern = memset_pattern;
+
+	/* cpu_size_fraction gauranteed to be >= 0 and < 1 */
+	//uint16_t bucket = get_algorithm_instance(n);
+	//LOG_TRACE("got bucket %d\n", bucket);
+	size_t cpu_size_fraction = auto_tune_states[get_algorithm_instance(n,MEMSET)].cpu_size_fraction;
+	//LOG_TRACE("dto_memset size %d cpu fraction %d, alg instance %u\n",n,cpu_size_fraction,get_algorithm_instance(n,MEMSET));
+	cpu_size = n * cpu_size_fraction / 100;
+	dsa_size = n - cpu_size;
+
+	thr_bytes_completed = 0;
+#ifdef DTO_STATS_SUPPORT
+	thr_bytes_completed_cpu = 0;
+#endif
+
+	int max_transfer_size = dsa_max_size < wq->max_transfer_size ? dsa_max_size : wq->max_transfer_size;  //JJS
+
+	//if (dsa_size <= wq->max_transfer_size) {
+	if (dsa_size <= max_transfer_size) {  //JJS
+		thr_desc.dst_addr = (uint64_t) s + cpu_size;
+		thr_desc.xfer_size = (uint32_t) dsa_size;
+		thr_comp.status = 0;
+		unsplit_size = n;
+		//LOG_TRACE("dto_memset size %d \n",unsplit_size);
+		*result = dsa_submit(wq, &thr_desc, 1);
+		if (likely(*result == SUCCESS)) {
+			if (cpu_size) {
+				orig_memset(s, c, cpu_size);
+				thr_bytes_completed = cpu_size;
+#ifdef DTO_STATS_SUPPORT
+				thr_bytes_completed_cpu = cpu_size;
+#endif
+			}
+			*result = dsa_wait(wq, &thr_desc, unsplit_size, &thr_comp.status, MEMSET);
+		}
+	} else {
+		uint32_t threshold;
+		threshold = max_transfer_size * 100 / (100 - cpu_size_fraction);
+		//LOG_TRACE("dto_memset size %d value %x in the loop\n",n,c);
+
+		do {
+			size_t len;
+
+			len = n <= threshold ? n : threshold;
+			unsplit_size = len;
+			cpu_size = len * cpu_size_fraction / 100;
+			dsa_size = len - cpu_size;
+
+			//LOG_TRACE("dto_memset size %d \n",unsplit_size);
+
+			thr_desc.dst_addr = (uint64_t) s + cpu_size + thr_bytes_completed;
+			thr_desc.xfer_size = (uint32_t) dsa_size;
+			thr_comp.status = 0;
+			*result = dsa_submit(wq, &thr_desc, 1);
+			if (*result == SUCCESS) {
+				if (cpu_size) {
+					void *s1 = s + thr_bytes_completed;
+
+					orig_memset(s1, c, cpu_size);
+					thr_bytes_completed += cpu_size;
+#ifdef DTO_STATS_SUPPORT
+					thr_bytes_completed_cpu += cpu_size;
+#endif
+				}
+				*result = dsa_wait(wq, &thr_desc, unsplit_size, &thr_comp.status, MEMSET);
+			}
+
+			if (*result != SUCCESS)
+				break;
+			n -= len;
+			/* If remaining bytes are less than dsa_min_size,
+			 * dont submit to DSA. Instead, complete remaining
+			 * bytes on CPU
+			 */
+		} while (n >= dsa_min_size);
+	}
+}
+
+/* For overlapping src & dest buffers in memmove API, we can't split the memmove
+ * job. Otherwise, it may lead to incorrect copy operation.
+ */
+static bool is_overlapping_buffers (void *dest, const void *src, size_t n)
+{
+	if ((dest + n) < src || (src + n) < dest)
+		return false;
+
+	return true;
+}
+
+/*
+static uint8_t dto_memcpymove_special(void *dest, const void *src, size_t n, bool is_memcpy, int *result, uint32_t thread_id, uint64_t transaction_num)
+{
+	struct dto_wq *wq = get_wq(dest, n);
+	size_t cpu_size, dsa_size, unsplit_size;
+	char is_overlapping = 0;
+
+	//printf("work queue %d \n",wq->index);
+
+	//printf("thread id %d transaction %llu work queue %d \n",thread_id, transaction_num, wq->index);
+
+	thr_desc.opcode = DSA_OPCODE_MEMMOVE;
+	thr_desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
+	if (dto_dsa_cc && (wq->dsa_gencap & GENCAP_CC_MEMORY))
+		thr_desc.flags |= IDXD_OP_FLAG_CC;
+	thr_desc.completion_addr = (uint64_t)&thr_comp;
+
+	uint8_t op;
+	if (is_memcpy)
+		op = MEMCOPY;
+	else
+		op = MEMMOVE;
+
+	size_t cpu_size_fraction = auto_tune_states[get_algorithm_instance(n,op)].cpu_size_fraction;
+
+	//LOG_TRACE("dto_memcpymove size %d cpu fraction %d alg instance %u\n",n,cpu_size_fraction,get_algorithm_instance(n,MEMCOPY));
+	
+	if (!is_memcpy && is_overlapping_buffers(dest, src, n)) {
+		cpu_size = 0;
+		is_overlapping = 1;
+	}
+	else {
+		cpu_size = n * cpu_size_fraction / 100;
+	}
+
+	dsa_size = n - cpu_size;
+
+	thr_bytes_completed = 0;
+
+#ifdef DTO_STATS_SUPPORT
+	thr_bytes_completed_cpu = 0;
+#endif
+
+	int max_transfer_size = dsa_max_size < wq->max_transfer_size ? dsa_max_size : wq->max_transfer_size;  //JJS
+
+	//printf("size %u max tranfer size %u\n",n,max_transfer_size);
+
+	//if (dsa_size <= wq->max_transfer_size) {
+	if (dsa_size <= max_transfer_size) {  //JJS
+		thr_desc.src_addr = (uint64_t) src + cpu_size;
+		thr_desc.dst_addr = (uint64_t) dest + cpu_size;
+		thr_desc.xfer_size = (uint32_t) dsa_size;
+		thr_comp.status = 0;
+		unsplit_size = n;
+		//LOG_TRACE("dto_memcpy size %d \n",unsplit_size);
+		if (is_overlapping){
+			if (dto_overlapping_memmove_action == OVERLAPPING_DSA) {
+				*result = dsa_execute(wq, &thr_desc, &thr_comp.status);
+			} else {
+				thr_bytes_completed = 0;
+				*result = SUCCESS;
+			}
+		} else {
+			*result = dsa_submit(wq, &thr_desc, 1);
+			if (*result == SUCCESS) {
+				if (cpu_size) {
+					if (is_memcpy)
+						orig_memcpy(dest, src, cpu_size);
+					else
+						orig_memmove(dest, src, cpu_size);
+					thr_bytes_completed += cpu_size;
+#ifdef DTO_STATS_SUPPORT
+					thr_bytes_completed_cpu += cpu_size ;
+#endif
+				}
+				*result = dsa_wait(wq, &thr_desc,  unsplit_size, &thr_comp.status,op);
+			}
+		}
+	} else {
+		uint32_t threshold;
+		threshold = max_transfer_size * 100 / (100 - cpu_size_fraction);
+
+		do {
+			size_t len;
+
+			len = n <= threshold ? n : threshold;
+
+			if (!is_memcpy && is_overlapping_buffers(dest, src, len))
+				cpu_size = 0;
+			else
+				cpu_size = len * cpu_size_fraction / 100;
+
+			dsa_size = len - cpu_size;
+
+			thr_desc.src_addr = (uint64_t) src + cpu_size + thr_bytes_completed;
+			thr_desc.dst_addr = (uint64_t) dest + cpu_size + thr_bytes_completed;
+			thr_desc.xfer_size = (uint32_t) dsa_size;
+			thr_comp.status = 0;
+			unsplit_size = len;
+			//LOG_TRACE("dto_memcpy size %d \n",unsplit_size);
+			if (is_overlapping){
+				*result = dsa_execute(wq, &thr_desc, &thr_comp.status);
+			}
+			else{
+				*result = dsa_submit(wq, &thr_desc, 1);
+				if (*result == SUCCESS) {
+					if (cpu_size) {
+						const void *src1 = src + thr_bytes_completed;
+						void *dest1 = dest + thr_bytes_completed;
+
+						if (is_memcpy)
+							orig_memcpy(dest1, src1, cpu_size);
+						else
+							orig_memmove(dest1, src1, cpu_size);
+						thr_bytes_completed += cpu_size;
+#ifdef DTO_STATS_SUPPORT
+						thr_bytes_completed_cpu += cpu_size ;
+#endif
+					}
+					*result = dsa_wait(wq, &thr_desc,  unsplit_size, &thr_comp.status, op);
+				}
+			}
+
+			if (*result != SUCCESS)
+				break;
+			n -= len;
+			
+		} while (n >= dsa_min_size);
+	}
+	return wq->index;
+}
+
+*/
+
+static uint8_t dto_memcpymove(void *dest, const void *src, size_t n, bool is_memcpy, int *result)
+{
+	struct dto_wq *wq = get_wq(dest, n);
+	size_t cpu_size, dsa_size, unsplit_size;
+	char is_overlapping = 0;
+
+	//printf("work queue %d \n",wq->index);
+
+	thr_desc.opcode = DSA_OPCODE_MEMMOVE;
+	thr_desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
+	if (dto_dsa_cc && (wq->dsa_gencap & GENCAP_CC_MEMORY))
+		thr_desc.flags |= IDXD_OP_FLAG_CC;
+	thr_desc.completion_addr = (uint64_t)&thr_comp;
+
+	uint8_t op;
+	if (is_memcpy)
+		op = MEMCOPY;
+	else
+		op = MEMMOVE;
+
+	size_t cpu_size_fraction = auto_tune_states[get_algorithm_instance(n,op)].cpu_size_fraction;
+
+	//LOG_TRACE("dto_memcpymove size %d cpu fraction %d alg instance %u\n",n,cpu_size_fraction,get_algorithm_instance(n,MEMCOPY));
+	/* cpu_size_fraction gauranteed to be >= 0 and < 1 */
+	if (!is_memcpy && is_overlapping_buffers(dest, src, n)) {
+		cpu_size = 0;
+		is_overlapping = 1;
+	}
+	else {
+		cpu_size = n * cpu_size_fraction / 100;
+	}
+
+	dsa_size = n - cpu_size;
+
+	thr_bytes_completed = 0;
+
+#ifdef DTO_STATS_SUPPORT
+	thr_bytes_completed_cpu = 0;
+#endif
+
+	int max_transfer_size = dsa_max_size < wq->max_transfer_size ? dsa_max_size : wq->max_transfer_size;  //JJS
+
+	//printf("size %u max tranfer size %u\n",n,max_transfer_size);
+
+	//if (dsa_size <= wq->max_transfer_size) {
+	if (dsa_size <= max_transfer_size) {  //JJS
+
+        // JJS - changes to flip CPU and DSA portion
+        // DSA portion at the start of the buffer
+
+		//thr_desc.src_addr = (uint64_t) src + cpu_size;
+		//thr_desc.dst_addr = (uint64_t) dest + cpu_size;
+        thr_desc.src_addr = (uint64_t) src;
+		thr_desc.dst_addr = (uint64_t) dest;
+
+		thr_desc.xfer_size = (uint32_t) dsa_size;
+		thr_comp.status = 0;
+		unsplit_size = n;
+		//LOG_TRACE("dto_memcpy size %d \n",unsplit_size);
+		if (is_overlapping){
+			if (dto_overlapping_memmove_action == OVERLAPPING_DSA) {
+				*result = dsa_execute(wq, &thr_desc, &thr_comp.status);
+			} else {
+				thr_bytes_completed = 0;
+				*result = SUCCESS;
+			}
+		} else {
+			*result = dsa_submit(wq, &thr_desc, 1);
+			if (*result == SUCCESS) {
+				if (cpu_size) {
+                    // JJS - changes to flip CPU and DSA portion
+                    // CPU portion starts after the dsa portion
+					if (is_memcpy)
+						//orig_memcpy(dest, src, cpu_size);
+                        orig_memcpy((void *)((uint64_t)dest+dsa_size), (const void *)((uint64_t)src+dsa_size), cpu_size);
+					else
+						//orig_memmove(dest, src, cpu_size);
+                        orig_memmove((void *)((uint64_t)dest+dsa_size), (const void *)((uint64_t)src+dsa_size), cpu_size);
+					thr_bytes_completed += cpu_size;
+#ifdef DTO_STATS_SUPPORT
+					thr_bytes_completed_cpu += cpu_size ;
+#endif
+				}
+				*result = dsa_wait(wq, &thr_desc,  unsplit_size, &thr_comp.status,op);
+			}
+		}
+	} else {
+		uint32_t threshold;
+		threshold = max_transfer_size * 100 / (100 - cpu_size_fraction);
+
+		do {
+			size_t len;
+
+			len = n <= threshold ? n : threshold;
+
+			if (!is_memcpy && is_overlapping_buffers(dest, src, len))
+				cpu_size = 0;
+			else
+				cpu_size = len * cpu_size_fraction / 100;
+
+			dsa_size = len - cpu_size;
+
+			thr_desc.src_addr = (uint64_t) src + cpu_size + thr_bytes_completed;
+			thr_desc.dst_addr = (uint64_t) dest + cpu_size + thr_bytes_completed;
+			thr_desc.xfer_size = (uint32_t) dsa_size;
+			thr_comp.status = 0;
+			unsplit_size = len;
+			//LOG_TRACE("dto_memcpy size %d \n",unsplit_size);
+			if (is_overlapping){
+				*result = dsa_execute(wq, &thr_desc, &thr_comp.status);
+			}
+			else{
+				*result = dsa_submit(wq, &thr_desc, 1);
+				if (*result == SUCCESS) {
+					if (cpu_size) {
+						const void *src1 = src + thr_bytes_completed;
+						void *dest1 = dest + thr_bytes_completed;
+
+						if (is_memcpy)
+							orig_memcpy(dest1, src1, cpu_size);
+						else
+							orig_memmove(dest1, src1, cpu_size);
+						thr_bytes_completed += cpu_size;
+#ifdef DTO_STATS_SUPPORT
+						thr_bytes_completed_cpu += cpu_size ;
+#endif
+					}
+					*result = dsa_wait(wq, &thr_desc,  unsplit_size, &thr_comp.status, op);
+				}
+			}
+
+			if (*result != SUCCESS)
+				break;
+			n -= len;
+			/* If remaining bytes are less than dsa_min_size,
+			 * dont submit to DSA. Instead, complete remaining
+			 * bytes on CPU
+			 */
+		} while (n >= dsa_min_size);
+	}
+	return is_overlapping;
+}
+
+static int dto_memcmp(const void *s1, const void *s2, size_t n, int *result)
+{
+	struct dto_wq *wq = get_wq((void*)s2, n);
+	int cmp_result = 0;
+	size_t orig_n = n;
+
+	thr_desc.opcode = DSA_OPCODE_COMPARE;
+	thr_desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
+	thr_desc.completion_addr = (uint64_t)&thr_comp;
+	thr_comp.result = 0;
+
+	thr_bytes_completed = 0;
+
+	int max_transfer_size = dsa_max_size < wq->max_transfer_size ? dsa_max_size : wq->max_transfer_size;  //JJS
+
+	//if (n <= wq->max_transfer_size) {
+	if (n <= max_transfer_size) {  //JJS
+		thr_desc.src_addr = (uint64_t) s1;
+		thr_desc.src2_addr = (uint64_t) s2;
+		thr_desc.xfer_size = (uint32_t) n;
+		*result = dsa_execute(wq, &thr_desc, &thr_comp.status);
+	} else {
+		do {
+			size_t len;
+
+			//len = n <= wq->max_transfer_size ? n : wq->max_transfer_size;
+			len = n <= max_transfer_size ? n : max_transfer_size;  //JJS
+
+			thr_desc.src_addr = (uint64_t) s1 + thr_bytes_completed;
+			thr_desc.src2_addr = (uint64_t) s2 + thr_bytes_completed;
+			thr_desc.xfer_size = (uint32_t) len;
+			*result = dsa_execute(wq, &thr_desc, &thr_comp.status);
+
+			if (*result != SUCCESS || thr_comp.result)
+				break;
+
+			n -= len;
+			/* If remaining bytes are less than dsa_min_size,
+			 * dont submit to DSA. Instead, complete remaining
+			 * bytes on CPU
+			 */
+		} while (n >= dsa_min_size);
+	}
+
+	if (thr_comp.result) {
+		/* cmp returned mismatch. determine the return value */
+		uint8_t *t1 = (uint8_t *)s1 + thr_bytes_completed;
+		uint8_t *t2 = (uint8_t *)s2 + thr_bytes_completed;
+
+		cmp_result = *t1 - *t2;
+		/* Inform the caller than the job is done even though
+		 * we didnt process all the bytes
+		 */
+		thr_bytes_completed = orig_n;
+	}
+	return cmp_result;
+}
+
+/* The dto_internal_mem* APIs are used only when mem* APIs are
+ * called before DTO is properly initialized. So these
+ * implementations dont have to be performant
+ */
+static void *dto_internal_memset(void *s1, int c, size_t n)
+{
+	char *dest = s1;
+	size_t i;
+
+	for (i = 0; i < n; i++)
+		dest[i] = (char)c;
+
+	return s1;
+}
+
+static void *dto_internal_memcpymove(void *dest, const void *src, size_t n)
+{
+	char *d = dest;
+	const char *s = (const char *)src;
+	ssize_t i;
+
+	if (s >= d) {
+		/* go from beginning to end */
+		for (i = 0; i < n; i++)
+			d[i] = s[i];
+	} else {
+		/* go from end to beginning */
+		for (i = n - 1; i >= 0; i--)
+			d[i] = s[i];
+	}
+
+	return dest;
+}
+
+static int dto_internal_memcmp(const void *s1, const void *s2, size_t n)
+{
+	const unsigned char *src1 = (const unsigned char *)s1;
+	const unsigned char *src2 = (const unsigned char *)s2;
+	size_t i;
+
+	for (i = 0; i < n; i++) {
+		if (src1[i] != src2[i])
+			return src1[i] - src2[i];
+	}
+	return 0;
+}
+
+void *memset(void *s1, int c, size_t n)
+{
+	int result = 0;
+	void *ret = s1;
+	int use_orig_func = USE_ORIG_FUNC(n, dto_dsa_memset);
+#ifdef DTO_STATS_SUPPORT
+	struct timespec st, et;
+	size_t orig_n = n;
+#endif
+
+	LOG_TRACE("memset size %d value %x dest %x\n",n,c,s1);
+
+	if (unlikely(dto_initialized == 0)) {
+		/* If there are other constructors in the same binary,
+		 * they may run before DTO's constructor. Just use
+		 * internal CPU-based implementation if DTO is not
+		 * initialized yet.
+		 */
+		return dto_internal_memset(s1, c, n);
+	}
+
+#ifdef DTO_STATS_SUPPORT
+if (unlikely(collect_stats)) {
+	//if (global_op_counter < dto_stats_num_warmup_ops) {  
+			++ global_op_counter;  
+	//}
+	/*
+	else {
+		if (unlikely(collect_stats)) {
+			if (n >= dsa_min_size) { 
+				//LOG_TRACE("memset numa node %d\n",get_numa_node_buf(s1));
+				numa_node_counts[MEMSET_DST][get_numa_node_buf(s1)]++;
+			}
+		}
+	*/
+	}
+#endif
+
+	if (!use_orig_func) {
+#ifdef DTO_STATS_SUPPORT
+		DTO_COLLECT_STATS_START(collect_stats, st);
+#endif
+		dto_memset(s1, c, n, &result);
+
+#ifdef DTO_STATS_SUPPORT
+		DTO_COLLECT_STATS_DSA_END(collect_stats, st, et, MEMSET, n, 0, thr_bytes_completed, thr_bytes_completed_cpu, result);
+#endif
+		if (thr_bytes_completed != n) {
+			/* fallback to std call if job is only partially completed */
+			//use_orig_func = 1;
+			n -= thr_bytes_completed;
+			s1 = (void *)((uint64_t)s1 + thr_bytes_completed);
+
+			// Add call to orig_memset here, so we can keep track of the stats for this case separately from the case where
+			// orig_memset was called from the start
+#ifdef DTO_STATS_SUPPORT
+			DTO_COLLECT_STATS_START(collect_stats, st);
+#endif
+
+			orig_memset(s1, c, n);
+
+#ifdef DTO_STATS_SUPPORT
+			DTO_COLLECT_STATS_CPU_END(collect_stats, st, et, MEMSET, n, orig_n, 0, use_orig_func);
+#endif
+
+		}
+	}
+
+	//if (use_orig_func) {
+	else {
+#ifdef DTO_STATS_SUPPORT
+		DTO_COLLECT_STATS_START(collect_stats, st);
+#endif
+
+		orig_memset(s1, c, n);
+
+#ifdef DTO_STATS_SUPPORT
+		DTO_COLLECT_STATS_CPU_END(collect_stats, st, et, MEMSET, n, orig_n, 0, use_orig_func);
+#endif
+	}
+	return ret;
+}
+
+/*
+uint8_t memcpy_special(void *dest, const void *src, size_t n, uint32_t thread_id, uint64_t transaction_num)
+{
+	int result = 0;
+	void *ret = dest;
+	int use_orig_func = USE_ORIG_FUNC(n, dto_dsa_memcpy);
+#ifdef DTO_STATS_SUPPORT
+	struct timespec st, et;
+	size_t orig_n = n;
+#endif
+
+	uint8_t wq_index;
+
+	//LOG_TRACE("memcpy size %d src %x dest %x\n",n,src,dest);
+
+	if (unlikely(dto_initialized == 0)) {
+		
+		return dto_internal_memcpymove(dest, src, n);
+	}
+
+
+#ifdef DTO_STATS_SUPPORT
+	if (unlikely(collect_stats)) {
+		if (global_op_counter < dto_stats_num_warmup_ops) {  
+				++ global_op_counter;  
+		}
+		//else { 
+		//	if (n >= dsa_min_size) {
+				//LOG_TRACE("memcpy src numa node %d dest numa node %d\n",get_numa_node_buf((void*)src),get_numa_node_buf(dest));
+		//		numa_node_counts[MEMCPY_DST][get_numa_node_buf(dest)]++;
+		//		numa_node_counts[MEMCPY_SRC][get_numa_node_buf((void*)src)]++;
+		//	}
+		//}
+	}
+#endif
+
+
+	if (!use_orig_func) {
+#ifdef DTO_STATS_SUPPORT
+		DTO_COLLECT_STATS_START(collect_stats, st);
+#endif
+		wq_index = dto_memcpymove_special(dest, src, n, 1, &result,thread_id, transaction_num);
+
+#ifdef DTO_STATS_SUPPORT
+		DTO_COLLECT_STATS_DSA_END(collect_stats, st, et, MEMCOPY, n, 0, thr_bytes_completed, thr_bytes_completed_cpu, result);
+#endif
+		if (thr_bytes_completed != n) {
+			
+			//use_orig_func = 1;
+			n -= thr_bytes_completed;
+			if (thr_comp.result == 0) {
+				dest = (void *)((uint64_t)dest + thr_bytes_completed);
+				src = (const void *)((uint64_t)src + thr_bytes_completed);
+			}
+
+			// Add call to orig_memset here, so we can keep track of the stats for this case separately from the case where
+			// orig_memset was called from the start
+#ifdef DTO_STATS_SUPPORT
+			DTO_COLLECT_STATS_START(collect_stats, st);
+#endif
+
+			orig_memcpy(dest, src, n);
+
+#ifdef DTO_STATS_SUPPORT
+			DTO_COLLECT_STATS_CPU_END(collect_stats, st, et, MEMCOPY, n, orig_n, 0, use_orig_func);
+#endif
+
+		}
+	}
+
+	//if (use_orig_func) {
+	else {
+#ifdef DTO_STATS_SUPPORT
+		DTO_COLLECT_STATS_START(collect_stats, st);
+#endif
+
+		orig_memcpy(dest, src, n);
+
+#ifdef DTO_STATS_SUPPORT
+		DTO_COLLECT_STATS_CPU_END(collect_stats, st, et, MEMCOPY, n, orig_n, 0, use_orig_func);
+#endif
+	}
+	return wq_index;
+}
+*/
+
+void *memcpy(void *dest, const void *src, size_t n)
+{
+	int result = 0;
+	void *ret = dest;
+	int use_orig_func = USE_ORIG_FUNC(n, dto_dsa_memcpy);
+#ifdef DTO_STATS_SUPPORT
+	struct timespec st, et;
+	size_t orig_n = n;
+#endif
+
+	//LOG_TRACE("memcpy size %d src %x dest %x\n",n,src,dest);
+
+	if (unlikely(dto_initialized == 0)) {
+		/* If there are other constructors in the same binary,
+		 * they may run before DTO's constructor. Just use
+		 * internal CPU-based implementation if DTO is not
+		 * initialized yet.
+		 */
+		return dto_internal_memcpymove(dest, src, n);
+	}
+
+
+#ifdef DTO_STATS_SUPPORT
+	if (unlikely(collect_stats)) {
+		//if (global_op_counter < dto_stats_num_warmup_ops) {  
+				++ global_op_counter;  
+		//}
+		//else { 
+		//	if (n >= dsa_min_size) {
+				//LOG_TRACE("memcpy src numa node %d dest numa node %d\n",get_numa_node_buf((void*)src),get_numa_node_buf(dest));
+		//		numa_node_counts[MEMCPY_DST][get_numa_node_buf(dest)]++;
+		//		numa_node_counts[MEMCPY_SRC][get_numa_node_buf((void*)src)]++;
+		//	}
+		//}
+	}
+#endif
+
+
+	if (!use_orig_func) {
+#ifdef DTO_STATS_SUPPORT
+		DTO_COLLECT_STATS_START(collect_stats, st);
+#endif
+		dto_memcpymove(dest, src, n, 1, &result);
+
+#ifdef DTO_STATS_SUPPORT
+		DTO_COLLECT_STATS_DSA_END(collect_stats, st, et, MEMCOPY, n, 0, thr_bytes_completed, thr_bytes_completed_cpu, result);
+#endif
+		if (thr_bytes_completed != n) {
+			/* fallback to std call if job is only partially completed */
+			//use_orig_func = 1;
+
+            // JJS - changes to flip CPU and DSA portion
+            // If thr_bytes_completed is different than bytes_completed_cpu, dsa successfully copied the difference. In this case
+            // the DSA portion to copy needs to start at that offset.
+            // the number n (remaining bytes) is correct in either case 
+            uint32_t diff = thr_bytes_completed - thr_bytes_completed_cpu;
+			n -= thr_bytes_completed;
+			if (thr_comp.result == 0) {
+				//dest = (void *)((uint64_t)dest + thr_bytes_completed);
+				//src = (const void *)((uint64_t)src + thr_bytes_completed);
+
+                // dsa portion starts at the beginning of the buffer plus any data that DSA successfully copied before incurring the page fault.
+                dest = (void *)((uint64_t)dest + diff);
+				src = (const void *)((uint64_t)src + diff);
+			}
+
+			// Add call to orig_memset here, so we can keep track of the stats for this case separately from the case where
+			// orig_memset was called from the start
+#ifdef DTO_STATS_SUPPORT
+			DTO_COLLECT_STATS_START(collect_stats, st);
+#endif
+
+			orig_memcpy(dest, src, n);
+
+#ifdef DTO_STATS_SUPPORT
+			DTO_COLLECT_STATS_CPU_END(collect_stats, st, et, MEMCOPY, n, orig_n, 0, use_orig_func);
+#endif
+
+		}
+	}
+
+	//if (use_orig_func) {
+	else {
+#ifdef DTO_STATS_SUPPORT
+		DTO_COLLECT_STATS_START(collect_stats, st);
+#endif
+
+		orig_memcpy(dest, src, n);
+
+#ifdef DTO_STATS_SUPPORT
+		DTO_COLLECT_STATS_CPU_END(collect_stats, st, et, MEMCOPY, n, orig_n, 0, use_orig_func);
+#endif
+	}
+	return ret;
+}
+
+void *memmove(void *dest, const void *src, size_t n)
+{
+	int result = 0;
+	void *ret = dest;
+	int use_orig_func = USE_ORIG_FUNC(n, dto_dsa_memmove);
+	uint8_t is_overlapping;
+#ifdef DTO_STATS_SUPPORT
+	struct timespec st, et;
+	size_t orig_n = n;
+#endif
+
+	//LOG_TRACE("memmov size %d src %x dest %x\n",n,src,dest);
+
+	if (unlikely(dto_initialized == 0)) {
+		/* If there are other constructors in the same binary,
+		 * they may run before DTO's constructor. Just use
+		 * internal CPU-based implementation if DTO is not
+		 * initialized yet.
+		 */
+		return dto_internal_memcpymove(dest, src, n);
+	}
+
+#ifdef DTO_STATS_SUPPORT
+	if (unlikely(collect_stats)) {
+		//if (global_op_counter < dto_stats_num_warmup_ops) {  
+				++ global_op_counter;  
+		//}
+	}
+#endif
+
+	if (!use_orig_func) {
+#ifdef DTO_STATS_SUPPORT
+		DTO_COLLECT_STATS_START(collect_stats, st);
+#endif
+		is_overlapping = dto_memcpymove(dest, src, n, 0, &result);
+
+#ifdef DTO_STATS_SUPPORT
+		DTO_COLLECT_STATS_DSA_END(collect_stats, st, et, MEMMOVE, n, is_overlapping, thr_bytes_completed, thr_bytes_completed_cpu, result);
+#endif
+		if (thr_bytes_completed != n) {
+			/* fallback to std call if job is only partially completed */
+			//use_orig_func = 1;
+            // JJS - changes to flip CPU and DSA portion
+            // If thr_bytes_completed is different than bytes_completed_cpu, dsa successfully copied the difference. In this case
+            // the DSA portion to copy needs to start at that offset.
+            // the number n (remaining bytes) is correct in either case 
+            uint32_t diff = thr_bytes_completed - thr_bytes_completed_cpu;
+			n -= thr_bytes_completed;
+			if (thr_comp.result == 0) {
+                //dest = (void *)((uint64_t)dest + thr_bytes_completed);
+				//src = (const void *)((uint64_t)src + thr_bytes_completed);
+
+                // dsa portion starts at the beginning of the buffer plus any data that DSA successfully copied before incurring the page fault.
+                dest = (void *)((uint64_t)dest + diff);
+				src = (const void *)((uint64_t)src + diff);
+			}
+			// Add call to orig_memset here, so we can keep track of the stats for this case separately from the case where
+			// orig_memset was called from the start
+#ifdef DTO_STATS_SUPPORT
+			DTO_COLLECT_STATS_START(collect_stats, st);
+#endif
+
+			orig_memmove(dest, src, n);
+
+#ifdef DTO_STATS_SUPPORT
+			// If we got here due to a DSA error, don't count the overlapping move in the stdlib bucket because it was already counted in DSA bucket
+			if (dto_overlapping_memmove_action != OVERLAPPING_CPU)
+				is_overlapping = 0;
+
+			DTO_COLLECT_STATS_CPU_END(collect_stats, st, et, MEMMOVE, n, orig_n, is_overlapping, use_orig_func);
+#endif			
+		}
+	}
+
+	//if (use_orig_func) {
+	else {
+#ifdef DTO_STATS_SUPPORT
+		DTO_COLLECT_STATS_START(collect_stats, st);
+#endif
+
+		orig_memmove(dest, src, n);
+
+#ifdef DTO_STATS_SUPPORT
+		DTO_COLLECT_STATS_CPU_END(collect_stats, st, et, MEMMOVE, n, orig_n, 0, use_orig_func);
+#endif
+	}
+	return ret;
+}
+
+int memcmp(const void *s1, const void *s2, size_t n)
+{
+	int result = 0;
+	int ret;
+	int use_orig_func = USE_ORIG_FUNC(n, dto_dsa_memcmp);
+#ifdef DTO_STATS_SUPPORT
+	struct timespec st, et;
+	size_t orig_n = n;
+#endif
+
+	if (unlikely(dto_initialized == 0)) {
+		/* If there are other constructors in the same binary,
+		 * they may run before DTO's constructor. Just use
+		 * internal CPU-based implementation if DTO is not
+		 * initialized yet.
+		 */
+		return dto_internal_memcmp(s1, s2, n);
+	}
+
+	if (!use_orig_func) {
+#ifdef DTO_STATS_SUPPORT
+		DTO_COLLECT_STATS_START(collect_stats, st);
+#endif
+		ret = dto_memcmp(s1, s2, n, &result);
+
+#ifdef DTO_STATS_SUPPORT
+		DTO_COLLECT_STATS_DSA_END(collect_stats, st, et, MEMCMP, n, 0, thr_bytes_completed, n-thr_bytes_completed, result);
+#endif
+		if (thr_bytes_completed != n) {
+			/* fallback to std call if job is only partially completed */
+			//use_orig_func = 1;
+			n -= thr_bytes_completed;
+			s1 = (const void *)((uint64_t)s1 + thr_bytes_completed);
+			s2 = (const void *)((uint64_t)s2 + thr_bytes_completed);
+			// Add call to orig_memset here, so we can keep track of the stats for this case separately from the case where
+			// orig_memset was called from the start
+#ifdef DTO_STATS_SUPPORT
+			DTO_COLLECT_STATS_START(collect_stats, st);
+#endif
+
+			ret = orig_memcmp(s1, s2, n);
+
+#ifdef DTO_STATS_SUPPORT
+			DTO_COLLECT_STATS_CPU_END(collect_stats, st, et, MEMCMP, n, orig_n, 0, use_orig_func);
+#endif			
+		}
+	}
+
+	//if (use_orig_func) {
+	else {
+#ifdef DTO_STATS_SUPPORT
+		DTO_COLLECT_STATS_START(collect_stats, st);
+#endif
+
+		ret = orig_memcmp(s1, s2, n);
+
+#ifdef DTO_STATS_SUPPORT
+		DTO_COLLECT_STATS_CPU_END(collect_stats, st, et, MEMCMP, n, orig_n, 0, use_orig_func);
+#endif
+	}
+	return ret;
+}
