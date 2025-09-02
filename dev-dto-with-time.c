@@ -405,6 +405,7 @@ static atomic_ullong num_adjustment_ops[MAX_AUTOTUNE_OP_TYPES*MAX_AUTOTUNE_INSTA
 //static atomic_ullong num_queue_full;
 
 static atomic_ullong global_op_counter = 0; 
+static atomic_ullong dto_op_counter = 0; 
 static atomic_ullong sample_counter = 0;
 
 #define NUM_LATEST_UPDATES 100000
@@ -720,7 +721,7 @@ static __always_inline void dsa_wait_and_adjust(const volatile uint8_t *comp, si
 			__dsa_wait(comp);
 
         cycles = (rdtsc() - start);
-        raw_wait_times[global_op_counter] = cycles;
+        raw_wait_times[dto_op_counter++] = cycles;
 		return;
 	}
 	
@@ -1181,7 +1182,7 @@ static void print_alg_stats_dict(void)
 		LOG_STATS("},\n");
 
 		LOG_STATS("'all_wait_times': [");
-		for (uint64_t i=0;i<global_op_counter;++i){
+		for (uint64_t i=0;i<dto_op_counter;++i){
 			LOG_STATS("%llu, ", raw_wait_times[i]);
 		}
 		LOG_STATS("],\n");
