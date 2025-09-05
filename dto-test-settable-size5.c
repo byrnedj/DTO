@@ -67,10 +67,14 @@ atomic_int no_ops = 0;
 // get random number between 0 and 1
 static __always_inline uint32_t getRand(uint32_t max)  
 {
-
 	uint32_t x = rand() / (RAND_MAX / (max + 1) + 1);
-
 	return x;
+}
+
+static __always_inline double getRand2()  
+{
+	double random_value = (double)rand() / RAND_MAX;
+	return random_value;
 }
 
 //static __always_inline void swap(uint32_t *a, uint32_t *b) {
@@ -276,13 +280,15 @@ int main(int argc, char **argv)
     uint32_t warmup_time_s;
 	uint32_t percent_src_dst_overlap;
 	uint8_t overlap_probability;
+	uint8_t in_cache_probability;
 	uint64_t cycles=0;
 	float latency;
 	float bw;
 	uint64_t cycles_per_sec;
+	
 
-	if (argc != 17) {
-		printf("Usage: dto-test-settable-size num_threads sleep_time_us mem_op transaction_size total_num_iters mem_buf_size num_mem_bufs random_access src_numa_policy dst_numa_policy num_burst_threads burst_size time_between_ms warmup_time_s percent_src_dst_overlap overlap_probability\n");
+	if (argc != 18) {
+		printf("Usage: dto-test-settable-size num_threads sleep_time_us mem_op transaction_size total_num_iters mem_buf_size num_mem_bufs random_access src_numa_policy dst_numa_policy num_burst_threads burst_size time_between_ms warmup_time_s percent_src_dst_overlap overlap_probability in_cache_probability\n");
 		printf("buf_size in increments of 1024, num_threads <= 10\n");
 		return 1;
 	}
@@ -305,6 +311,7 @@ int main(int argc, char **argv)
         warmup_time_s = atoi(argv[14]);
 		percent_src_dst_overlap = atoi(argv[15]);
 		overlap_probability = atoi(argv[16]);
+		in_cache_probability = atoi(argv[17]);
 
 		calibrate(&cycles_per_sec);
 
@@ -487,14 +494,14 @@ int main(int argc, char **argv)
 		else {
 			float prob = overlap_probability;
 			prob = prob / 100;
-			uint32_t j;
+			double j;
 			uint8_t* src_buf_pos = src_buffs[0];
 			uint8_t* dst_buf_pos = dst_buffs[0];
 
 			//printf("transaction size %d nonoverlap size %d t_size_overlap %d\n", transaction_size,non_overlap_size,t_size_overlap);
 			
 			for (uint32_t i=0;i<overall_ind_size;++i) {
-				j = getRand(1);
+				j = getRand2();
 				// no overlap
 				if (j>prob) {
 					src_addrs[i] = src_buf_pos;
@@ -537,6 +544,23 @@ int main(int argc, char **argv)
 
     //printf("num inters per thread %d remainder %d\n",num_iters_per_thread, remainder);
     //printf("num bufs per thread %d\n",bufs_per_thread);
+
+	if (in_cache_probability>0) {
+		float prob = in_cache_probability;
+		prob = prob / 100;
+		double j;
+		for(int t = 0; t < num_threads; ++t) {
+			int st = t*bufs_per_thread;
+			for (int i=0;i<bufs_per_thread;++i) {
+				j = getRand2();
+				if (j < prob) {
+					src_addrs[st+i] = src_addrs[st];
+					dst_addrs[st+i] = dst_addrs[st];
+				}
+			}
+		}
+	}
+
 
 	for(int t = 0; t < num_threads; ++t) {
         p[t].max_iters = total_num_iters;  // We pass the total number and the threads use an atomic to track how many total ops have been performed

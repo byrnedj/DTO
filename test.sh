@@ -23,7 +23,7 @@
 #accel-config enable-wq dsa6/wq6.0
 
 export DTO_USESTDC_CALLS=0
-export DTO_COLLECT_STATS=1
+export DTO_COLLECT_STATS=0
 export DTO_COLLECT_ALG_STATS=1
 export DTO_COLLECT_ALG_STATS_LATEST_UPDATES=1
 export DTO_COLLECT_ALG_STATS_LATEST_CPUFRACTS=1
@@ -32,7 +32,7 @@ export DTO_STATS_OUTPUT_TYPE=1
 
 #export DTO_NUM_AUTOTUNE_INSTANCES=1
 export DTO_PER_OP_AUTOTUNE_INSTANCES=0
-export DTO_NUM_WQS=8
+export DTO_NUM_WQS=1
 
 export DTO_IS_NUMA_AWARE=0
 export DTO_OPPOSITE_NUMA=0
@@ -46,7 +46,7 @@ export DTO_CPU_SIZE_FRACTION=0.33 # 0.64 # 0.0  #0.60  # 0.60 #
 export DTO_AUTO_ADJUST_KNOBS=1
 export DTO_DSA_CC=1
 
-export DTO_LOG_LEVEL=2
+export DTO_LOG_LEVEL=0
 export DTO_MAKE_ADJ=1
 
 export DTO_SLEEP_DELAY_NS=100000
@@ -158,7 +158,16 @@ export DTO_OVERLAPPING_MEMMOVE_ACTION=1  # 0-CPU, 1-DSA
 
 #taskset -c 56-57 ./dto-test-settable-size-dev5 1 0 2 8 1000000 8388608 1 0 0 0 0 1 0 0 0 0
 
-taskset -c 56-57 ./dto-test-settable-size-dev5 1 0 2 800 10000 4194304 1 1 0 0 0 1 0 0 0 0
+#taskset -c 56-57 ./dto-test-settable-size-dev5 1 0 2 800 10000 4194304 1 1 0 0 0 1 0 0 0 0
+
+taskset -c 56-57 ./dto-test-settable-size5 1 0 2 800 10000 4194304 1 1 0 0 0 1 0 0 0 0 0
+
+taskset -c 56-57 ./dto-test-settable-size5 1 0 2 800 10000 4194304 1 1 0 0 0 1 0 0 0 0 10
+
+taskset -c 56-57 ./dto-test-settable-size5 1 0 2 800 10000 4194304 1 1 0 0 0 1 0 0 0 0 20
+taskset -c 56-57 ./dto-test-settable-size5 1 0 2 800 10000 4194304 1 1 0 0 0 1 0 0 0 0 30
+taskset -c 56-57 ./dto-test-settable-size5 1 0 2 800 10000 4194304 1 1 0 0 0 1 0 0 0 0 50
+taskset -c 56-57 ./dto-test-settable-size5 1 0 2 800 10000 4194304 1 1 0 0 0 1 0 0 0 0 90
 
 #/usr/bin/time taskset -c 56-57 ./dto-test-settable-size5        1 0 2 128 10000000 2097152 1 1 0 0 0 1 0 0 0 0
 

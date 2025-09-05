@@ -1,0 +1,1 @@
+{"sizes": [8,16,32,64,128,256], "percentages": ["nodsa", "auto", "0.00"], "mem_ops": [2], "thread_counts":[1], "numa_configs": ["unaware"], "scale_buf_sizes_with_tx_size": false,"mem_buf_sizes": [512], "num_mem_bufs": [2], "alloc_types": ["single"], "rand_index_uses": [1], "cache_control_configs": [1], "wait_methods": ["busypoll"]}
