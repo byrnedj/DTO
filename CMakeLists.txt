@@ -11,7 +11,7 @@ add_compile_definitions(_GNU_SOURCE)
 target_compile_definitions(dto PRIVATE DTO_STATS_SUPPORT)
 
 # Link libraries
-target_link_libraries(dto accel-config dl)
+target_link_libraries(dto accel-config dl numa)
 
 # Install targets
 install(
