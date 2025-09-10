@@ -4,6 +4,7 @@ project(DTO VERSION 1.0 LANGUAGES C)
 include(GNUInstallDirs)
 set(CMAKE_INSTALL_LIBDIR lib)
 
+
 # Build the shared library
 add_library(dto SHARED dto.c)
 add_library(DTO::dto ALIAS dto)
@@ -16,6 +17,12 @@ target_compile_definitions(dto PRIVATE DTO_STATS_SUPPORT)
 
 # Link libraries
 target_link_libraries(dto accel-config dl numa)
+
+include(CheckCCompilerFlag)
+check_c_compiler_flag("-mwaitpkg" HAS_WAITPKG)
+if (HAS_WAITPKG)
+  target_compile_options(dto PRIVATE -mwaitpkg -march=native)
+endif()
 
 # Build dto-test and dto-test-wodto
 add_executable(dto-test dto-test.c)
