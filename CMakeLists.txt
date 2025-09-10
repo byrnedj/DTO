@@ -8,6 +8,10 @@ set(CMAKE_INSTALL_LIBDIR lib)
 # Build the shared library
 add_library(dto SHARED dto.c)
 add_library(DTO::dto ALIAS dto)
+target_include_directories(dto
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 
 # set gnu source everywhere
 add_compile_definitions(_GNU_SOURCE)
@@ -37,6 +41,8 @@ install(TARGETS dto
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+
+install(FILES dto.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
 install(EXPORT DTOTargets
         FILE DTOTargets.cmake
