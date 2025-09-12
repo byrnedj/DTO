@@ -19,6 +19,8 @@
 #define DTO_DSA_COMPLETE_OFFLOAD 8192
 #define DTO_AUTO_SPLIT 16384
 
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -84,6 +86,46 @@ void dto_memcpy_cfg(void *dest, const void *src, size_t n,
  */
 void dto_memcpy(void *dest, const void *src, size_t n,
                 int flags, callback_t cb, void* args);
+
+
+/**
+ * dto_memcpy_crc_default - Copy memory and compute CRC using DTO defaults.
+ * @dest: Destination buffer.
+ * @src:  Source buffer.
+ * @n:    Number of bytes to copy.
+ *
+ * Return: CRC32C value of the copied data.
+ */
+uint32_t dto_memcpy_crc_default(void *dest, const void *src, size_t n);
+
+/**
+ * dto_memcpy_crc_cfg - Copy memory and compute CRC using caller configuration.
+ * @dest: Destination buffer.
+ * @src:  Source buffer.
+ * @n:    Number of bytes to copy.
+ * @cfg:  DTO configuration to use for this call.
+ * @cb:   Optional callback invoked after submission.
+ * @args: Argument passed to the callback.
+ *
+ * Return: CRC32C value of the copied data.
+ */
+uint32_t dto_memcpy_crc_cfg(void *dest, const void *src, size_t n,
+                  struct dto_call_cfg *cfg, callback_t cb, void* args);
+
+/**
+ * dto_memcpy_crc - Copy memory and compute CRC using @flags derived
+ *                   configuration.
+ * @dest:  Destination buffer.
+ * @src:   Source buffer.
+ * @n:     Number of bytes to copy.
+ * @flags: Bitwise OR of DTO_API_* values that override defaults.
+ * @cb:    Optional callback invoked after submission.
+ * @args:  Argument passed to the callback.
+ *
+ * Return: CRC32C value of the copied data.
+ */
+uint32_t dto_memcpy_crc(void *dest, const void *src, size_t n,
+                   int flags, callback_t cb, void* args);
 
 /**
  * dto_memmove_default - Move memory using DTO's default configuration.
@@ -176,6 +218,41 @@ int dto_memcmp_cfg(const void *s1, const void *s2, size_t n,
  * Return: Comparison result as in memcmp().
  */
 int dto_memcmp(const void *s1, const void *s2, size_t n, int flags);
+
+/**
+ * dto_crc_default - Compute CRC using DTO's default configuration.
+ * @src: Buffer to checksum.
+ * @n:   Number of bytes to process.
+ *
+ * Return: CRC32C value of the buffer.
+ */
+uint32_t dto_crc_default(const void *src, size_t n);
+
+/**
+ * dto_crc_cfg - Compute CRC using a caller provided configuration.
+ * @src:  Buffer to checksum.
+ * @n:    Number of bytes to process.
+ * @cfg:  DTO configuration to use for this call.
+ * @cb:   Optional callback invoked after submission.
+ * @args: Argument passed to the callback.
+ *
+ * Return: CRC32C value of the buffer.
+ */
+uint32_t dto_crc_cfg(const void *src, size_t n, struct dto_call_cfg *cfg,
+                callback_t cb, void* args);
+
+/**
+ * dto_crc - Compute CRC using a configuration derived from @flags.
+ * @src:   Buffer to checksum.
+ * @n:     Number of bytes to process.
+ * @flags: Bitwise OR of DTO_API_* values that override defaults.
+ * @cb:    Optional callback invoked after submission.
+ * @args:  Argument passed to the callback.
+ *
+ * Return: CRC32C value of the buffer.
+ */
+uint32_t dto_crc(const void *src, size_t n, int flags, callback_t cb,
+                void* args);
 
 #ifdef __cplusplus
 }

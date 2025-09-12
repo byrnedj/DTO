@@ -23,6 +23,7 @@
 #include <accel-config/libaccel_config.h>
 #include <numaif.h>
 #include <numa.h>
+#include <nmmintrin.h>
 #include "dto.h"
 
 #define likely(x)       __builtin_expect((x), 1)
@@ -73,6 +74,7 @@ struct dto_wq {
 	uint64_t dsa_gencap;
 	int wq_size;
 	uint32_t max_transfer_size;
+        int block_on_fault;
 	int wq_fd;
 	void *wq_portal;
 	bool wq_mmapped;
@@ -274,6 +276,29 @@ static double min_avg_waits = MIN_AVG_YIELD_WAITS;
 static double max_avg_waits = MAX_AVG_YIELD_WAITS;
 
 extern char *__progname;
+
+static uint32_t crc32c_hw(const uint8_t *data, size_t len)
+{
+    uint32_t crc = 0;
+
+    while (len >= sizeof(uint64_t)) {
+        crc = _mm_crc32_u64(crc, *(const uint64_t *)data);
+        data += sizeof(uint64_t);
+        len -= sizeof(uint64_t);
+    }
+
+    while (len >= sizeof(uint32_t)) {
+        crc = _mm_crc32_u32(crc, *(const uint32_t *)data);
+        data += sizeof(uint32_t);
+        len -= sizeof(uint32_t);
+    }
+
+    while (len--) {
+        crc = _mm_crc32_u8(crc, *data++);
+    }
+
+    return crc;
+}
 
 static void dto_log(int req_log_level, const char *fmt, ...)
 {
@@ -881,6 +906,7 @@ static int dsa_init_from_wq_list(char *wq_list)
 			close(dir_fd);
 			goto fail_wq;
 		}
+		wqs[num_wqs].max_transfer_size = dto_get_param_ullong(dir_fd, "block_on_fault", &rc);
 
 		dto_get_param_string(dir_fd, "mode", wq_mode);
 
@@ -1036,6 +1062,7 @@ static int dsa_init_from_accfg(void)
 
 			wqs[num_wqs].wq_size = accfg_wq_get_size(wq);
 			wqs[num_wqs].max_transfer_size = accfg_wq_get_max_transfer_size(wq);
+                        wqs[num_wqs].block_on_fault = accfg_wq_get_block_on_fault(wq);
 
 			wqs[num_wqs].acc_wq = wq;
 			wqs[num_wqs].dsa_gencap = accfg_device_get_gen_cap(device);
@@ -1545,6 +1572,90 @@ static bool is_overlapping_buffers (void *dest, const void *src, size_t n)
 	return true;
 }
 
+static uint32_t __dto_crc(const void *src, size_t n,
+                          struct dto_call_cfg *cfg, callback_t cb, void *args)
+{
+        struct dto_wq *wq = get_wq((void *)src, cfg);
+        if (wq->block_on_fault == 0) {
+            LOG_ERROR("DSA WQ %s does not support block on fault. Falling back to CPU crc32c\n", wq->wq_path);
+            orig_memcpy((void *)src, src, n);
+            if (cb)
+                cb(args);
+            return crc32c_hw(src, n);
+        }
+        int result;
+
+        thr_bytes_completed = 0;
+
+        thr_desc.opcode = DSA_OPCODE_CRCGEN;
+        thr_desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR | IDXD_OP_FLAG_BOF;
+        if (cfg->cache_control && (wq->dsa_gencap & GENCAP_CC_MEMORY))
+                thr_desc.flags |= IDXD_OP_FLAG_CC;
+        thr_desc.completion_addr = (uint64_t)&thr_comp;
+
+        thr_desc.src_addr = (uint64_t)src;
+        thr_desc.dst_addr = 0;
+        thr_desc.xfer_size = (uint32_t)n;
+        thr_desc.crc_seed = 0;
+        thr_desc.rsvd = 0;
+        thr_comp.status = 0;
+
+        result = dsa_submit(wq, &thr_desc);
+        if (result == SUCCESS) {
+                if (cb)
+                        cb(args);
+                result = dsa_wait(wq, &thr_desc, &thr_comp.status, cfg);
+        }
+
+        if (result != SUCCESS || thr_bytes_completed < n)
+                return 0;
+
+        return (uint32_t)thr_comp.crc_val;
+}
+
+static uint32_t __dto_memcpy_crc(void *dest, const void *src, size_t n,
+                                 struct dto_call_cfg *cfg, callback_t cb, void *args)
+{
+        int use_orig = USE_ORIG_FUNC(n, dto_dsa_memcpy);
+
+        if (use_orig) {
+                orig_memcpy(dest, src, n);
+                if (cb)
+                        cb(args);
+                return crc32c_hw(src, n);
+        }
+
+        struct dto_wq *wq = get_wq(dest, cfg);
+        int result;
+
+        thr_bytes_completed = 0;
+
+        thr_desc.opcode = DSA_OPCODE_COPY_CRC;
+        thr_desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR | IDXD_OP_FLAG_BOF;
+        if (cfg->cache_control && (wq->dsa_gencap & GENCAP_CC_MEMORY))
+                thr_desc.flags |= IDXD_OP_FLAG_CC;
+        thr_desc.completion_addr = (uint64_t)&thr_comp;
+
+        thr_desc.src_addr = (uint64_t)src;
+        thr_desc.dst_addr = (uint64_t)dest;
+        thr_desc.xfer_size = (uint32_t)n;
+        thr_desc.crc_seed = 0;
+        thr_desc.rsvd = 0;
+        thr_comp.status = 0;
+
+        result = dsa_submit(wq, &thr_desc);
+        if (result == SUCCESS) {
+                if (cb)
+                        cb(args);
+                result = dsa_wait(wq, &thr_desc, &thr_comp.status, cfg);
+        }
+
+        if (result != SUCCESS || thr_bytes_completed < n)
+                return 0;
+
+        return (uint32_t)thr_comp.crc_val;
+}
+
 static bool dto_memcpymove(void *dest, const void *src, size_t n, bool is_memcpy,
 		int *result, callback_t cb, void* args,
 		const struct dto_call_cfg *cfg)
@@ -1759,6 +1870,22 @@ __attribute__((visibility("default"))) void dto_memcpy_cfg(void *dest, const voi
         __dto_memcpy(dest, src, n, cfg, cb, args);
 }
 
+__attribute__((visibility("default"))) uint32_t dto_memcpy_crc_default(void *dest, const void *src, size_t n) {
+        return __dto_memcpy_crc(dest, src, n, &dto_default_cfg, NULL, NULL);
+}
+
+__attribute__((visibility("default"))) uint32_t dto_memcpy_crc(void *dest, const void *src, size_t n,
+        int flags, callback_t cb, void* args) {
+        struct dto_call_cfg cfg;
+        init_dto_cfg(&cfg, flags);
+        return __dto_memcpy_crc(dest, src, n, &cfg, cb, args);
+}
+
+__attribute__((visibility("default"))) uint32_t dto_memcpy_crc_cfg(void *dest, const void *src, size_t n,
+        struct dto_call_cfg *cfg, callback_t cb, void* args) {
+        return __dto_memcpy_crc(dest, src, n, cfg, cb, args);
+}
+
 void __dto_memmove(void *dest, const void *src, size_t n,
        		   struct dto_call_cfg *cfg, callback_t cb, void* args) {
 	int result = 0;
@@ -1948,6 +2075,25 @@ __attribute__((visibility("default"))) int dto_memcmp_cfg(const void *s1, const 
                 struct dto_call_cfg *cfg)
 {
         return __dto_memcmp(s1, s2, n, cfg);
+}
+
+__attribute__((visibility("default"))) uint32_t dto_crc_default(const void *src, size_t n)
+{
+        return __dto_crc(src, n, &dto_default_cfg, NULL, NULL);
+}
+
+__attribute__((visibility("default"))) uint32_t dto_crc(const void *src, size_t n,
+        int flags, callback_t cb, void *args)
+{
+        struct dto_call_cfg cfg;
+        init_dto_cfg(&cfg, flags);
+        return __dto_crc(src, n, &cfg, cb, args);
+}
+
+__attribute__((visibility("default"))) uint32_t dto_crc_cfg(const void *src, size_t n,
+        struct dto_call_cfg *cfg, callback_t cb, void *args)
+{
+        return __dto_crc(src, n, cfg, cb, args);
 }
 
 /* The dto_internal_mem* APIs are used only when mem* APIs are

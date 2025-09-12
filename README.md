@@ -58,16 +58,23 @@ is available in three forms:
 - The unsuffixed name derives configuration from a bitwise OR of `DTO_API_*`
   flags.
 
+We also support CRC32C offload via `dto_memcpy_crc` and `dto_crc` functions. `dto_memcpy_crc`
+offloads both memcpy and CRC32C computation to DSA, while `dto_crc` offloads only CRC32C computation to DSA.
+
 Available entry points include:
 
 - `dto_memcpy_default`, `dto_memcpy_cfg`, `dto_memcpy`
+- `dto_memcpy_async`
 - `dto_memmove_default`, `dto_memmove_cfg`, `dto_memmove`
 - `dto_memset_default`, `dto_memset_cfg`, `dto_memset`
 - `dto_memcmp_default`, `dto_memcmp_cfg`, `dto_memcmp`
+- `dto_memcpy_crc_default`, `dto_memcpy_crc_cfg`, `dto_memcpy_crc`
+- `dto_crc_default`, `dto_crc_cfg`, `dto_crc`
 
 ### Sample usage
 
 ```c
+#include <stdint.h>
 #include "dto.h"
 
 int main(void)
@@ -90,6 +97,12 @@ int main(void)
 
     /* Flags-based configuration */
     dto_memset(dst, 0, sizeof(dst), DTO_API_WAIT_YIELD);
+
+    /* Copy while computing CRC */
+    uint32_t c1 = dto_memcpy_crc_default(dst, src, sizeof(src));
+
+    /* Compute CRC with flags-based configuration */
+    uint32_t c2 = dto_crc(src, sizeof(src), DTO_API_WAIT_YIELD, NULL, NULL);
 
     return diff;
 }
