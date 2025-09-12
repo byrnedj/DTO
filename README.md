@@ -41,6 +41,60 @@ can be enabled or disabled using an environment variable DTO_AUTO_ADJUST_KNOBS.
 
 DTO can also be used to learn certain application characterics by building histogram of various API types and sizes. The histogram can be built using an environment variable DTO_COLLECT_STATS.
 
+Finally, DTO offers an API to allow applications to pass a function pointer to be called while waiting for DSA to complete the operation. This can be used to perform other work while waiting for DSA to complete the operation. The function signature is:
+
+```bash
+dto_memcpy_async(void *dest, const void *src, size_t n, callback_t cb, void* args);
+```
+where callback_t cb is a function pointer in the calling application. If the callback terminates before DSA completes the operation, the specified wait method is used to complete the waiting.
+
+## DTO API
+
+DTO provides drop-in replacements for standard memory operations. Each function
+is available in three forms:
+
+- `*_default` uses library defaults.
+- `*_cfg` accepts a `struct dto_call_cfg` to override per-call behavior.
+- The unsuffixed name derives configuration from a bitwise OR of `DTO_API_*`
+  flags.
+
+Available entry points include:
+
+- `dto_memcpy_default`, `dto_memcpy_cfg`, `dto_memcpy`
+- `dto_memmove_default`, `dto_memmove_cfg`, `dto_memmove`
+- `dto_memset_default`, `dto_memset_cfg`, `dto_memset`
+- `dto_memcmp_default`, `dto_memcmp_cfg`, `dto_memcmp`
+
+### Sample usage
+
+```c
+#include "dto.h"
+
+int main(void)
+{
+    char src[64] = "example";
+    char dst[64];
+
+    /* Use defaults */
+    dto_memcpy_default(dst, src, sizeof(src));
+
+    /* Per-call configuration */
+    struct dto_call_cfg cfg = {
+        .auto_adjust = 0,
+        .cache_control = 1,
+        .wait_method = WAIT_BUSYPOLL,
+        .numa_mode = NA_BUFFER_CENTRIC,
+        .overlapping_action = OVERLAPPING_CPU,
+    };
+    int diff = dto_memcmp_cfg(dst, src, sizeof(src), &cfg);
+
+    /* Flags-based configuration */
+    dto_memset(dst, 0, sizeof(dst), DTO_API_WAIT_YIELD);
+
+    return diff;
+}
+```
+
 ```bash
 dto.c: DSA Transparent Offload shared library
 dto-test.c: Sample multi-threaded test application
