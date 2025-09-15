@@ -41,13 +41,6 @@ can be enabled or disabled using an environment variable DTO_AUTO_ADJUST_KNOBS.
 
 DTO can also be used to learn certain application characterics by building histogram of various API types and sizes. The histogram can be built using an environment variable DTO_COLLECT_STATS.
 
-Finally, DTO offers an API to allow applications to pass a function pointer to be called while waiting for DSA to complete the operation. This can be used to perform other work while waiting for DSA to complete the operation. The function signature is:
-
-```bash
-dto_memcpy_async(void *dest, const void *src, size_t n, callback_t cb, void* args);
-```
-where callback_t cb is a function pointer in the calling application. If the callback terminates before DSA completes the operation, the specified wait method is used to complete the waiting.
-
 ## DTO API
 
 DTO provides drop-in replacements for standard memory operations. Each function
@@ -64,7 +57,6 @@ offloads both memcpy and CRC32C computation to DSA, while `dto_crc` offloads onl
 Available entry points include:
 
 - `dto_memcpy_default`, `dto_memcpy_cfg`, `dto_memcpy`
-- `dto_memcpy_async`
 - `dto_memmove_default`, `dto_memmove_cfg`, `dto_memmove`
 - `dto_memset_default`, `dto_memset_cfg`, `dto_memset`
 - `dto_memcmp_default`, `dto_memcmp_cfg`, `dto_memcmp`
