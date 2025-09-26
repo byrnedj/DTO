@@ -506,7 +506,38 @@
 
 #python sweep_all_test_settable_size5.py --output-type perf --run-name in-cache-prob-sweep-1dsa-extern-with-stats_1 --cfg-filepath ./configs/reddis_800_in_cache_prob.json  --dto-version extern --num-iter 10000000 --exclude-pfs  --num-dsas 1 --results-dirname  in-cache-prob-extern_with_stats_1dsa
 
-python sweep_all_test_settable_size5.py --output-type micro --run-name in-cache-prob-sweep-1dsa-extern-no-stats_1 --cfg-filepath ./configs/reddis_800_in_cache_prob.json  --dto-version extern --no-stats --num-iter 10000000 --exclude-pfs  --num-dsas 1 --results-dirname  in-cache-prob-extern_no_stats_1dsa
+#python sweep_all_test_settable_size5.py --output-type micro --run-name in-cache-prob-sweep-1dsa-extern-no-stats_1 --cfg-filepath ./configs/reddis_800_in_cache_prob.json  --dto-version extern --no-stats --num-iter 10000000 --exclude-pfs  --num-dsas 1 --results-dirname  in-cache-prob-extern_no_stats_1dsa
 
-python sweep_all_test_settable_size5.py --output-type perf --run-name in-cache-prob-sweep-1dsa-extern-with-stats_1 --cfg-filepath ./configs/reddis_800_in_cache_prob_perc_sweep.json  --dto-version extern --num-iter 10000000 --exclude-pfs  --num-dsas 1 --results-dirname  in-cache-prob-extern_with_stats_1dsa
+#python sweep_all_test_settable_size5.py --output-type perf --run-name in-cache-prob-sweep-1dsa-extern-with-stats_1 --cfg-filepath ./configs/reddis_800_in_cache_prob_perc_sweep.json  --dto-version extern --num-iter 10000000 --exclude-pfs  --num-dsas 1 --results-dirname  in-cache-prob-extern_with_stats_1dsa
+
+#python sweep_all_test_settable_size5.py --output-type micro --run-name raw-op-times-extern-no-stats_1 --cfg-filepath ./configs/raw_time_collection.json  --dto-version extern --no-stats --collect-raw-times --num-iter 1000000 --exclude-pfs  --num-dsas 1 --results-dirname  raw_op_times_extern_no_stats
+
+#python sweep_all_test_settable_size5.py --output-type micro --run-name raw-op-times-extern-no-stats2_1 --cfg-filepath ./configs/raw_time_collection.json  --dto-version extern --no-stats --collect-raw-times --num-iter 1000000 --exclude-pfs  --num-dsas 1 --results-dirname  raw_op_times_extern_no_stats_32bit
+
+
+#python sweep_all_test_settable_size5.py --output-type perf --run-name in-cache-prob-sweep-1dsa-extern-with-stats_1 --cfg-filepath ./configs/reddis_800_in_cache_prob_perc_sweep.json  --dto-version extern --num-iter 10000000 --exclude-pfs  --num-dsas 1 --results-dirname  in-cache-prob-extern_with_stats_1dsa
+#python sweep_all_test_settable_size5.py --output-type micro --run-name in-cache-prob-sweep-1dsa-dev-with-times_1 --cfg-filepath ./configs/reddis_800_in_cache_prob_auto.json  --dto-version dev_time --alg-stats --num-iter 1000000 --exclude-pfs  --num-dsas 1 --results-dirname  in-cache-prob-dev_with_times_1dsa
+
+#python sweep_all_test_settable_size5.py --output-type micro --run-name raw-op-times-extern-no-stats2_1 --cfg-filepath ./configs/raw_time_collection_subset_threads.json  --dto-version extern --no-stats --collect-raw-times --num-iter 1000000 --exclude-pfs  --num-dsas 1 --results-dirname  raw_op_times_extern_no_stats_threads
+
+#python sweep_all_test_settable_size5.py --output-type perf --run-name in-cache-prob-sweep-1dsa-extern-with-stats_1 --cfg-filepath ./configs/reddis_800_in_cache_prob_perc_sweep_threads2.json  --dto-version extern --num-iter 10000000 --exclude-pfs  --num-dsas 1 --results-dirname  in-cache-prob-extern_with_stats_1dsa_2
+#python sweep_all_test_settable_size5.py --output-type micro --run-name in-cache-prob-sweep-1dsa-dev-with-times_1 --cfg-filepath ./configs/reddis_800_in_cache_prob_auto_threads.json  --dto-version dev_time --alg-stats --num-iter 1000000 --exclude-pfs  --num-dsas 1 --results-dirname  in-cache-prob-dev_with_times_1dsa
+
+#python sweep_all_test_settable_size5.py --output-type perf --run-name in-cache-prob-sweep-1dsa-minwait-extern-with-stats_3 --cfg-filepath ./configs/reddis_800_in_cache_prob_auto_1threads_min_wait.json  --dto-version extern --num-iter 10000000 --exclude-pfs  --num-dsas 1 --results-dirname  in-cache-prob-extern_with_stats_1dsa_minwaits3
+
+#python sweep_all_test_settable_size5.py --output-type micro --run-name in-cache-prob-sweep-1dsa-minwait-dev-alg-stats_3 --cfg-filepath ./configs/reddis_800_in_cache_prob_auto_1threads_min_wait.json  --dto-version dev --alg-stats --num-iter 10000000 --exclude-pfs  --num-dsas 1 --results-dirname  in-cache-prob-dev_alg_stats_1dsa_minwaits3
+
+#python sweep_all_test_settable_size5.py --output-type micro --run-name in-cache-prob-sweep-1dsa-minwait-extern-no-stats_3 --cfg-filepath ./configs/reddis_800_in_cache_prob_auto_1threads_min_wait.json  --dto-version extern --no-stats --num-iter 10000000 --exclude-pfs  --num-dsas 1 --results-dirname  in-cache-prob-extern_no_stats_1dsa_minwaits3
+
+
+#python sweep_all_test_settable_size5.py --output-type micro --run-name in-cache-prob-sweep-1dsa-minwait-dev-with-times_3 --cfg-filepath ./configs/reddis_800_in_cache_prob_auto_1threads_min_wait.json  --dto-version dev_time --alg-stats --num-iter 1000000 --exclude-pfs  --num-dsas 1 --results-dirname  in-cache-prob-dev_with_times_1dsa_minwaits3
+#python sweep_all_test_settable_size5.py --output-type micro --run-name in-cache-prob-sweep-1dsa-minwait-extern-raw-times_3 --cfg-filepath ./configs/reddis_800_in_cache_prob_auto_1threads_min_wait.json  --dto-version extern --no-stats --collect-raw-times --num-iter 1000000 --exclude-pfs  --num-dsas 1 --results-dirname  in-cache-prob-extern-raw_times_1dsa_minwaits3
+
+#python sweep_all_test_settable_size5.py --output-type micro --run-name in-cache-prob-sweep-1dsa-minwait-dev-raw-times_3 --cfg-filepath ./configs/reddis_800_in_cache_prob_auto_1threads_min_wait.json  --dto-version dev_time --collect-raw-times --alg-stats --num-iter 1000000 --exclude-pfs  --num-dsas  1 --results-dirname  in-cache-prob-dev_raw_times_1dsa_minwaits3
+#python sweep_all_test_settable_size5.py --output-type micro --run-name in-cache-prob-sweep-1dsa-minwait-uniform-dev-raw-times --cfg-filepath ./configs/reddis_800_in_cache_prob_auto_1threads_min_wait.json  --dto-version dev_time --collect-raw-times --alg-stats --num-iter 1000000 --exclude-pfs  --num-dsas  1 --results-dirname  in-cache-prob-dev_raw_times_1dsa_minwait_uniform
+
+#python sweep_all_test_settable_size5.py --output-type perf --run-name tx-size-in-cache-perc-extern-with-stats --cfg-filepath ./configs/tx_size_comparison_subset.json  --dto-version extern --num-iter 10000000 --exclude-pfs  --num-dsas 1 --results-dirname  tx_size_in_cache_perc_sweep_minwaits 
+#python sweep_all_test_settable_size5.py --output-type perf --run-name tx-size-in-cache-perc-extern-with-stats --cfg-filepath ./configs/tx_size_comparison_subset_auto.json  --dto-version extern --num-iter 10000000 --exclude-pfs  --num-dsas 1 --results-dirname  tx_size_in_cache_perc_sweep_minwaits
+
+python sweep_all_test_settable_size5.py --output-type micro --run-name in-cache-prob-sweep-1dsa-minwait-dev-raw-times_3 --cfg-filepath ./configs/reddis_800_in_cache_prob_perc_sweep.json  --dto-version dev_time --collect-raw-times --alg-stats --num-iter 1000000  --exclude-pfs  --num-dsas  1 --results-dirname  in-cache-prob-dev_raw_times_1dsa_minwaits3_perc_sweep
 

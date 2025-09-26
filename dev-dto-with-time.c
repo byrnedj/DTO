@@ -484,6 +484,7 @@ struct auto_tune_state {
 	atomic_ullong num_descs;
 	atomic_ullong adjust_num_descs;
 	atomic_ullong adjust_num_waits;
+	atomic_ulong adjust_num_waits_min;  //JJS - min waits
 	size_t cpu_size_fraction;
 	uint32_t wq_index_offset;
 	uint32_t num_wqs;
@@ -499,6 +500,7 @@ static size_t auto_tune_buckets[MAX_AUTOTUNE_INSTANCES];
 static double min_avg_waits = MIN_AVG_YIELD_WAITS;
 static double max_avg_waits = MAX_AVG_YIELD_WAITS;
 static uint8_t auto_adjust_knobs = 1;
+static uint8_t use_min_waits = 0;            //JJS - min waits
 //static __thread uint8_t adjust = 0;
 //static atomic_uchar dto_updating = 0;
 
@@ -715,17 +717,20 @@ static __always_inline void dsa_wait_and_adjust(const volatile uint8_t *comp, si
 	//LOG_TRACE("get_algorithm_instance returned %u\n",bucket);
 
     start = rdtsc();
-	if ((++auto_tune_states[bucket].num_descs & DESCS_PER_RUN) != DESCS_PER_RUN) {
+	//if ((++auto_tune_states[bucket].num_descs & DESCS_PER_RUN) != DESCS_PER_RUN) {
+	if ((++auto_tune_states[bucket].num_descs % 16) != 0) {
 		//LOG_TRACE("dsa_wait_and_adjust size %lu instance %u num_descs %u returning\n",unsplit_size, bucket, auto_tune_states[bucket].num_descs);
 		while (*comp == 0)
 			__dsa_wait(comp);
 
         cycles = (rdtsc() - start);
         raw_wait_times[dto_op_counter++] = cycles;
+		//printf("not num descs %llu\n",auto_tune_states[bucket].num_descs);
 		return;
 	}
 	
-		
+	//printf("collect sample num descs %llu\n",auto_tune_states[bucket].num_descs);
+	
 	/* Run the heuristics as well as wait for DSA */
 	while (*comp == 0) {
 		__dsa_wait(comp);
@@ -734,6 +739,7 @@ static __always_inline void dsa_wait_and_adjust(const volatile uint8_t *comp, si
 
 	cycles = (rdtsc() - start);
 	//printf("%llu\n",cycles);
+	raw_wait_times[dto_op_counter++] = cycles;
 	sampled_wait_times[sample_counter++] = cycles;
 
 	if(autotune_exclude_failed && *comp != DSA_COMP_SUCCESS) {
@@ -741,8 +747,12 @@ static __always_inline void dsa_wait_and_adjust(const volatile uint8_t *comp, si
 	}
 
 
+	if (use_min_waits)                                                //JJS - min waits
+		auto_tune_states[bucket].adjust_num_waits_min = auto_tune_states[bucket].adjust_num_waits_min < local_num_waits ? auto_tune_states[bucket].adjust_num_waits_min : local_num_waits;   
+	else
+		auto_tune_states[bucket].adjust_num_waits += local_num_waits;
+
 	auto_tune_states[bucket].adjust_num_descs++;
-	auto_tune_states[bucket].adjust_num_waits += local_num_waits;
 	
 	
 	auto_tune_states[bucket].adjust_wait_time += cycles;
@@ -758,7 +768,16 @@ static __always_inline void dsa_wait_and_adjust(const volatile uint8_t *comp, si
 		unsigned long long temp = auto_tune_states[bucket].adjust_num_descs;
 
 		if (temp && atomic_compare_exchange_strong(&auto_tune_states[bucket].adjust_num_descs, &temp, 0)) {
-			double avg_num_waits = (double)auto_tune_states[bucket].adjust_num_waits / temp;
+			//printf("Algorithm iteration num descs %llu\n",auto_tune_states[bucket].num_descs);
+			double avg_num_waits;
+			if (use_min_waits) {                                                               //JJS - min waits
+				avg_num_waits = (double)auto_tune_states[bucket].adjust_num_waits_min;    
+				auto_tune_states[bucket].adjust_num_waits_min = 100000;
+			}    
+			else {
+				avg_num_waits = (double)auto_tune_states[bucket].adjust_num_waits / temp;   
+				auto_tune_states[bucket].adjust_num_waits = 0;
+			}
 			//double avg_num_waits2 = (double)adjust_num_waits / temp;
 			
 			//if(avg_num_waits != avg_num_waits2)
@@ -771,7 +790,6 @@ static __always_inline void dsa_wait_and_adjust(const volatile uint8_t *comp, si
 
 			int ut = NO_CHANGE;
 
-			auto_tune_states[bucket].adjust_num_waits = 0;
 			//adjust_num_waits = 0;
 			if (make_adjustments) {
 				if (avg_num_waits > max_avg_waits) {
@@ -2706,6 +2724,17 @@ static int init_dto(void)
 				auto_adjust_knobs = !!auto_adjust_knobs;
 			}
 
+			env_str = getenv("DTO_AUTO_ADJUST_USE_MIN");             //JJS - min waits
+
+			if (env_str != NULL) {
+				errno = 0;
+				use_min_waits = strtoul(env_str, NULL, 10);
+				if (errno)
+					use_min_waits = 1;
+
+				use_min_waits = !!use_min_waits;
+			}
+
 			if (numa_available() != -1) {
 				env_str = getenv("DTO_IS_NUMA_AWARE");
 				if (env_str != NULL) {
@@ -2791,6 +2820,7 @@ static int init_dto(void)
 					auto_tune_states[i+(j*MAX_AUTOTUNE_INSTANCES)].wq_index_offset = i*num_wqs_per_bucket;
 					auto_tune_states[i+(j*MAX_AUTOTUNE_INSTANCES)].num_wqs = num_wqs_per_bucket;
 					auto_tune_states[i+(j*MAX_AUTOTUNE_INSTANCES)].next_wq = 0;
+					auto_tune_states[i+(j*MAX_AUTOTUNE_INSTANCES)].adjust_num_waits_min = 100000; // JJS - min waits
 				}
 			}
 

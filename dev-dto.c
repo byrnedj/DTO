@@ -49,7 +49,7 @@
 #define MAX_WQS 32
 #define MAX_NUMA_NODES 32
 #define DTO_DEFAULT_MIN_SIZE 8192
-#define DTO_DEFAULT_MAX_SIZE 2097152 //JJS
+#define DTO_DEFAULT_MAX_SIZE 2097152 
 #define DTO_INITIALIZED 0
 #define DTO_INITIALIZING 1
 
@@ -121,7 +121,7 @@ static uint8_t use_std_lib_calls;
 static enum numa_aware is_numa_aware;
 static uint8_t opposite_numa = 0;
 static size_t dsa_min_size = DTO_DEFAULT_MIN_SIZE;
-static size_t dsa_max_size = DTO_DEFAULT_MAX_SIZE;  //JJS
+static size_t dsa_max_size = DTO_DEFAULT_MAX_SIZE;  
 static int wait_method = WAIT_YIELD;
 //static size_t cpu_size_fraction;
 
@@ -170,7 +170,7 @@ static const char * const memop_names[] = {
 #define HIST_BUCKET_SIZE 4096
 #define HIST_NO_BUCKETS 512
 
-// update stats - JJS
+// update stats
 #define HIST_AVG_WAIT_BUCKET_SIZE 0.1
 #define HIST_AVG_WAIT_BUCKETS 512
 #define HIST_CPU_FRACT_BUCKET_SIZE 1
@@ -200,7 +200,7 @@ static const char * const stat_group_names[] = {
 	[DSA_FAIL_CODES] = "failure reason"
 };
 
-static const char * const stat_group_names2[] = {  //JJS
+static const char * const stat_group_names2[] = {  
 	[STDC_CALL] = "stdc",
 	[DSA_CALL_SUCCESS] = "dsa_success",
 	[DSA_CALL_FAILED] = "dsa_failed",
@@ -308,7 +308,7 @@ static __thread uint64_t thr_bytes_completed_cpu;
 
 static void update_alg_stats(double avg_num_waits, int update_type, int cpu_size_fraction, int dsa_min_size, size_t n, uint8_t alg_instance);
 
-//update stats collection - JJS
+//update stats collection 
 #define DTO_COLLECT_ALG_STATS(cs, avg_num_waits, update_type, cpu_size_fraction, dsa_min_size, trans_size, bucket)			\
 	do {	\
 		if (unlikely(cs)) {							\
@@ -330,7 +330,7 @@ static atomic_int fail_counter[HIST_NO_BUCKETS][MAX_FAILURES];
 static atomic_int dto_wq_depth[MAX_WQS];
 static atomic_ulong num_dto_requests[HIST_NO_REQS][MAX_WQS];
 
-//update stats collection - JJS
+//update stats collection 
 static atomic_ullong avg_waits_counter[HIST_NO_BUCKETS][HIST_AVG_WAIT_BUCKETS];
 static atomic_ullong cpu_fract_counter[HIST_CPU_FRACT_BUCKETS];
 static atomic_ullong min_size_counter[HIST_MIN_SIZE_BUCKETS];
@@ -413,6 +413,7 @@ struct auto_tune_state {
 	atomic_ullong num_descs;
 	atomic_ullong adjust_num_descs;
 	atomic_ullong adjust_num_waits;
+	atomic_ulong adjust_num_waits_min;  //JJS - min waits
 	size_t cpu_size_fraction;
 	uint32_t wq_index_offset;
 	uint32_t num_wqs;
@@ -427,6 +428,7 @@ static size_t auto_tune_buckets[MAX_AUTOTUNE_INSTANCES];
 static double min_avg_waits = MIN_AVG_YIELD_WAITS;
 static double max_avg_waits = MAX_AVG_YIELD_WAITS;
 static uint8_t auto_adjust_knobs = 1;
+static uint8_t use_min_waits = 0;                 //JJS - min waits
 //static __thread uint8_t adjust = 0;
 //static atomic_uchar dto_updating = 0;
 
@@ -673,9 +675,12 @@ static __always_inline void dsa_wait_and_adjust(const volatile uint8_t *comp, si
 		return;
 	}
 
+	if (use_min_waits)
+		auto_tune_states[bucket].adjust_num_waits_min = auto_tune_states[bucket].adjust_num_waits_min < local_num_waits ? auto_tune_states[bucket].adjust_num_waits_min : local_num_waits;   //JJS - min waits
+	else
+		auto_tune_states[bucket].adjust_num_waits += local_num_waits;
 
 	auto_tune_states[bucket].adjust_num_descs++;
-	auto_tune_states[bucket].adjust_num_waits += local_num_waits;
 
 	//printf("bucket %d local_num_waits %d adjust num waits %d adjust num desc %d\n", bucket,local_num_waits, auto_tune_states[bucket].adjust_num_waits, auto_tune_states[bucket].adjust_num_descs);
 
@@ -685,8 +690,15 @@ static __always_inline void dsa_wait_and_adjust(const volatile uint8_t *comp, si
 		unsigned long long temp = auto_tune_states[bucket].adjust_num_descs;
 
 		if (temp && atomic_compare_exchange_strong(&auto_tune_states[bucket].adjust_num_descs, &temp, 0)) {
-			double avg_num_waits = (double)auto_tune_states[bucket].adjust_num_waits / temp;
-
+			double avg_num_waits;
+			if (use_min_waits) {                                                               //JJS - min waits
+				avg_num_waits = (double)auto_tune_states[bucket].adjust_num_waits_min; 
+				auto_tune_states[bucket].adjust_num_waits_min = 100000;       
+			}
+			else {
+				avg_num_waits = (double)auto_tune_states[bucket].adjust_num_waits / temp;   
+				auto_tune_states[bucket].adjust_num_waits = 0;
+			}
 			//printf("In algorithm bucket %d adjust num waits %d temp %d adjust num desc %d\n", bucket, auto_tune_states[bucket].adjust_num_waits, temp, auto_tune_states[bucket].adjust_num_descs);
 
 			//adjust_num_descs_lt += temp;
@@ -694,8 +706,7 @@ static __always_inline void dsa_wait_and_adjust(const volatile uint8_t *comp, si
 			//double avg_num_waits_lt = (double)adjust_num_waits_lt / adjust_num_descs_lt;
 
 			int ut = NO_CHANGE;
-
-			auto_tune_states[bucket].adjust_num_waits = 0;
+			
 			if (make_adjustments) {
 				if (avg_num_waits > max_avg_waits) {
 					if (auto_tune_states[bucket].cpu_size_fraction < MAX_CPU_SIZE_FRACTION) {
@@ -2534,7 +2545,7 @@ static int init_dto(void)
 			}
 
 
-			env_str = getenv("DTO_MAX_BYTES");   //JJS
+			env_str = getenv("DTO_MAX_BYTES");   
 
 			if (env_str != NULL) {
 				errno = 0;
@@ -2571,6 +2582,19 @@ static int init_dto(void)
 
 				auto_adjust_knobs = !!auto_adjust_knobs;
 			}
+
+			env_str = getenv("DTO_AUTO_ADJUST_USE_MIN");                //JJS - min waits
+
+			if (env_str != NULL) {
+				errno = 0;
+				use_min_waits = strtoul(env_str, NULL, 10);
+				if (errno)
+					use_min_waits = 1;
+
+				use_min_waits = !!use_min_waits;
+			}
+
+			
 
 			if (numa_available() != -1) {
 				env_str = getenv("DTO_IS_NUMA_AWARE");
@@ -2657,6 +2681,7 @@ static int init_dto(void)
 					auto_tune_states[i+(j*MAX_AUTOTUNE_INSTANCES)].wq_index_offset = i*num_wqs_per_bucket;
 					auto_tune_states[i+(j*MAX_AUTOTUNE_INSTANCES)].num_wqs = num_wqs_per_bucket;
 					auto_tune_states[i+(j*MAX_AUTOTUNE_INSTANCES)].next_wq = 0;
+					auto_tune_states[i+(j*MAX_AUTOTUNE_INSTANCES)].adjust_num_waits_min = 100000; // JJS - min waits
 				}
 			}
 
@@ -2803,10 +2828,10 @@ static void dto_memset(void *s, int c, size_t n, int *result)
 	thr_bytes_completed_cpu = 0;
 #endif
 
-	int max_transfer_size = dsa_max_size < wq->max_transfer_size ? dsa_max_size : wq->max_transfer_size;  //JJS
+	int max_transfer_size = dsa_max_size < wq->max_transfer_size ? dsa_max_size : wq->max_transfer_size;  
 
 	//if (dsa_size <= wq->max_transfer_size) {
-	if (dsa_size <= max_transfer_size) {  //JJS
+	if (dsa_size <= max_transfer_size) {  
 		thr_desc.dst_addr = (uint64_t) s + cpu_size;
 		thr_desc.xfer_size = (uint32_t) dsa_size;
 		thr_comp.status = 0;
@@ -2920,12 +2945,12 @@ static uint8_t dto_memcpymove_special(void *dest, const void *src, size_t n, boo
 	thr_bytes_completed_cpu = 0;
 #endif
 
-	int max_transfer_size = dsa_max_size < wq->max_transfer_size ? dsa_max_size : wq->max_transfer_size;  //JJS
+	int max_transfer_size = dsa_max_size < wq->max_transfer_size ? dsa_max_size : wq->max_transfer_size;  
 
 	//printf("size %u max tranfer size %u\n",n,max_transfer_size);
 
 	//if (dsa_size <= wq->max_transfer_size) {
-	if (dsa_size <= max_transfer_size) {  //JJS
+	if (dsa_size <= max_transfer_size) {  
 		thr_desc.src_addr = (uint64_t) src + cpu_size;
 		thr_desc.dst_addr = (uint64_t) dest + cpu_size;
 		thr_desc.xfer_size = (uint32_t) dsa_size;
@@ -3051,12 +3076,12 @@ static uint8_t dto_memcpymove(void *dest, const void *src, size_t n, bool is_mem
 	thr_bytes_completed_cpu = 0;
 #endif
 
-	int max_transfer_size = dsa_max_size < wq->max_transfer_size ? dsa_max_size : wq->max_transfer_size;  //JJS
+	int max_transfer_size = dsa_max_size < wq->max_transfer_size ? dsa_max_size : wq->max_transfer_size;  
 
 	//printf("size %u max tranfer size %u\n",n,max_transfer_size);
 
 	//if (dsa_size <= wq->max_transfer_size) {
-	if (dsa_size <= max_transfer_size) {  //JJS
+	if (dsa_size <= max_transfer_size) {  
 		thr_desc.src_addr = (uint64_t) src + cpu_size;
 		thr_desc.dst_addr = (uint64_t) dest + cpu_size;
 		thr_desc.xfer_size = (uint32_t) dsa_size;
@@ -3156,10 +3181,10 @@ static int dto_memcmp(const void *s1, const void *s2, size_t n, int *result)
 
 	thr_bytes_completed = 0;
 
-	int max_transfer_size = dsa_max_size < wq->max_transfer_size ? dsa_max_size : wq->max_transfer_size;  //JJS
+	int max_transfer_size = dsa_max_size < wq->max_transfer_size ? dsa_max_size : wq->max_transfer_size;  
 
 	//if (n <= wq->max_transfer_size) {
-	if (n <= max_transfer_size) {  //JJS
+	if (n <= max_transfer_size) {  
 		thr_desc.src_addr = (uint64_t) s1;
 		thr_desc.src2_addr = (uint64_t) s2;
 		thr_desc.xfer_size = (uint32_t) n;
@@ -3169,7 +3194,7 @@ static int dto_memcmp(const void *s1, const void *s2, size_t n, int *result)
 			size_t len;
 
 			//len = n <= wq->max_transfer_size ? n : wq->max_transfer_size;
-			len = n <= max_transfer_size ? n : max_transfer_size;  //JJS
+			len = n <= max_transfer_size ? n : max_transfer_size;  
 
 			thr_desc.src_addr = (uint64_t) s1 + thr_bytes_completed;
 			thr_desc.src2_addr = (uint64_t) s2 + thr_bytes_completed;

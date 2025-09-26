@@ -30,6 +30,8 @@
 
 #define RAND_SEED 121919193
 
+#define RAW_TIMES_MARGIN 5000
+
 enum memop {
 	MEMSET = 0x1,  
 	MEMCOPY = 0x2,       
@@ -58,6 +60,10 @@ struct parms {
     uint32_t time_between_ms;
     uint32_t warmup_time_s;
 	uint64_t cycles;
+	uint64_t raw_times_size;
+	uint32_t* raw_times;
+    uint8_t collect_raw_times;
+	uint32_t iterations_completed;
 };
 
 #ifdef PRINT_OUTPUT
@@ -167,13 +173,16 @@ int thread_func(void *thr_data)
     uint64_t burst_size = p->burst_size;
     uint32_t time_between_ms = p->time_between_ms;
     uint32_t warmup_time_s = p->warmup_time_s;
+	uint32_t* raw_times = p->raw_times;
+    uint8_t collect_raw_times = p->collect_raw_times;
+	uint64_t raw_times_size = p->raw_times_size;
 
 	p->cycles = 0;
 
     uint8_t *s;
 	uint8_t *d;
 
-	uint64_t start;
+	uint64_t start, elapsed;
 	
     //for (uint32_t i=0;i<10;++i) {
     //    printf("%d: src addr %d: %x\n",thread_id, i,src_buffs[i]);
@@ -191,14 +200,15 @@ int thread_func(void *thr_data)
 
 	// max_iters is the total iters for all threads. If number of threads is > 1 this loop will never complete.
 	// atomic variable no_ops keeps track of the total across all trheads and There is a check against no_op with a break which causes the loop to exit.
-	for (unsigned long long i=0; i < max_iters; ++i) {
+	unsigned long long i=0;
+	for (i=0; i < max_iters; ++i) {
         s = src_buffs[i%num_mem_bufs];
         d = dst_buffs[i%num_mem_bufs];
 
 
 		start = rdtsc();
 	
-		//printf("next buffers: index %d, src %x, dst %x\n",i%num_mem_bufs,s,d);
+		//printf("%llu: next buffers: index %d, src %x, dst %x\n",i,i%num_mem_bufs,s,d);
 		
 		// issue the memory transactions
 		if (mem_ops & MEMSET) {
@@ -221,11 +231,18 @@ int thread_func(void *thr_data)
 			memcmp(d, s, transaction_size);
 		}
 
-		p->cycles += (rdtsc() - start);
+		elapsed = rdtsc() - start;
+		p->cycles += elapsed;
+        if(collect_raw_times) {
+            //raw_times[i%raw_times_size] = elapsed;
+			raw_times[no_ops++] = elapsed;
+        } else {
+			++no_ops;	
+		}
         
 
 #ifdef PRINT_OUTPUT
-		++no_ops;
+		//++no_ops;
 		//if (no_ops % LOG_COUNT == 0)
 		//	printf("completed %d ops\n", no_ops);
 #endif
@@ -250,10 +267,10 @@ int thread_func(void *thr_data)
 
         if (no_ops > max_iters)
             break;
-
 	}
 
-	//printf("thread %d finished %d\n", thread_id,no_ops);
+	p->iterations_completed = i+1;
+	//("thread %d finished %llu\n", thread_id,i);
 
 	return 0;
 }
@@ -285,10 +302,12 @@ int main(int argc, char **argv)
 	float latency;
 	float bw;
 	uint64_t cycles_per_sec;
+	uint8_t collect_raw_times = 0;
+	uint32_t* raw_times;
 	
 
-	if (argc != 18) {
-		printf("Usage: dto-test-settable-size num_threads sleep_time_us mem_op transaction_size total_num_iters mem_buf_size num_mem_bufs random_access src_numa_policy dst_numa_policy num_burst_threads burst_size time_between_ms warmup_time_s percent_src_dst_overlap overlap_probability in_cache_probability\n");
+	if (argc != 19) {
+		printf("Usage: dto-test-settable-size num_threads sleep_time_us mem_op transaction_size total_num_iters mem_buf_size num_mem_bufs random_access src_numa_policy dst_numa_policy num_burst_threads burst_size time_between_ms warmup_time_s percent_src_dst_overlap overlap_probability in_cache_probability collect_raw_times\n");
 		printf("buf_size in increments of 1024, num_threads <= 10\n");
 		return 1;
 	}
@@ -312,6 +331,7 @@ int main(int argc, char **argv)
 		percent_src_dst_overlap = atoi(argv[15]);
 		overlap_probability = atoi(argv[16]);
 		in_cache_probability = atoi(argv[17]);
+		collect_raw_times = atoi(argv[18]);
 
 		calibrate(&cycles_per_sec);
 
@@ -352,6 +372,18 @@ int main(int argc, char **argv)
 			printf("transaction_size %d must be  <= mem_buf_size %d\n",transaction_size,mem_buf_size);
 			return 1;
 		}
+	}
+
+	if(collect_raw_times){
+		// We add a margin to the number of iterations because if this is used with multiple threads the
+		// split between threads is not exact and the last thread might write past the end of the buffer
+		// The number (1000) was chosen without any real investigation of the required margin...
+		raw_times = calloc(total_num_iters + (RAW_TIMES_MARGIN*num_threads), sizeof(uint32_t));
+		for(uint32_t i=0;i<total_num_iters +(RAW_TIMES_MARGIN*num_threads);++i)
+		{
+			raw_times[i] = 4294967295;
+		}
+
 	}
 
 	//printf("buf_size %lu iters %lu threads %u\n",p.buf_size, p.max_iters, p.num_threads);
@@ -446,7 +478,6 @@ int main(int argc, char **argv)
 			ind_size_overlap -= 1;
 			overall_ind_size = ind_size_overlap;
 		}
-
 	}
 
 	if (overlap_probability > 0 && overlap_probability < 100) {
@@ -483,6 +514,7 @@ int main(int argc, char **argv)
 			for (uint32_t i=0;i<overall_ind_size;++i) {
 				src_addrs[i] = src_buffs[0] + transaction_size*BUF_SIZE_BASE*i;
 				dst_addrs[i] = dst_buffs[0] + transaction_size*BUF_SIZE_BASE*i;
+				//printf("%d: src %x, dst %x\n",i,src_addrs[i],dst_addrs[i]);
 			}
 		}
 		else if (overlap_probability == 100) {
@@ -542,12 +574,20 @@ int main(int argc, char **argv)
 
     uint32_t bufs_per_thread = overall_ind_size / num_threads;
 
+	// This is used only to divide up the raw_time buffer. The total number of iterations
+	// is passed to the threads and an atomic op count is used to stop the threads when the 
+	// total number of iterations is reached
+	unsigned long long num_iters_per_thread = total_num_iters / num_threads;
     //printf("num inters per thread %d remainder %d\n",num_iters_per_thread, remainder);
     //printf("num bufs per thread %d\n",bufs_per_thread);
 
-	if (in_cache_probability>0) {
-		float prob = in_cache_probability;
+	
+	int num_in_cache = 0;
+	float prob = in_cache_probability;
 		prob = prob / 100;
+	if (in_cache_probability>0) {
+		//float prob = in_cache_probability;
+		//prob = prob / 100;
 		double j;
 		for(int t = 0; t < num_threads; ++t) {
 			int st = t*bufs_per_thread;
@@ -556,11 +596,31 @@ int main(int argc, char **argv)
 				if (j < prob) {
 					src_addrs[st+i] = src_addrs[st];
 					dst_addrs[st+i] = dst_addrs[st];
+					num_in_cache++;
 				}
 			}
 		}
 	}
+	
 
+	//printf("In cache probability %f, %d / %d in cache. Resulting ratio %f\n",prob, num_in_cache, bufs_per_thread*num_threads, (float)num_in_cache/(float)(bufs_per_thread*num_threads));
+
+	//uint32_t raw_times_margin_per_thread = RAW_TIMES_MARGIN/num_threads;
+
+	/*
+	for(int t = 0; t < num_threads; ++t) {
+
+        p[t].src_buffs = &src_addrs[t*bufs_per_thread];
+        p[t].dst_buffs = &dst_addrs[t*bufs_per_thread];
+       
+		for(int i=0;i<bufs_per_thread;++i) {
+			printf("thread %d, %d: src %x dst %x\n",t,i,p[t].src_buffs[i],p[t].dst_buffs[i]);
+		}
+
+	}
+
+	return 0;
+	*/
 
 	for(int t = 0; t < num_threads; ++t) {
         p[t].max_iters = total_num_iters;  // We pass the total number and the threads use an atomic to track how many total ops have been performed
@@ -576,6 +636,12 @@ int main(int argc, char **argv)
         p[t].burst_size = burst_size;
         p[t].time_between_ms = time_between_ms;
         p[t].warmup_time_s = warmup_time_s;
+		p[t].collect_raw_times = collect_raw_times;
+		if (collect_raw_times) {
+			p[t].raw_times = raw_times;
+			//p[t].raw_times = raw_times + (t * (num_iters_per_thread+RAW_TIMES_MARGIN));
+			p[t].raw_times_size = num_iters_per_thread+RAW_TIMES_MARGIN;
+		}
 
         //if (t==num_threads-1)
         //    p[t].max_iters += remainder;
@@ -588,6 +654,11 @@ int main(int argc, char **argv)
 		thrd_join(threads[t], NULL);
         //printf("thread %d done\n", t);
 		cycles += p[t].cycles;
+		//if (collect_raw_times) {
+			//if (p[t].iterations_completed > num_iters_per_thread+RAW_TIMES_MARGIN) {
+			//	printf("#Warning: Thread %d number of iterations exceeded margin by %d",t,p[t].iterations_completed - (num_iters_per_thread+RAW_TIMES_MARGIN));
+			//}
+		//}
     }
 
     for(int i=0;i<num_mem_bufs;++i) {
@@ -609,9 +680,25 @@ int main(int argc, char **argv)
 	bw = total_num_iters * (transaction_size*BUF_SIZE_BASE/secs)/1000000000;
 	float latency_ns = (latency * 1E9)/cycles_per_sec;
 
+	uint32_t num_samples=0;
 	printf("'''\n");
 	printf("# BW %f GB/s Latency %f ns cycles per second %llu\n",bw,latency_ns, cycles_per_sec);
-	printf("micro_stats={'BW':%f, 'latency':%f, 'cycles_per_sec':%llu}\n",bw,latency_ns,cycles_per_sec);
+	printf("micro_stats={'BW':%f, 'latency':%f, 'cycles_per_sec':%llu",bw,latency_ns,cycles_per_sec);
+	if (collect_raw_times) {
+		printf(",\n'raw_times': [");
+		//for(int t = 0; t < num_threads; ++t) {
+			//int num = (p[t].iterations_completed < num_iters_per_thread+RAW_TIMES_MARGIN) ? p[t].iterations_completed : num_iters_per_thread+RAW_TIMES_MARGIN;
+			//for (int i=0;i<num;++i) {
+			for (int i=0;i<total_num_iters;++i) {
+				//printf("%u,",raw_times[(t * (num_iters_per_thread+RAW_TIMES_MARGIN))+i]);
+				printf("%u,",raw_times[i]);
+				num_samples++;
+			}
+		//}
+		printf("]\n");
+	}
+	printf("}\n");
+	//printf("num samples collected %u\n",num_samples);
 		
 #ifdef PRINT_OUTPUT	
 	//printf("all threads completed execution\n");
