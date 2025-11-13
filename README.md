@@ -49,8 +49,10 @@ dto-4-dsa.conf:  An example json config file for configuring DSAs
 
 Following environment variables control the behavior of DTO library:
 	DTO_USESTDC_CALLS=0/1, 1 (uses std c memory functions only), 0 (uses DSA along with std c lib call; in case of DSA page fault - reverts to std c lib call). Default is 0.
-	DTO_COLLECT_STATS=0/1, 1 (enables stats collection - #of operations, avg latency for each API, etc.>, 0 (disables stats collection).
-				Should be enabled for debugging/profiling only, not for perf evaluation (enabling it slows down the workload). Default is 0.
+        DTO_COLLECT_STATS=0/1, 1 (enables stats collection - #of operations, avg latency for each API, etc.>, 0 (disables stats collection).
+                                Should be enabled for debugging/profiling only, not for perf evaluation (enabling it slows down the workload). Default is 0.
+        DTO_STATS_FILE=<path> when DTO_COLLECT_STATS=1, redirect histogram output to the provided regular file instead of standard output.
+                                The file is truncated when DTO loads; failures fall back to standard output and emit an error.
 	DTO_WAIT_METHOD=<yield,busypoll,umwait> (specifies the method to use while waiting for DSA to complete operation, default is yield)
 	DTO_MIN_BYTES=xxxx (specifies minimum size of API call needed for DSA operation execution, default is 16384 bytes)
 	DTO_CPU_SIZE_FRACTION=0.xx (specifies fraction of job performed by CPU, in parallel to DSA). Default is 0.00
