@@ -10,6 +10,8 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <string.h>
+#include <stdarg.h>
+#include <unistd.h>
 #include <sys/mman.h>
 #include <cpuid.h>
 #include <linux/idxd.h>
@@ -23,6 +25,7 @@
 #include <accel-config/libaccel_config.h>
 #include <numaif.h>
 #include <numa.h>
+#include <signal.h>
 
 #define likely(x)       __builtin_expect((x), 1)
 #define unlikely(x)     __builtin_expect((x), 0)
@@ -205,6 +208,7 @@ static const char * const wait_names[] = {
 static int collect_stats;
 static char dto_log_path[PATH_MAX];
 static int log_fd = -1;
+static int stats_fd = -1;
 
 #ifdef DTO_STATS_SUPPORT
 static struct timespec dto_start_time;
@@ -265,6 +269,84 @@ static enum {
 #define LOG_TRACE(...) dto_log(LOG_LEVEL_TRACE, __VA_ARGS__)
 
 static unsigned int log_level = LOG_LEVEL_FATAL;
+
+static void dto_stats_log(const char *fmt, ...)
+{
+        char buf[512];
+        va_list args;
+
+        if (stats_fd == -1 && LOG_LEVEL_TRACE > log_level)
+                return;
+
+        va_start(args, fmt);
+        if (stats_fd != -1) {
+                if (vsnprintf(buf, sizeof(buf), fmt, args) > 0)
+                        write(stats_fd, buf, strlen(buf));
+        } else if (log_fd == -1) {
+                vprintf(fmt, args);
+        } else {
+                vsnprintf(buf, sizeof(buf), fmt, args);
+                write(log_fd, buf, strlen(buf));
+        }
+        va_end(args);
+}
+
+#ifdef DTO_STATS_SUPPORT
+static void print_stats(void);
+static struct sigaction previous_sigint_action;
+static volatile sig_atomic_t sigint_handler_installed;
+static int previous_sigint_action_valid;
+
+static void restore_sigint_handler(void)
+{
+        if (!sigint_handler_installed)
+                return;
+
+        if (previous_sigint_action_valid)
+                sigaction(SIGINT, &previous_sigint_action, NULL);
+        else {
+                struct sigaction default_action = {0};
+
+                default_action.sa_handler = SIG_DFL;
+                sigaction(SIGINT, &default_action, NULL);
+        }
+
+        sigint_handler_installed = 0;
+}
+
+static void dto_handle_sigint(int signo)
+{
+        if (collect_stats)
+                print_stats();
+
+        restore_sigint_handler();
+
+        if (previous_sigint_action_valid && previous_sigint_action.sa_handler == SIG_IGN)
+                return;
+
+        raise(signo);
+}
+
+static void install_sigint_handler(void)
+{
+        struct sigaction action = {0};
+
+        if (sigint_handler_installed)
+                return;
+
+        action.sa_handler = dto_handle_sigint;
+        sigemptyset(&action.sa_mask);
+        action.sa_flags = SA_RESTART;
+
+        if (sigaction(SIGINT, NULL, &previous_sigint_action) == 0)
+                previous_sigint_action_valid = 1;
+        else
+                previous_sigint_action_valid = 0;
+
+        if (sigaction(SIGINT, &action, NULL) == 0)
+                sigint_handler_installed = 1;
+}
+#endif
 
 /* Auto tune heuristics magic numbers */
 #define DESCS_PER_RUN 0xF0
@@ -597,41 +679,41 @@ static void print_stats(void)
 
 	clock_gettime(CLOCK_BOOTTIME, &dto_end_time);
 
-	LOG_TRACE("DTO Run Time: %ld ms\n", TS_NS(dto_start_time, dto_end_time)/1000000);
+	dto_stats_log("DTO Run Time: %ld ms\n", TS_NS(dto_start_time, dto_end_time)/1000000);
 
 	// display stats
 	for (int t = 0; t < 2; ++t) {
 		if (t == 0)
-			LOG_TRACE("\n******** Number of Memory Operations ********\n");
+			dto_stats_log("\n******** Number of Memory Operations ********\n");
 		else
-			LOG_TRACE("\n******** Average Memory Operation Latency (us)  ********\n");
+			dto_stats_log("\n******** Average Memory Operation Latency (us)  ********\n");
 
-		LOG_TRACE("%17s    ", "");
+		dto_stats_log("%17s    ", "");
 		for (int g = 0; g < MAX_STAT_GROUP; ++g) {
 			if (t == 0) {
 				if (g == DSA_FAIL_CODES)
-					LOG_TRACE("<***** %-13s *****> ", stat_group_names[g]);
+					dto_stats_log("<***** %-13s *****> ", stat_group_names[g]);
 				else
-					LOG_TRACE("<*************** %-13s ***************> ", stat_group_names[g]);
+					dto_stats_log("<*************** %-13s ***************> ", stat_group_names[g]);
 			} else {
 				if (g != DSA_FAIL_CODES)
-					LOG_TRACE("<******** %-13s ********> ", stat_group_names[g]);
+					dto_stats_log("<******** %-13s ********> ", stat_group_names[g]);
 
 			}
 		}
-		LOG_TRACE("\n");
+		dto_stats_log("\n");
 
-		LOG_TRACE("%-17s -- ", "Byte Range");
+		dto_stats_log("%-17s -- ", "Byte Range");
 		for (int g = 0; g < MAX_STAT_GROUP - 1; ++g) {
 			for (int o = 0; o < MAX_MEMOP; ++o)
-				LOG_TRACE("%-8s ", memop_names[o]);
+				dto_stats_log("%-8s ", memop_names[o]);
 			if (t == 0)
-				LOG_TRACE("%-12s ", "bytes");
+				dto_stats_log("%-12s ", "bytes");
 		}
 		if (t == 0)
 			for (int o = 1; o < MAX_FAILURES; ++o)
-				LOG_TRACE("%-6s ", failure_names[o]);
-		LOG_TRACE("\n");
+				dto_stats_log("%-6s ", failure_names[o]);
+		dto_stats_log("\n");
 
 		for (int b = 0; b < HIST_NO_BUCKETS; ++b) {
 			bool empty = true;
@@ -650,31 +732,31 @@ static void print_stats(void)
 				continue;
 
 			if (b < (HIST_NO_BUCKETS-1))
-				LOG_TRACE("% 8d-%-8d -- ", b*4096, ((b+1)*4096)-1);
+				dto_stats_log("% 8d-%-8d -- ", b*4096, ((b+1)*4096)-1);
 			else
-				LOG_TRACE("   >=%-12d -- ", b*4096);
+				dto_stats_log("   >=%-12d -- ", b*4096);
 
 			for (int g = 0; g < MAX_STAT_GROUP - 1; ++g) {
 				for (int o = 0; o < MAX_MEMOP; ++o) {
 					if (t == 0) {
-						LOG_TRACE("%-8d ", op_counter[b][g][o]);
+						dto_stats_log("%-8d ", op_counter[b][g][o]);
 						continue;
 					}
 					if (op_counter[b][g][o] != 0) {
 						double avg_us = ((double) lat_counter[b][g][o])/(((double) op_counter[b][g][o]) * 1000.0);
 
-						LOG_TRACE("%-8.2f ", avg_us);
+						dto_stats_log("%-8.2f ", avg_us);
 					} else {
-						LOG_TRACE("%-8d ", 0);
+						dto_stats_log("%-8d ", 0);
 					}
 				}
 				if (t == 0)
-					LOG_TRACE("%-12lld ", bytes_counter[b][g]);
+					dto_stats_log("%-12lld ", bytes_counter[b][g]);
 			}
 			if (t == 0)
 				for (int o = 1; o < MAX_FAILURES; ++o)
-					LOG_TRACE("%-6d ", fail_counter[b][o]);
-			LOG_TRACE("\n");
+					dto_stats_log("%-6d ", fail_counter[b][o]);
+			dto_stats_log("\n");
 		}
 	}
 }
@@ -1308,12 +1390,28 @@ static int init_dto(void)
 		}
 
 		if (collect_stats) {
-			clock_gettime(CLOCK_BOOTTIME, &dto_start_time);
-			/* Change the log level to 'trace' so that the
-			 * stats can be logged
-			 */
-			log_level = LOG_LEVEL_TRACE;
-		}
+			env_str = getenv("DTO_STATS_FILE");
+                        if (env_str != NULL) {
+                                struct stat st;
+
+                                if (lstat(env_str, &st) == -1 ||
+                                        (st.st_mode & S_IFMT) == S_IFREG) {
+                                        stats_fd = open(env_str, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+                                        if (stats_fd == -1)
+                                                LOG_ERROR("Failed to open DTO_STATS_FILE '%s': %s\n", env_str, strerror(errno));
+                                } else {
+                                        LOG_ERROR("DTO_STATS_FILE '%s' must reference a regular file\n", env_str);
+                                }
+                        }
+
+                        clock_gettime(CLOCK_BOOTTIME, &dto_start_time);
+                        /* Change the log level to 'trace' so that the
+                         * stats can be logged
+                         */
+                        log_level = LOG_LEVEL_TRACE;
+                        dto_stats_log("Stats collection enabled, some latencies may be higher due to collection overhead.\n");
+                        install_sigint_handler();
+                }
 #endif
 
 		/* Register fork handler for the child process */
@@ -1443,13 +1541,18 @@ static void cleanup_dto(void)
 			munmap(wqs[i].wq_portal, 0x1000);
 			wqs[i].wq_mmapped = false;
 		}
-			close(wqs[i].wq_fd);
+		close(wqs[i].wq_fd);
 	}
 #ifdef DTO_STATS_SUPPORT
-	print_stats();
+        print_stats();
+        restore_sigint_handler();
 #endif
-	if (log_fd != -1)
-		close(log_fd);
+        if (log_fd != -1)
+                close(log_fd);
+	if (stats_fd != -1) {
+		close(stats_fd);
+		stats_fd = -1;
+	}
 
 	cleanup_devices();
 }
