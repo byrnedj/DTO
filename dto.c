@@ -30,11 +30,11 @@
 // DSA capabilities
 #define GENCAP_CC_MEMORY  0x4
 
-#define UMWAIT_DELAY_DEFAULT 100000
-/* C0.1 state */
-#define UMWAIT_STATE 1
+#define UMWAIT_DELAY_DEFAULT 100000 //cycles until umwait timeout
 
-#define DEFAULT_SLEEP_TIME_USEC 8  //20 //sleep mode wait
+#define C01_STATE 1
+#define C02_STATE 0
+#define TPAUSE_DELAY 1000
 
 #define USE_ORIG_FUNC(n, use_dsa) (use_std_lib_calls == 1 || !use_dsa || n < dsa_min_size)
 #define TS_NS(s, e) (((e.tv_sec*1000000000) + e.tv_nsec) - ((s.tv_sec*1000000000) + s.tv_nsec))
@@ -46,16 +46,21 @@
  */
 #define MAX_WQS 32
 #define MAX_NUMA_NODES 32
-#define DTO_DEFAULT_MIN_SIZE 8192
+#define DTO_DEFAULT_MIN_SIZE 65536
 #define DTO_INITIALIZED 0
 #define DTO_INITIALIZING 1
+
+
+#define NSEC_PER_SEC (1000000000)
+#define MSEC_PER_SEC (1000)
+#define NSEC_PER_MSEC (NSEC_PER_SEC/MSEC_PER_SEC)
 
 // thread specific variables
 static __thread struct dsa_hw_desc thr_desc;
 static __thread struct dsa_completion_record thr_comp __attribute__((aligned(32)));
 static __thread uint64_t thr_bytes_completed;
 
-// orignal std memory functions
+// original std memory functions
 static void * (*orig_memset)(void *s, int c, size_t n);
 static void * (*orig_memcpy)(void *dest, const void *src, size_t n);
 static void * (*orig_memmove)(void *dest, const void *src, size_t n);
@@ -81,8 +86,8 @@ struct dto_device {
 enum wait_options {
 	WAIT_BUSYPOLL = 0,
 	WAIT_UMWAIT,
-	WAIT_YIELD, //sleep mode wait
-	WAIT_SLEEP
+	WAIT_YIELD,
+	WAIT_TPAUSE
 };
 
 enum numa_aware {
@@ -90,6 +95,12 @@ enum numa_aware {
 	NA_BUFFER_CENTRIC,
 	NA_CPU_CENTRIC,
 	NA_LAST_ENTRY
+};
+
+enum overlapping_memmove_actions {
+	OVERLAPPING_CPU = 0,
+	OVERLAPPING_DSA,
+	OVERLAPPING_LAST_ENTRY
 };
 
 static const char * const numa_aware_names[] = {
@@ -108,8 +119,8 @@ static atomic_uchar dto_initializing;
 static uint8_t use_std_lib_calls;
 static enum numa_aware is_numa_aware;
 static size_t dsa_min_size = DTO_DEFAULT_MIN_SIZE;
-static int wait_method = WAIT_YIELD;
-static size_t cpu_size_fraction;
+static int wait_method = WAIT_BUSYPOLL;
+static size_t cpu_size_fraction[2];   // range of values is 0 to 99
 
 static uint8_t dto_dsa_memcpy = 1;
 static uint8_t dto_dsa_memmove = 1;
@@ -117,9 +128,22 @@ static uint8_t dto_dsa_memset = 1;
 static uint8_t dto_dsa_memcmp = 1;
 
 static uint8_t dto_dsa_cc = 1;
+static bool dto_use_c02 = true; //C02 state is default -
+                            //C02 avg exit latency is ~500 ns
+                            //and C01 is about ~240 ns on SPR
+
+#define TPAUSE_C02_DELAY_NS 6000 //in this case we are offloading so delay can
+                                 //be ~6 us as this is around the time a > 64KB 
+                                 //copy takes to complete
+
+#define TPAUSE_C01_DELAY_NS 1000 //keep smaller because we want to wake up
+                                 //with lower latency
+
+static uint64_t tpause_wait_time = TPAUSE_C02_DELAY_NS;
 
 static unsigned long dto_umwait_delay = UMWAIT_DELAY_DEFAULT;
-static unsigned int dto_sleep_time_usec = DEFAULT_SLEEP_TIME_USEC; //sleep mode wait
+
+static uint8_t dto_overlapping_memmove_action = OVERLAPPING_CPU;
 
 static uint8_t fork_handler_registered;
 
@@ -175,7 +199,7 @@ static const char * const wait_names[] = {
 	[WAIT_BUSYPOLL] = "busypoll",
 	[WAIT_UMWAIT] = "umwait",
 	[WAIT_YIELD] = "yield",
-	[WAIT_SLEEP] = "sleep",  //sleep mode wait
+        [WAIT_TPAUSE] = "tpause"
 };
 
 static int collect_stats;
@@ -193,7 +217,7 @@ static struct timespec dto_start_time;
 	} while (0)						\
 
 
-#define DTO_COLLECT_STATS_DSA_END(cs, st, et, op, n, tbc, r)				\
+#define DTO_COLLECT_STATS_DSA_END(cs, st, et, op, n, overlap, tbc, r)				\
 	do {										\
 		if (unlikely(cs)) {							\
 			uint64_t t;							\
@@ -201,9 +225,9 @@ static struct timespec dto_start_time;
 			t = (((et.tv_sec*1000000000) + et.tv_nsec) -			\
 					((st.tv_sec*1000000000) + st.tv_nsec));		\
 			if (unlikely(r != SUCCESS))					\
-				update_stats(op, n, tbc, t, DSA_CALL_FAILED, r);	\
+				update_stats(op, n, overlap, tbc, t, DSA_CALL_FAILED, r);	\
 			else								\
-				update_stats(op, n, tbc, t, DSA_CALL_SUCCESS, 0);	\
+				update_stats(op, n, overlap, tbc, t, DSA_CALL_SUCCESS, 0);	\
 		}									\
 	} while (0)									\
 
@@ -214,7 +238,7 @@ static struct timespec dto_start_time;
 			clock_gettime(CLOCK_BOOTTIME, &et);			\
 			t = (((et.tv_sec*1000000000) + et.tv_nsec) -		\
 				((st.tv_sec*1000000000) + st.tv_nsec));		\
-			update_stats(op, orig_n, n, t, STDC_CALL, 0);		\
+			update_stats(op, orig_n, false, n, t, STDC_CALL, 0);		\
 		}								\
 	} while (0)								\
 
@@ -228,7 +252,7 @@ static atomic_int fail_counter[HIST_NO_BUCKETS][MAX_FAILURES];
 static int init_dto(void) __attribute__((constructor));
 static void cleanup_dto(void) __attribute__((destructor));
 
-static int umwait_support;
+static int waitpkg_support;
 
 static enum {
 	LOG_LEVEL_FATAL,
@@ -249,24 +273,47 @@ static unsigned int log_level = LOG_LEVEL_FATAL;
 #define MAX_AVG_YIELD_WAITS 2.0
 #define MIN_AVG_POLL_WAITS 5.0
 #define MAX_AVG_POLL_WAITS 20.0
-#define MAX_CPU_SIZE_FRACTION 90 //0.9
-#define CSF_STEP_INCREMENT 1 //0.01
-#define CSF_STEP_DECREMENT 1 //0.01
+#define MAX_CPU_SIZE_FRACTION 90  // specified in percent (e.g., 90 is 0.90)
+#define CSF_STEP_INCREMENT 1
+#define CSF_STEP_DECREMENT 1
 #define MAX_DSA_MIN_SIZE 65536
 #define MIN_DSA_MIN_SIZE 6144
 #define DMS_STEP_INCREMENT 1024
 #define DMS_STEP_DECREMENT 1024
 
 /* Auto tuning variables */
-static atomic_ullong num_descs;
-static atomic_ullong adjust_num_descs;
-static atomic_ullong adjust_num_waits;
+static atomic_ullong num_descs[2];
+static atomic_ullong adjust_num_descs[2];
+static atomic_ullong adjust_num_wait[2];
 /* default waits are for yield because yield is default waiting method */
 static double min_avg_waits = MIN_AVG_YIELD_WAITS;
 static double max_avg_waits = MAX_AVG_YIELD_WAITS;
 static uint8_t auto_adjust_knobs = 1;
+static uint8_t use_split_algorithm = 1;
 
 extern char *__progname;
+
+static __always_inline uint64_t
+rdtsc(void)
+{
+	uint64_t tsc;
+	unsigned int dummy;
+
+	/*
+	 * https://www.felixcloutier.com/x86/rdtscp
+	 * The RDTSCP instruction is not a serializing instruction, but it
+	 * does wait until all previous instructions have executed and all
+	 * previous loads are globally visible
+	 *
+	 * If software requires RDTSCP to be executed prior to execution of
+	 * any subsequent instruction (including any memory accesses), it can
+	 * execute LFENCE immediately after RDTSCP
+	 */
+	tsc = __rdtscp(&dummy);
+	__builtin_ia32_lfence();
+
+	return tsc;
+}
 
 static void dto_log(int req_log_level, const char *fmt, ...)
 {
@@ -289,8 +336,6 @@ static void dto_log(int req_log_level, const char *fmt, ...)
 /* Reinitialize DTO in the child process. */
 static void child (void)
 {
-	//LOG_TRACE("child process initialization called\n");
-
 #ifdef DTO_STATS_SUPPORT
 	int i, j, k;
 
@@ -317,7 +362,6 @@ static void child (void)
 static __always_inline unsigned char enqcmd(struct dsa_hw_desc *desc, volatile void *reg)
 {
 	unsigned char retry;
-	//LOG_TRACE("descriptor %x reg %x\n",desc,reg);
 
 	asm volatile(".byte 0xf2, 0x0f, 0x38, 0xf8, 0x02\t\n"
 			"setz %0\t\n"
@@ -331,94 +375,78 @@ static __always_inline void movdir64b(struct dsa_hw_desc *desc, volatile void *r
 		: : "a" (reg), "d" (desc));
 }
 
-static __always_inline void umonitor(const volatile void *addr)
-{
-	asm volatile(".byte 0xf3, 0x48, 0x0f, 0xae, 0xf0" : : "a"(addr));
-}
-
-static __always_inline int umwait(unsigned long timeout, unsigned int state)
-{
-	uint8_t r;
-	uint32_t timeout_low = (uint32_t)timeout;
-	uint32_t timeout_high = (uint32_t)(timeout >> 32);
-
-	asm volatile(".byte 0xf2, 0x48, 0x0f, 0xae, 0xf1\t\n"
-		"setc %0\t\n"
-		: "=r"(r)
-		: "c"(state), "a"(timeout_low), "d"(timeout_high));
-	return r;
-}
-
 static __always_inline void dsa_wait_yield(const volatile uint8_t *comp)
 {
-	//int count=0;
 	while (*comp == 0) {
-	//	++count;
-		sched_yield();
+	    sched_yield();
 	}
-	//if(count>1)
-	//	printf("yielded %d\n",count);
 }
 
 static __always_inline void dsa_wait_busy_poll(const volatile uint8_t *comp)
 {
 	while (*comp == 0) {
-		_mm_pause();
+	    _mm_pause();
 	}
+}
+
+static __always_inline void dsa_wait_tpause(const volatile uint8_t *comp)
+{
+	while (*comp == 0) {
+            uint64_t delay = _rdtsc() + tpause_wait_time;
+            _tpause(C02_STATE, delay);
+        }
 }
 
 static __always_inline void __dsa_wait_umwait(const volatile uint8_t *comp)
 {
-	umonitor(comp);
+	_umonitor((void*)comp);
 
-	// Hardware never writes 0 to this field. Software should initialize this field to 0
-	// so it can detect when the completion record has been written
-	if (*comp == 0) {
-		uint64_t delay = __rdtsc() + dto_umwait_delay;
-
-		umwait(delay, UMWAIT_STATE);
-	}
+        uint64_t delay = _rdtsc() + UMWAIT_DELAY_DEFAULT;
+	_umwait(C02_STATE, delay);
 }
 
 static __always_inline void dsa_wait_umwait(const volatile uint8_t *comp)
 {
-
-	while (*comp == 0)
-		__dsa_wait_umwait(comp);
-}
-
-//sleep mode wait
-static __always_inline void dsa_wait_sleep(const volatile uint8_t *comp)
-{
-	//int count=0;
 	while (*comp == 0) {
-	//		++count;
-	        usleep(dto_sleep_time_usec);	
+	    __dsa_wait_umwait(comp);
         }
-	//if(count>1)
-	//	printf("slept %d\n",count);
 }
 
 static __always_inline void __dsa_wait(const volatile uint8_t *comp)
 {
-	if (wait_method == WAIT_YIELD)
+        switch(wait_method) {
+            case WAIT_YIELD:
 		sched_yield();
-	else if (wait_method == WAIT_UMWAIT)
-		__dsa_wait_umwait(comp);
-	else if (wait_method == WAIT_SLEEP)  //sleep mode wait
-		dsa_wait_sleep(comp);
-	else
-		_mm_pause();
+                break;
+            case WAIT_UMWAIT:
+                __dsa_wait_umwait(comp);
+                break;
+            case WAIT_TPAUSE:
+                _tpause( C01_STATE, _rdtsc() + TPAUSE_C01_DELAY_NS); 
+                break;
+            default:
+                 _mm_pause();
+        }
 }
 
 static __always_inline void dsa_wait_no_adjust(const volatile uint8_t *comp)
 {
-	if (wait_method == WAIT_YIELD)
-		dsa_wait_yield(comp);
-	else if (wait_method == WAIT_UMWAIT)
-		dsa_wait_umwait(comp);
-	else
-		dsa_wait_busy_poll(comp);
+    switch (wait_method) {
+        case WAIT_YIELD:
+            dsa_wait_yield(comp);
+            break;
+        case WAIT_UMWAIT:
+            dsa_wait_umwait(comp);
+            break;
+        case WAIT_BUSYPOLL:
+            dsa_wait_busy_poll(comp);
+            break;
+        case WAIT_TPAUSE:
+            dsa_wait_tpause(comp);
+            break;
+        default:
+            dsa_wait_busy_poll(comp);
+    }
 }
 
 /* A simple auto-tuning heuristic.
@@ -439,13 +467,17 @@ static __always_inline void dsa_wait_no_adjust(const volatile uint8_t *comp)
  *      - If cpu_size_fraction not too low, decrease it by CSF_STEP_DECREMENT
  *      - else if dsa_min_size not too low, decrease it by DMS_STEP_DECREMENT
  */
-static __always_inline void dsa_wait_and_adjust(const volatile uint8_t *comp)
+static __always_inline void dsa_wait_and_adjust(const volatile uint8_t *comp, uint16_t in_cache)
 {
 	uint64_t local_num_waits = 0;
 
-	if ((++num_descs & DESCS_PER_RUN) != DESCS_PER_RUN) {
-		while (*comp == 0)
+	//printf("transaction: in_cache=%d, cpu_size_fraction=%zu%%, dsa_min_size=%zu\n",
+	//	in_cache, cpu_size_fraction[in_cache], dsa_min_size);
+
+	if ((++num_descs[in_cache] & DESCS_PER_RUN) != DESCS_PER_RUN) {
+		while (*comp == 0) {
 			__dsa_wait(comp);
+                }
 
 		return;
 	}
@@ -455,36 +487,41 @@ static __always_inline void dsa_wait_and_adjust(const volatile uint8_t *comp)
 		__dsa_wait(comp);
 		local_num_waits++;
 	}
-	adjust_num_descs++;
-	adjust_num_waits += local_num_waits;
 
-	if (adjust_num_descs >= NUM_DESCS) {
-		unsigned long long temp = adjust_num_descs;
+	// operations that have failed (mostly due to page fault) return very quickly and cause the algorithm
+	// to think that the DSA operation was faster than it really was. We exclude them from the calculation.
+	if (*comp != DSA_COMP_SUCCESS) {
+		return;
+	}
 
-		if (temp && atomic_compare_exchange_strong(&adjust_num_descs, &temp, 0)) {
-			double avg_num_waits = (double)adjust_num_waits / temp;
+	adjust_num_descs[in_cache]++;
+	adjust_num_wait[in_cache] += local_num_waits;
 
-			adjust_num_waits = 0;
+	if (adjust_num_descs[in_cache] >= NUM_DESCS) {
+		unsigned long long temp = adjust_num_descs[in_cache];
+
+		if (temp && atomic_compare_exchange_strong(&adjust_num_descs[in_cache], &temp, 0)) {
+			double avg_num_waits = (double)adjust_num_wait[in_cache] / temp;
+
+			adjust_num_wait[in_cache] = 0;
 			if (avg_num_waits > max_avg_waits) {
-				if (cpu_size_fraction < MAX_CPU_SIZE_FRACTION)
-					cpu_size_fraction += CSF_STEP_INCREMENT;
-				else if (dsa_min_size < MAX_DSA_MIN_SIZE)
-					dsa_min_size += DMS_STEP_INCREMENT;
+				if (cpu_size_fraction[in_cache] < MAX_CPU_SIZE_FRACTION)
+					cpu_size_fraction[in_cache] += CSF_STEP_INCREMENT;
 			} else if (avg_num_waits < min_avg_waits) {
-				if (cpu_size_fraction >= CSF_STEP_DECREMENT)
-					cpu_size_fraction -= CSF_STEP_DECREMENT;
-				else if (dsa_min_size > MIN_DSA_MIN_SIZE)
-					dsa_min_size -= DMS_STEP_DECREMENT;
+				if (cpu_size_fraction[in_cache] >= CSF_STEP_DECREMENT)
+					cpu_size_fraction[in_cache] -= CSF_STEP_DECREMENT;
 			}
+			//printf("Auto-tune: in_cache=%d, avg_waits=%.2f, cpu_size_fraction=%zu%%, dsa_min_size=%zu\n",
+			//	in_cache, avg_num_waits, cpu_size_fraction[in_cache], dsa_min_size);
 		}
 	}
 }
 
 static __always_inline int dsa_wait(struct dto_wq *wq,
-	struct dsa_hw_desc *hw, volatile uint8_t *comp)
+	struct dsa_hw_desc *hw, volatile uint8_t *comp, uint16_t in_cache)
 {
 	if (auto_adjust_knobs)
-		dsa_wait_and_adjust(comp);
+		dsa_wait_and_adjust(comp, in_cache);
 	else
 		dsa_wait_no_adjust(comp);
 
@@ -495,8 +532,7 @@ static __always_inline int dsa_wait(struct dto_wq *wq,
 		thr_bytes_completed += thr_comp.bytes_completed;
 		return PAGE_FAULT;
 	}
-
-	LOG_ERROR("failed status %x xfersz %x opcode %d\n", *comp, hw->xfer_size, hw->opcode);
+	LOG_ERROR("failed status %x xfersz %x\n", *comp, hw->xfer_size);
 	return FAIL_OTHERS;
 }
 
@@ -504,7 +540,7 @@ static __always_inline int dsa_submit(struct dto_wq *wq,
 	struct dsa_hw_desc *hw)
 {
 	int ret;
-	//LOG_TRACE("dsa_submit: desc flags: 0x%x, opcode: 0x%x, wq %x descriptor %x\n", hw->flags, hw->opcode, wq, hw);
+	//LOG_TRACE("desc flags: 0x%x, opcode: 0x%x\n", hw->flags, hw->opcode);
 	__builtin_ia32_sfence();
 
 	if (wq->wq_mmapped) {
@@ -540,10 +576,7 @@ static __always_inline int dsa_execute(struct dto_wq *wq,
 			ret = 0;
 	}
 	if (!ret) {
-		if (auto_adjust_knobs)
-			dsa_wait_and_adjust(comp);
-		else
-			dsa_wait_no_adjust(comp);
+		dsa_wait_no_adjust(comp);
 
 		if (*comp == DSA_COMP_SUCCESS) {
 			thr_bytes_completed += hw->xfer_size;
@@ -559,9 +592,14 @@ static __always_inline int dsa_execute(struct dto_wq *wq,
 }
 
 #ifdef DTO_STATS_SUPPORT
-static void update_stats(int op, size_t n, size_t bytes_completed,
+static void update_stats(int op, size_t n, bool overlapping, size_t bytes_completed,
 		uint64_t elapsed_ns, int group, int error_code)
 {
+	// dto_memcpymove didn't actually submit the request to DSA, so there is nothing to log. This will be captured by a second call
+	if (op == MEMMOVE && overlapping && dto_overlapping_memmove_action == OVERLAPPING_CPU && group == DSA_CALL_SUCCESS) {
+		return;
+	}
+
 	int bucket = (n / HIST_BUCKET_SIZE);
 
 	if (bucket >= HIST_NO_BUCKETS)  /* last bucket includes remaining sizes */
@@ -808,8 +846,6 @@ static bool test_write_syscall(struct dto_wq *wq)
 	struct dsa_completion_record comp __attribute__((aligned(32)));
 	int retry = 0;
 
-	//LOG_TRACE("test_write_syscall\n");
-
 	desc.opcode = DSA_OPCODE_NOOP;
 	desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
 	comp.status = 0;
@@ -915,7 +951,6 @@ static int dsa_init_from_wq_list(char *wq_list)
 
 		// map DSA WQ portal
 		wqs[num_wqs].wq_portal = mmap(NULL, 0x1000, PROT_WRITE, MAP_SHARED | MAP_POPULATE,
-		//wqs[num_wqs].wq_portal = mmap(NULL, 0x1000, PROT_WRITE, MAP_PRIVATE | MAP_POPULATE,
 				wqs[num_wqs].wq_fd, 0);
 
 		if (wqs[num_wqs].wq_portal == MAP_FAILED) {
@@ -1127,15 +1162,13 @@ static int dsa_init(void)
 	const char *env_str;
 	char wq_list[256];
 
-	//LOG_TRACE("dsa_init called\n");
-
-	/* detect umwait support */
+	/* detect waitpkg support */
 	leaf = 7;
 	waitpkg = 0;
 	if (__get_cpuid(0, &leaf, unused, &waitpkg, unused + 1)) {
 		if (waitpkg & 0x20) {
-			//LOG_TRACE("umwait supported\n");
-			umwait_support = 1;
+			LOG_TRACE("waitpkg supported\n");
+			waitpkg_support = 1;
 		}
 	}
 
@@ -1146,16 +1179,21 @@ static int dsa_init(void)
 			min_avg_waits = MIN_AVG_POLL_WAITS;
 			max_avg_waits = MAX_AVG_POLL_WAITS;
 		} else if (!strncmp(env_str, wait_names[WAIT_UMWAIT], strlen(wait_names[WAIT_UMWAIT]))) {
-			if (umwait_support) {
+			if (waitpkg_support) {
 				wait_method = WAIT_UMWAIT;
 				/* Use the same waits as busypoll for now */
 				min_avg_waits = MIN_AVG_POLL_WAITS;
 				max_avg_waits = MAX_AVG_POLL_WAITS;
 			} else
 				LOG_ERROR("umwait not supported. Falling back to default wait method\n");
-		} else if (!strncmp(env_str, wait_names[WAIT_SLEEP], strlen(wait_names[WAIT_SLEEP]))) {
-                    wait_method = WAIT_SLEEP;
-		}
+		} else if (!strncmp(env_str, wait_names[WAIT_TPAUSE], strlen(wait_names[WAIT_TPAUSE]))) {
+		    if (waitpkg_support) {
+			wait_method = WAIT_TPAUSE;
+                    } else {
+			LOG_ERROR("tpause not supported. Falling back to busypoll\n");
+                        wait_method = WAIT_BUSYPOLL;
+                    }
+                }
 	}
 
 	env_str = getenv("DTO_WQ_LIST");
@@ -1207,8 +1245,6 @@ static int init_dto(void)
 			if (log_level > LOG_LEVEL_TRACE)
 				log_level = LOG_LEVEL_TRACE;
 		}
-
-		//LOG_TRACE("init_dto called\n");
 
 		// save std c lib function pointers
 		orig_memset = dlsym(RTLD_NEXT, "memset");
@@ -1276,6 +1312,14 @@ static int init_dto(void)
 			dto_dsa_memcmp = !!dto_dsa_memcmp;
 		}
 
+		env_str = getenv("DTO_OVERLAPPING_MEMMOVE_ACTION");
+		if (env_str != NULL) {
+			errno = 0;
+			dto_overlapping_memmove_action = strtoul(env_str, NULL, 10);
+			if (errno)
+				dto_overlapping_memmove_action = OVERLAPPING_CPU;
+		}
+
 #ifdef DTO_STATS_SUPPORT
 		env_str = getenv("DTO_COLLECT_STATS");
 		if (env_str != NULL) {
@@ -1338,7 +1382,8 @@ static int init_dto(void)
 					cpu_size_fraction_float = 0.0;
 				}
 				/* Use only 2 digits after decimal point */
-				cpu_size_fraction = cpu_size_fraction_float * 100;
+				cpu_size_fraction[0] = cpu_size_fraction_float * 100;
+				cpu_size_fraction[1] = cpu_size_fraction_float * 100;
 			}
 
 			env_str = getenv("DTO_AUTO_ADJUST_KNOBS");
@@ -1350,6 +1395,16 @@ static int init_dto(void)
 					auto_adjust_knobs = 1;
 
 				auto_adjust_knobs = !!auto_adjust_knobs;
+			}
+
+			env_str = getenv("DTO_AUTO_ADJUST_USE_SPLIT_ALGORITHM");                
+			if (env_str != NULL) {
+				errno = 0;
+				use_split_algorithm = strtoul(env_str, NULL, 10);
+				if (errno)
+					use_split_algorithm = 1;
+
+				use_split_algorithm = !!use_split_algorithm;
 			}
 
 			if (numa_available() != -1) {
@@ -1377,26 +1432,35 @@ static int init_dto(void)
 				use_std_lib_calls = 1;
 			}
 
-			//sleep mode wait
-			env_str = getenv("DTO_SLEEP_DELAY_US");
-			if (env_str != NULL) {
-				errno = 0;
-				dto_sleep_time_usec = strtoul(env_str, NULL, 10);
-				if (errno || dto_sleep_time_usec == 0)
-					dto_sleep_time_usec = DEFAULT_SLEEP_TIME_USEC;
-			}
+                        // calculate the wait time for TPAUSE
+                        if (wait_method == WAIT_TPAUSE) {
+    			        unsigned int num, den, freq;
+    			        unsigned int empty;
+    			        unsigned long long tmp;
+    			        __get_cpuid( 0x15, &den, &num, &freq, &empty );
+    			        freq /= 1000;
+    			        LOG_TRACE( "Core Freq = %u kHz\n", freq );
+    			        LOG_TRACE( "TSC Mult  = %u\n", num );
+    			        LOG_TRACE( "TSC Den   = %u\n", den );
+    			        freq *= num;
+    			        freq /= den;
+    			        LOG_TRACE( "CPU freq = %u kHz\n", freq );
 
+    			        LOG_TRACE( "Requested wait: %llu nsec\n", tpause_wait_time );
+    			        tmp = tpause_wait_time;
+    			        tmp *= freq;
+    			        tpause_wait_time = tmp / NSEC_PER_MSEC;
+    			        LOG_TRACE( "Requested wait duration: %llu cycles\n", tpause_wait_time );
+                        }
+    
 			// display configuration
-			/*
-			LOG_TRACE("Internal_DTO - log_level: %d, collect_stats: %d, use_std_lib_calls: %d, dsa_min_size: %lu, "
+			LOG_TRACE("log_level: %d, collect_stats: %d, use_std_lib_calls: %d, dsa_min_size: %lu, "
 				"cpu_size_fraction: %.2f, wait_method: %s, auto_adjust_knobs: %d, numa_awareness: %s, dto_dsa_cc: %d\n",
-				//"cpu_size_fraction: %d, wait_method: %s, auto_adjust_knobs: %d, numa_awareness: %s, dto_dsa_cc: %d\n",
 				log_level, collect_stats, use_std_lib_calls, dsa_min_size,
 				cpu_size_fraction_float, wait_names[wait_method], auto_adjust_knobs, numa_aware_names[is_numa_aware], dto_dsa_cc);
 			for (int i = 0; i < num_wqs; i++)
-				LOG_TRACE("[%d] wq_path: %s, wq_size: %d, dsa_cap: %lx, wq pointer %x wq portal %x\n", i,
-					wqs[i].wq_path, wqs[i].wq_size, wqs[i].dsa_gencap,&wqs[i],wqs[i].wq_portal);
-			*/
+				LOG_TRACE("[%d] wq_path: %s, wq_size: %d, dsa_cap: %lx\n", i,
+					wqs[i].wq_path, wqs[i].wq_size, wqs[i].dsa_gencap);
 		}
 		dto_initialized = 1;
 
@@ -1439,46 +1503,45 @@ static __always_inline  struct dto_wq *get_wq(void* buf)
 			if (dev != NULL &&
 				dev->num_wqs > 0) {
 				wq = dev->wqs[dev->next_wq++ % dev->num_wqs];
-
-				//LOG_TRACE("numa aware get WQ %x, next_wq %d, num_wqs %d\n",wq, dev->next_wq, dev->num_wqs);
 			}
 		}
 	}
 
 	if (wq == NULL) {
-		int ind = next_wq++ % num_wqs;
-		wq = &wqs[ind];
-		//wq = &wqs[next_wq++ % num_wqs];
-		//LOG_TRACE("not numa aware get WQ %x, next_wq %d, ind %d, num_wqs %d wqs base address %x\n",wq, next_wq, ind, num_wqs, wqs);
+		wq = &wqs[next_wq++ % num_wqs];
 	}
 
 	return wq;
 }
-
-static void *dto_internal_memset(void *s1, int c, size_t n);
 
 static void dto_memset(void *s, int c, size_t n, int *result)
 {
 	uint64_t memset_pattern;
 	size_t cpu_size, dsa_size;
 	struct dto_wq *wq = get_wq(s);
-	//printf("memset size %d value %x pointer %x\n",n,c,s);
-	//LOG_TRACE("dto_memset size %d value %x pointer %x descriptor %x\n",n,c,s,&thr_desc);
+	uint16_t in_cache = false;
+	uint64_t start, end;
 
 	for (int i = 0; i < 8; ++i)
 		((uint8_t *) &memset_pattern)[i] = (uint8_t) c;
 
 	thr_desc.opcode = DSA_OPCODE_MEMFILL;
 	thr_desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
-	if (dto_dsa_cc && (wq->dsa_gencap & GENCAP_CC_MEMORY)) 
+	if (dto_dsa_cc && (wq->dsa_gencap & GENCAP_CC_MEMORY))
 		thr_desc.flags |= IDXD_OP_FLAG_CC;
 	thr_desc.completion_addr = (uint64_t)&thr_comp;
 	thr_desc.pattern = memset_pattern;
 
-	//printf("fille out descriptor\n");
+	/* cpu_size_fraction guaranteed to be >= 0 and < 1 */
+	if (use_split_algorithm) {
+		volatile uint32_t *test_p = (uint32_t *) s;
+		start = rdtsc();
+		uint32_t test = *test_p;
+		end = rdtsc();
+		in_cache = (end - start) < 200;
+	}
 
-	/* cpu_size_fraction gauranteed to be >= 0 and < 1 */
-	cpu_size = n * cpu_size_fraction / 100;
+	cpu_size = n * cpu_size_fraction[in_cache] / 100;
 	dsa_size = n - cpu_size;
 
 	thr_bytes_completed = 0;
@@ -1486,22 +1549,17 @@ static void dto_memset(void *s, int c, size_t n, int *result)
 		thr_desc.dst_addr = (uint64_t) s + cpu_size;
 		thr_desc.xfer_size = (uint32_t) dsa_size;
 		thr_comp.status = 0;
-
-		//dto_internal_memset(s, c, n);
-
 		*result = dsa_submit(wq, &thr_desc);
-		//printf("submit result %x\n",*result);
 		if (likely(*result == SUCCESS)) {
 			if (cpu_size) {
 				orig_memset(s, c, cpu_size);
 				thr_bytes_completed = cpu_size;
 			}
-			*result = dsa_wait(wq, &thr_desc, &thr_comp.status);
-			//printf("wait result %x\n",*result);
+			*result = dsa_wait(wq, &thr_desc, &thr_comp.status, in_cache);
 		}
 	} else {
 		uint32_t threshold;
-		size_t current_cpu_size_fraction = cpu_size_fraction;  // the cpu_size_fraction might be changed by the auto tune algorithm 
+		size_t current_cpu_size_fraction = cpu_size_fraction[in_cache];  // the cpu_size_fraction might be changed by the auto tune algorithm 
 		threshold = wq->max_transfer_size * 100 / (100 - current_cpu_size_fraction);
 
 		do {
@@ -1523,7 +1581,7 @@ static void dto_memset(void *s, int c, size_t n, int *result)
 					orig_memset(s1, c, cpu_size);
 					thr_bytes_completed += cpu_size;
 				}
-				*result = dsa_wait(wq, &thr_desc, &thr_comp.status);
+				*result = dsa_wait(wq, &thr_desc, &thr_comp.status, in_cache);
 			}
 
 			if (*result != SUCCESS)
@@ -1535,8 +1593,6 @@ static void dto_memset(void *s, int c, size_t n, int *result)
 			 */
 		} while (n >= dsa_min_size);
 	}
-
-	//printf(" -> done\n");
 }
 
 /* For overlapping src & dest buffers in memmove API, we can't split the memmove
@@ -1550,12 +1606,43 @@ static bool is_overlapping_buffers (void *dest, const void *src, size_t n)
 	return true;
 }
 
-static void dto_memcpymove(void *dest, const void *src, size_t n, bool is_memcpy, int *result)
+static bool dto_memcpymove(void *dest, const void *src, size_t n, bool is_memcpy, int *result)
 {
-	struct dto_wq *wq = get_wq(dest);
+	struct dto_wq *wq;
 	size_t cpu_size, dsa_size;
+	bool is_overlapping;
+	uint16_t in_cache = 0;
+	uint64_t start, end;
 
-	//LOG_TRACE("dto_memcpymove size %d src pointer %x dst pointer %x, descriptor %x\n",n,dest,src, &thr_desc);
+	thr_bytes_completed = 0;
+
+	if (!is_memcpy && is_overlapping_buffers(dest, src, n)) {
+		cpu_size = 0;
+		is_overlapping = true;
+	} else {
+		/* cpu_size_fraction guaranteed to be >= 0 and < 1 */
+		if (use_split_algorithm) {
+			volatile uint32_t *test_p = (uint32_t *) src;
+			start = rdtsc();
+			uint32_t test = *test_p;
+			end = rdtsc();
+			in_cache = (end - start) < 200;
+		}
+		cpu_size = n * cpu_size_fraction[in_cache] / 100;
+
+		//cpu_size = n * cpu_size_fraction / 100;
+		is_overlapping = false;
+	}
+
+	// If this is an overlapping memmove and the action is to perform on CPU, return having done nothing and
+	// memmove will perform the copy and correctly attribute statistics to stdlib call group
+	if (is_overlapping && dto_overlapping_memmove_action == OVERLAPPING_CPU) {
+		*result = SUCCESS;
+		return true;
+	}
+
+	dsa_size = n - cpu_size;
+	wq = get_wq(dest);
 
 	thr_desc.opcode = DSA_OPCODE_MEMMOVE;
 	thr_desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
@@ -1563,44 +1650,41 @@ static void dto_memcpymove(void *dest, const void *src, size_t n, bool is_memcpy
 		thr_desc.flags |= IDXD_OP_FLAG_CC;
 	thr_desc.completion_addr = (uint64_t)&thr_comp;
 
-	/* cpu_size_fraction gauranteed to be >= 0 and < 1 */
-	if (!is_memcpy && is_overlapping_buffers(dest, src, n))
-		cpu_size = 0;
-	else
-		cpu_size = n * cpu_size_fraction / 100;
-
-	dsa_size = n - cpu_size;
-
-	thr_bytes_completed = 0;
-
 	if (dsa_size <= wq->max_transfer_size) {
 		thr_desc.src_addr = (uint64_t) src + cpu_size;
 		thr_desc.dst_addr = (uint64_t) dest + cpu_size;
 		thr_desc.xfer_size = (uint32_t) dsa_size;
 		thr_comp.status = 0;
-		*result = dsa_submit(wq, &thr_desc);
-		if (*result == SUCCESS) {
-			if (cpu_size) {
-				if (is_memcpy)
-					orig_memcpy(dest, src, cpu_size);
-				else
-					orig_memmove(dest, src, cpu_size);
-				thr_bytes_completed += cpu_size;
+		if (is_overlapping) {
+			*result = dsa_execute(wq, &thr_desc, &thr_comp.status);
+		} else {
+			*result = dsa_submit(wq, &thr_desc);
+			if (*result == SUCCESS) {
+				if (cpu_size) {
+					if (is_memcpy)
+						orig_memcpy(dest, src, cpu_size);
+					else
+						orig_memmove(dest, src, cpu_size);
+					thr_bytes_completed += cpu_size;
+				}
+				*result = dsa_wait(wq, &thr_desc, &thr_comp.status, in_cache);
 			}
-			*result = dsa_wait(wq, &thr_desc, &thr_comp.status);
 		}
 	} else {
 		uint32_t threshold;
-		size_t current_cpu_size_fraction = cpu_size_fraction;  // the cpu_size_fraction might be changed by the auto tune algorithm 
-		threshold = wq->max_transfer_size * 100 / (100 - current_cpu_size_fraction);
+		size_t current_cpu_size_fraction = cpu_size_fraction[in_cache];  // the cpu_size_fraction might be changed by the auto tune algorithm 
+		if (is_overlapping) {
+			threshold = wq->max_transfer_size;
+		} else {
+			threshold = wq->max_transfer_size * 100 / (100 - current_cpu_size_fraction);
+		}
+
 		do {
 			size_t len;
 
 			len = n <= threshold ? n : threshold;
 
-			if (!is_memcpy && is_overlapping_buffers(dest, src, len))
-				cpu_size = 0;
-			else
+			if (!is_overlapping)
 				cpu_size = len * current_cpu_size_fraction / 100;
 
 			dsa_size = len - cpu_size;
@@ -1609,30 +1693,36 @@ static void dto_memcpymove(void *dest, const void *src, size_t n, bool is_memcpy
 			thr_desc.dst_addr = (uint64_t) dest + cpu_size + thr_bytes_completed;
 			thr_desc.xfer_size = (uint32_t) dsa_size;
 			thr_comp.status = 0;
-			*result = dsa_submit(wq, &thr_desc);
-			if (*result == SUCCESS) {
-				if (cpu_size) {
-					const void *src1 = src + thr_bytes_completed;
-					void *dest1 = dest + thr_bytes_completed;
+			if (is_overlapping){
+				*result = dsa_execute(wq, &thr_desc, &thr_comp.status);
+			} else {
+				*result = dsa_submit(wq, &thr_desc);
+				if (*result == SUCCESS) {
+					if (cpu_size) {
+						const void *src1 = src + thr_bytes_completed;
+						void *dest1 = dest + thr_bytes_completed;
 
-					if (is_memcpy)
-						orig_memcpy(dest1, src1, cpu_size);
-					else
-						orig_memmove(dest1, src1, cpu_size);
-					thr_bytes_completed += cpu_size;
+						if (is_memcpy)
+							orig_memcpy(dest1, src1, cpu_size);
+						else
+							orig_memmove(dest1, src1, cpu_size);
+						thr_bytes_completed += cpu_size;
+					}
+					*result = dsa_wait(wq, &thr_desc, &thr_comp.status, in_cache);
 				}
-				*result = dsa_wait(wq, &thr_desc, &thr_comp.status);
 			}
 
 			if (*result != SUCCESS)
 				break;
 			n -= len;
 			/* If remaining bytes are less than dsa_min_size,
-			 * dont submit to DSA. Instead, complete remaining
-			 * bytes on CPU
-			 */
+			* dont submit to DSA. Instead, complete remaining
+			* bytes on CPU
+			*/
 		} while (n >= dsa_min_size);
 	}
+
+	return is_overlapping;
 }
 
 static int dto_memcmp(const void *s1, const void *s2, size_t n, int *result)
@@ -1640,8 +1730,6 @@ static int dto_memcmp(const void *s1, const void *s2, size_t n, int *result)
 	struct dto_wq *wq = get_wq((void*)s2);
 	int cmp_result = 0;
 	size_t orig_n = n;
-
-	//LOG_TRACE("dto_memcmp size %d pointer1 %x pointer2 %x, descriptor %x\n",n,s1,s2,&thr_desc);
 
 	thr_desc.opcode = DSA_OPCODE_COMPARE;
 	thr_desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
@@ -1684,7 +1772,7 @@ static int dto_memcmp(const void *s1, const void *s2, size_t n, int *result)
 
 		cmp_result = *t1 - *t2;
 		/* Inform the caller than the job is done even though
-		 * we didnt process all the bytes
+		 * we didn't process all the bytes
 		 */
 		thr_bytes_completed = orig_n;
 	}
@@ -1700,8 +1788,6 @@ static void *dto_internal_memset(void *s1, int c, size_t n)
 	char *dest = s1;
 	size_t i;
 
-	//LOG_TRACE("dto_internal_memset size %d value %x pointer %x\n",n,c,s1);
-
 	for (i = 0; i < n; i++)
 		dest[i] = (char)c;
 
@@ -1713,7 +1799,6 @@ static void *dto_internal_memcpymove(void *dest, const void *src, size_t n)
 	char *d = dest;
 	const char *s = (const char *)src;
 	ssize_t i;
-	//LOG_TRACE("dto_memcpymove size %d src pointer %x dst pointer %x\n",n,dest,src);
 
 	if (s >= d) {
 		/* go from beginning to end */
@@ -1734,8 +1819,6 @@ static int dto_internal_memcmp(const void *s1, const void *s2, size_t n)
 	const unsigned char *src2 = (const unsigned char *)s2;
 	size_t i;
 
-	//LOG_TRACE("dto_internal_memcmp size %d pointer1 %x pointer2 %x\n",n,s1,s2);
-
 	for (i = 0; i < n; i++) {
 		if (src1[i] != src2[i])
 			return src1[i] - src2[i];
@@ -1747,9 +1830,6 @@ void *memset(void *s1, int c, size_t n)
 {
 	int result = 0;
 	void *ret = s1;
-
-	//LOG_TRACE("memset size %d value %x pointer %x\n",n,c,s1);
-
 	int use_orig_func = USE_ORIG_FUNC(n, dto_dsa_memset);
 #ifdef DTO_STATS_SUPPORT
 	struct timespec st, et;
@@ -1772,7 +1852,7 @@ void *memset(void *s1, int c, size_t n)
 		dto_memset(s1, c, n, &result);
 
 #ifdef DTO_STATS_SUPPORT
-		DTO_COLLECT_STATS_DSA_END(collect_stats, st, et, MEMSET, n, thr_bytes_completed, result);
+		DTO_COLLECT_STATS_DSA_END(collect_stats, st, et, MEMSET, n, false, thr_bytes_completed, result);
 #endif
 		if (thr_bytes_completed != n) {
 			/* fallback to std call if job is only partially completed */
@@ -1800,8 +1880,6 @@ void *memcpy(void *dest, const void *src, size_t n)
 {
 	int result = 0;
 	void *ret = dest;
-	//LOG_TRACE("memcpy size %d src pointer %x dst pointer %x\n",n,dest,src);
-
 	int use_orig_func = USE_ORIG_FUNC(n, dto_dsa_memcpy);
 #ifdef DTO_STATS_SUPPORT
 	struct timespec st, et;
@@ -1824,7 +1902,7 @@ void *memcpy(void *dest, const void *src, size_t n)
 		dto_memcpymove(dest, src, n, 1, &result);
 
 #ifdef DTO_STATS_SUPPORT
-		DTO_COLLECT_STATS_DSA_END(collect_stats, st, et, MEMCOPY, n, thr_bytes_completed, result);
+		DTO_COLLECT_STATS_DSA_END(collect_stats, st, et, MEMCOPY, n, false, thr_bytes_completed, result);
 #endif
 		if (thr_bytes_completed != n) {
 			/* fallback to std call if job is only partially completed */
@@ -1856,9 +1934,7 @@ void *memmove(void *dest, const void *src, size_t n)
 	int result = 0;
 	void *ret = dest;
 	int use_orig_func = USE_ORIG_FUNC(n, dto_dsa_memmove);
-
-	//LOG_TRACE("memmove size %d src pointer %x dst pointer %x\n",n,dest,src);
-
+	bool is_overlapping;
 #ifdef DTO_STATS_SUPPORT
 	struct timespec st, et;
 	size_t orig_n = n;
@@ -1877,10 +1953,10 @@ void *memmove(void *dest, const void *src, size_t n)
 #ifdef DTO_STATS_SUPPORT
 		DTO_COLLECT_STATS_START(collect_stats, st);
 #endif
-		dto_memcpymove(dest, src, n, 0, &result);
+		is_overlapping = dto_memcpymove(dest, src, n, 0, &result);
 
 #ifdef DTO_STATS_SUPPORT
-		DTO_COLLECT_STATS_DSA_END(collect_stats, st, et, MEMMOVE, n, thr_bytes_completed, result);
+		DTO_COLLECT_STATS_DSA_END(collect_stats, st, et, MEMMOVE, n, is_overlapping, thr_bytes_completed, result);
 #endif
 		if (thr_bytes_completed != n) {
 			/* fallback to std call if job is only partially completed */
@@ -1912,9 +1988,6 @@ int memcmp(const void *s1, const void *s2, size_t n)
 	int result = 0;
 	int ret;
 	int use_orig_func = USE_ORIG_FUNC(n, dto_dsa_memcmp);
-
-	//LOG_TRACE("memcmp size %d pointer1 %x pointer2 %x\n",n,s1,s2);
-
 #ifdef DTO_STATS_SUPPORT
 	struct timespec st, et;
 	size_t orig_n = n;
@@ -1936,7 +2009,7 @@ int memcmp(const void *s1, const void *s2, size_t n)
 		ret = dto_memcmp(s1, s2, n, &result);
 
 #ifdef DTO_STATS_SUPPORT
-		DTO_COLLECT_STATS_DSA_END(collect_stats, st, et, MEMCMP, n, thr_bytes_completed, result);
+		DTO_COLLECT_STATS_DSA_END(collect_stats, st, et, MEMCMP, n, false, thr_bytes_completed, result);
 #endif
 		if (thr_bytes_completed != n) {
 			/* fallback to std call if job is only partially completed */

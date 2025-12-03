@@ -24,6 +24,10 @@ parser.add_argument('--results-dirname', type=str, default=None, help='results d
 parser.add_argument('--dry-run', action='store_true', help='perform a dryrun')
 parser.add_argument('--overwrite', action='store_true', help='overwrite existing test results')
 parser.add_argument('--alg-stats', action='store_true', help='collect algorithm stats')
+parser.add_argument('--alg-stats-latest', action='store_true', help='collect algorithm stats latest values')
+parser.add_argument('--alg-stats-raw-times', action='store_true', help='collect algorithm stats with raw times')
+parser.add_argument('--alg-stats-raw-values', action='store_true', help='collect algorithm stats with raw values')
+parser.add_argument('--alg-stats-access-times', action='store_true', help='collect algorithm stats with access times')
 parser.add_argument('--no-stats', action='store_true', help='do not collect any stats')
 parser.add_argument('--num-dsas', type=int, default=8, help='number of DSA to use')
 parser.add_argument('--max-transaction-size', type=int, default=None, help='maximum transaction size (in KB) to use')
@@ -31,6 +35,7 @@ parser.add_argument('--stats-warmup-steps', type=int, default=0, help='number of
 parser.add_argument('--exclude-pfs', action='store_true', help='exclude DSA transactions with PFs from autotune algorithm')
 parser.add_argument('--same-buffer', action='store_true', help='perform multiple memops in series on same data buffers')
 parser.add_argument('--per-op-instances', action='store_true', help='perform multiple memops in series on same data buffers')
+parser.add_argument('--use-split-alg', action='store_true', help='use split version of auto-adjust algorithm')
 parser.add_argument('--separate-processes', action='store_true', help='spawn separate processes in place of threads')
 parser.add_argument('--perc-buffer-overlap', type=int, default=0, help='percentage overlap in buffers for mov transactions')
 parser.add_argument('--overlap-probability', type=int, default=0, help='probability of overlap as a percentage between 0 and 100')
@@ -40,6 +45,9 @@ parser.add_argument('--dto-version', type=str, default='dev', help='dto version'
 parser.add_argument('--start-cpu', type=int, default=56, help='starting cpu number for taskset')
 parser.add_argument('--cross-numa', action='store_true', help='spread threads onto cpu cores on both numas')
 parser.add_argument('--collect-raw-times', action='store_true', help='collect time of all transactions')
+parser.add_argument('--generate-equivalent-transactions', action='store_true', help='generate equivalent sized transactions for CPU and DSA')
+parser.add_argument('--delay', type=int, default=0, help='delay between transactions in us')
+parser.add_argument('--cpu-dsa', type=str, default='both', help='when generating equivalent transactions, use cpu, dsa, or both')
 
 # Parse the arguments
 args = parser.parse_args()
@@ -117,6 +125,10 @@ num_threads_override=args.num_threads_override
 num_iter = args.num_iter  #10000000 #1000000
 distribution_filepath = args.distribution_filepath
 alg_stats = args.alg_stats
+alg_stats_latest = args.alg_stats_latest
+alg_stats_raw_times = args.alg_stats_raw_times
+alg_stats_raw_values = args.alg_stats_raw_values
+alg_stats_access_times = args.alg_stats_access_times
 no_stats = args.no_stats
 num_dsas= args.num_dsas  #8
 max_transaction_size = args.max_transaction_size
@@ -133,6 +145,10 @@ dto_version = args.dto_version
 taskset_startcpu = args.start_cpu
 cross_numa = args.cross_numa
 collect_raw_times = 1 if args.collect_raw_times else 0
+generate_equivalent_transactions = args.generate_equivalent_transactions
+delay = args.delay
+cpu_dsa = args.cpu_dsa  #'both'  # 'cpu'  # 'dsa'  # 'both'
+use_split_alg = args.use_split_alg
 
 if dto_version == 'dev':
     dto_command_base_settable = ['../dto-test-settable-size-dev5']  
@@ -140,12 +156,16 @@ elif dto_version == 'extern':
     dto_command_base_settable = ['../dto-test-settable-size5']  
 elif dto_version == 'no':
     dto_command_base_settable =  ['../dto-test-settable-size5-nodto'] 
-elif dto_version == 'extern_localq':
-    dto_command_base_settable =  ['../dto-test-settable-size5-localq']
-elif dto_version == 'dev_localq':
-    dto_command_base_settable =  ['../dto-test-settable-size-dev5-localq']
-elif dto_version == 'dev_time':
-    dto_command_base_settable =  ['../dto-test-settable-size-dev5-with-time']
+#elif dto_version == 'extern_localq':
+#    dto_command_base_settable =  ['../dto-test-settable-size5-localq']
+#elif dto_version == 'dev_localq':
+#    dto_command_base_settable =  ['../dto-test-settable-size-dev5-localq']
+#elif dto_version == 'dev_time':
+#    dto_command_base_settable =  ['../dto-test-settable-size-dev5-with-time']
+elif dto_version == 'dev_dsatime':
+    dto_command_base_settable =  ['../dto-test-settable-size-dev5-with-dsa-time']
+#elif dto_version == 'extern_split':
+#    dto_command_base_settable = ['../dto-test-settable-size5-split']  
 
 dto_command_base_distribution = ['../dto-test-distribution-multithread-dev5']
 
@@ -248,6 +268,8 @@ config = {
     "in_cache_probabilities": in_cache_probabilities,
     "collect_raw_times": collect_raw_times,
     "alg_versions": alg_versions,
+    "generate_equivalent_transactions": generate_equivalent_transactions,
+    "use_split_algorithm": use_split_alg
 }
 
 if cfg_filepath is not None:
@@ -356,6 +378,10 @@ if per_op_instances and 'auto' in percentages:
     percentages.append('autop') 
     config["percentages"] = percentages
 
+if generate_equivalent_transactions:
+    equivalent_sizes = [(int(s*float(p)), s-int(s*float(p))) for s in sizes for p in percentages if p not in ['auto','autop','nodsa'] and float(p) < 1.0]
+    config["equivalent_sizes"] = equivalent_sizes
+
 assert len(thread_counts) == len(bursting_thread_counts), "Error: thread_counts length is {} and bursting_thread_counts lenght is {}. They must be equal".format(len(thread_counts), len(bursting_thread_counts))
 
 #assert len(burst_sizes) == len(time_between_bursts_ms), "Error: burst_sizes length is {} and time_between_bursts_ms lenght is {}. They must be equal".format(len(burst_sizes), len(time_between_bursts_ms))
@@ -429,25 +455,45 @@ dto_env['DTO_AUTOTUNE_EXCLUDE_FAILED']='1' if exclude_pfs_from_autotune else '0'
 
 dto_env['DTO_OVERLAPPING_MEMMOVE_ACTION'] = overlapping_memmove_actions[overlapping_move_action]
 
+dto_env['DTO_AUTO_ADJUST_USE_SPLIT_ALGORITHM'] = '1' if use_split_alg else '0'
+
 if output_type == 'DTO-python':
     print("setting up for DTO-python")
     dto_env['DTO_STATS_PREFIX']="'''"
     #dto_env['DTO_STATS_PREFIX']=""
     dto_env['DTO_STATS_OUTPUT_TYPE']='1'
     dto_env['DTO_COLLECT_STATS']='1'
-    if alg_stats:
+    if alg_stats or alg_stats_latest or alg_stats_raw_times or alg_stats_raw_values or dto_version == 'dev_dsatime':
         dto_env['DTO_COLLECT_ALG_STATS']='1'
-        dto_env['DTO_COLLECT_ALG_STATS_LATEST_UPDATES']='1'
-        dto_env['DTO_COLLECT_ALG_STATS_LATEST_CPUFRACTS']='1'
-elif output_type in ['perf', 'micro']:
+    if alg_stats_latest:
+        dto_env['DTO_COLLECT_ALG_STATS_LATEST_VALUES']='1'
+    if alg_stats_raw_times:
+        dto_env['DTO_COLLECT_ALG_STATS_RAW_TIMES']='1'
+    if alg_stats_raw_values:
+        dto_env['DTO_COLLECT_ALG_STATS_RAW_VALUES']='1'
+    if alg_stats_access_times:
+        dto_env['DTO_COLLECT_ALG_STATS_ACCESS_TIMES']='1'
+    if dto_version == 'dev_dsatime':
+        dto_env['DTO_COLLECT_ALG_STATS_DSA_TIMESTAMPS']='1'
+
+elif output_type in ['perf', 'micro', 'emon']:
     dto_env['DTO_STATS_OUTPUT_TYPE']='0'
     if not no_stats:
         dto_env['DTO_COLLECT_STATS']='1'
-        if alg_stats:
+        if alg_stats or alg_stats_latest or alg_stats_raw_times or alg_stats_raw_values or dto_version == 'dev_dsatime':
             dto_env['DTO_COLLECT_ALG_STATS']='1'
-            dto_env['DTO_COLLECT_ALG_STATS_LATEST_UPDATES']='1'
-            dto_env['DTO_COLLECT_ALG_STATS_LATEST_CPUFRACTS']='1'
+            dto_env['DTO_STATS_PREFIX']="'''"
             dto_env['DTO_STATS_OUTPUT_TYPE']='1'
+        if alg_stats_latest:
+            dto_env['DTO_COLLECT_ALG_STATS_LATEST_VALUES']='1'
+        if alg_stats_raw_times:
+            dto_env['DTO_COLLECT_ALG_STATS_RAW_TIMES']='1'
+        if alg_stats_raw_values:
+            dto_env['DTO_COLLECT_ALG_STATS_RAW_VALUES']='1'
+        if alg_stats_access_times:
+            dto_env['DTO_COLLECT_ALG_STATS_ACCESS_TIMES']='1'
+        if dto_version == 'dev_dsatime':
+            dto_env['DTO_COLLECT_ALG_STATS_DSA_TIMESTAMPS']='1'
 
 
 if control_frequencies and not dry_run:
@@ -475,10 +521,11 @@ for alg_version in alg_versions:
 
             for num_threads, num_bursting_threads in zip(thread_counts,bursting_thread_counts):
 
+                extra_cores = 1 if dto_version == 'dev_dsatime' else 0
                 if cross_numa:
-                    cores = list(range(taskset_startcpu-int(np.ceil(num_threads/2)),taskset_startcpu+int(np.ceil(num_threads/2)-1)))
+                    cores = list(range(taskset_startcpu-int(np.ceil(num_threads/2)),taskset_startcpu+int(np.ceil(num_threads/2)-1)+extra_cores))
                 else:
-                    cores = list(range(taskset_startcpu,taskset_startcpu+num_threads))
+                    cores = list(range(taskset_startcpu,taskset_startcpu+num_threads+extra_cores))
 
                 if separate_processes:
                     nt=1
@@ -488,11 +535,19 @@ for alg_version in alg_versions:
                         taskset_commands.append(['taskset', '-c', '{}'.format(cores[p])])
                     ni = int(round(num_iter / num_threads,0))
                 else:
-                    nt = num_threads
-                    nbt = num_bursting_threads
-                    taskset_commands = [['taskset', '-c', '{}-{}'.format(cores[0],cores[-1])]]
-                    ni = num_iter
-
+                    if dto_version == 'dev_dsatime' and num_threads > 1:
+                        nt = [1,num_threads-1]
+                        nbt = num_bursting_threads
+                        taskset_commands = [['taskset', '-c', '{}-{}'.format(cores[0],cores[1])], ['taskset', '-c', '{}-{}'.format(cores[2],cores[-1])]]
+                        #ni = [int(round(num_iter / num_threads,0)), int(round(num_iter / num_threads,0))*(num_threads-1) ]
+                        ni = [num_iter, num_iter*(num_threads-1)]
+                        
+                    else:
+                        nt = num_threads
+                        nbt = num_bursting_threads
+                        taskset_commands = [['taskset', '-c', '{}-{}'.format(cores[0],cores[-1])]]
+                        ni = num_iter
+                        
                 for burst_size in burst_sizes:
                     for time_between_bursts in times_between_bursts_ms:
                         for mem_op in mem_ops:
@@ -531,7 +586,23 @@ for alg_version in alg_versions:
                                                                 dto_env['DTO_IS_NUMA_AWARE']='2'
                                                                 dto_env['DTO_OPPOSITE_NUMA']='1'
 
-                                                        for perc in percentages:
+                                                        if generate_equivalent_transactions:
+                                                            if cpu_dsa == 'cpu':
+                                                                sizes_percs = [(s[0], "nodsa") for s in equivalent_sizes]
+                                                            elif cpu_dsa == 'dsa':
+                                                                sizes_percs = [(s[1], "0.00") for s in equivalent_sizes]
+                                                            else: # both
+                                                                sizes_percs = [(s[0], "nodsa") for s in equivalent_sizes] + [(s[1], "0.00") for s in equivalent_sizes] 
+                                                        else:
+                                                            sizes_percs = [(s, p) for s in sizes for p in percentages]
+
+                                                        #print(equivalent_sizes)
+                                                        #print(sizes_percs)
+
+                                                        #for perc in percentages:
+                                                        for sp in sizes_percs:
+                                                            size = sp[0]
+                                                            perc = sp[1]
                                                             #if perc == 'nodsa' and (numa_config != 'unaware'  or wait != 'yield'):
                                                             #    continue
 
@@ -555,88 +626,134 @@ for alg_version in alg_versions:
                                                                 else:
                                                                     dto_env['DTO_AUTO_ADJUST_KNOBS']='0'
 
-                                                            for size in sizes:
-                                                                if size != 'dist' and scale_buf_sizes_with_tx_size and size != mem_buf_size:
+                                                            #print("size {} mem_buf_size {}".format(size, mem_buf_size))
+                                                            #for size in sizes:
+                                                            if size != 'dist' and scale_buf_sizes_with_tx_size and size > mem_buf_size:
+                                                                continue
+                                                            
+                                                            # In the case of a distribution, we use the distribution filename in place of the size.
+                                                            if size == 'dist':
+                                                                    _,fn = os.path.split(distribution_filepath)
+                                                                    fn,_ = os.path.splitext(fn)
+                                                                    size=fn.replace('_','-')
+
+                                                            if generate_distfile:
+                                                                #print('creating temp disfile {}'.format(individual_ops))
+                                                                create_uniform_dist_file(size, individual_ops,"temp_memop_dist.csv")
+
+                                                            output_name = '{}_{}_{}_{}_{}_{}_{}_{}_{}_{}_{}_{}_{}_{}_{}_{}_{}K'.format(op_name,num_threads,num_bursting_threads,burst_size,time_between_bursts,warmup_time_s,map_numa_config[numa_config],perc.replace(".", "-"),alg_version,map_wait_method[wait],alloc,cache_control,r,num_b,mem_buf_size,in_cache_prob,size)
+                                                            print('processing {}_{}'.format(name,output_name))
+
+                                                            if not dry_run:
+                                                                if not overwrite and os.path.exists(os.path.join(results_dir,'{}_{}_DTO_config.json'.format(name,output_name))):
                                                                     continue
-                                                                
-                                                                # In the case of a distribution, we use the distribution filename in place of the size.
-                                                                if size == 'dist':
-                                                                        _,fn = os.path.split(distribution_filepath)
-                                                                        fn,_ = os.path.splitext(fn)
-                                                                        size=fn.replace('_','-')
+                                                            
+                                                                with open(os.path.join(results_dir,'{}_{}_DTO_config.json'.format(name, output_name)), 'w') as f:
+                                                                    json.dump(dto_env, f, indent=4)
 
-                                                                if generate_distfile:
-                                                                    #print('creating temp disfile {}'.format(individual_ops))
-                                                                    create_uniform_dist_file(size, individual_ops,"temp_memop_dist.csv")
-
-                                                                output_name = '{}_{}_{}_{}_{}_{}_{}_{}_{}_{}_{}_{}_{}_{}_{}_{}_{}K'.format(op_name,num_threads,num_bursting_threads,burst_size,time_between_bursts,warmup_time_s,map_numa_config[numa_config],perc.replace(".", "-"),alg_version,map_wait_method[wait],alloc,cache_control,r,num_b,mem_buf_size,in_cache_prob,size)
-                                                                print('processing {}_{}'.format(name,output_name))
-
-                                                                if not dry_run:
-                                                                    if not overwrite and os.path.exists(os.path.join(results_dir,'{}_{}_DTO_config.json'.format(name,output_name))):
-                                                                        continue
-                                                                
-                                                                    with open(os.path.join(results_dir,'{}_{}_DTO_config.json'.format(name, output_name)), 'w') as f:
-                                                                        json.dump(dto_env, f, indent=4)
-
-                                                                if alloc == 'single':
-                                                                    alloc_size = mem_buf_size*num_b
-                                                                    if distribution_filepath is not None:
-                                                                        dto_command_base = dto_command_base_distribution
-                                                                        dto_command = dto_command_base + [str(nt), str(0), str(ni), str(alloc_size), '1', str(r),numa_alloc_policy[numa_alloc_policy_src], numa_alloc_policy[numa_alloc_policy_dst], str(nbt), str(burst_size), str(time_between_bursts), str(warmup_time_s), str(perc_buffer_overlap), str(overlap_probability), distribution_filepath]
-                                                                    elif generate_distfile:
-                                                                        dto_command_base = dto_command_base_distribution
-                                                                        dto_command = dto_command_base + [str(nt), str(0), str(ni), str(alloc_size), '1', str(r),numa_alloc_policy[numa_alloc_policy_src], numa_alloc_policy[numa_alloc_policy_dst], str(nbt), str(burst_size), str(time_between_bursts), str(warmup_time_s), str(perc_buffer_overlap), str(overlap_probability), "temp_memop_dist.csv"]
-                                                                    else:
-                                                                        dto_command_base = dto_command_base_settable
-                                                                        dto_command = dto_command_base + [str(nt), str(0), str(mem_op), str(size), str(ni), str(alloc_size), '1', str(r), numa_alloc_policy[numa_alloc_policy_src], numa_alloc_policy[numa_alloc_policy_dst], str(nbt), str(burst_size), str(time_between_bursts), str(warmup_time_s), str(perc_buffer_overlap), str(overlap_probability), str(in_cache_prob), str(int(collect_raw_times))]
+                                                            if alloc == 'single':
+                                                                alloc_size = mem_buf_size*num_b
+                                                                if distribution_filepath is not None:
+                                                                    dto_command_base = dto_command_base_distribution
+                                                                    dto_command = dto_command_base + [str(nt), str(delay), str(ni), str(alloc_size), '1', str(r),numa_alloc_policy[numa_alloc_policy_src], numa_alloc_policy[numa_alloc_policy_dst], str(nbt), str(burst_size), str(time_between_bursts), str(warmup_time_s), str(perc_buffer_overlap), str(overlap_probability), distribution_filepath]
+                                                                elif generate_distfile:
+                                                                    dto_command_base = dto_command_base_distribution
+                                                                    dto_command = dto_command_base + [str(nt), str(delay), str(ni), str(alloc_size), '1', str(r),numa_alloc_policy[numa_alloc_policy_src], numa_alloc_policy[numa_alloc_policy_dst], str(nbt), str(burst_size), str(time_between_bursts), str(warmup_time_s), str(perc_buffer_overlap), str(overlap_probability), "temp_memop_dist.csv"]
                                                                 else:
-                                                                    if distribution_filepath is not None:
-                                                                        dto_command_base = dto_command_base_distribution
-                                                                        dto_command = dto_command_base + [str(nt), str(0), str(ni), str(mem_buf_size), str(num_b), str(r),numa_alloc_policy[numa_alloc_policy_src], numa_alloc_policy[numa_alloc_policy_dst], str(nbt), str(burst_size), str(time_between_bursts), str(warmup_time_s), str(perc_buffer_overlap), str(overlap_probability), distribution_filepath]
-                                                                    elif generate_distfile:
-                                                                        dto_command_base = dto_command_base_distribution
-                                                                        dto_command = dto_command_base + [str(nt), str(0), str(ni), str(mem_buf_size), str(num_b), str(r),numa_alloc_policy[numa_alloc_policy_src], numa_alloc_policy[numa_alloc_policy_dst], str(nbt), str(burst_size), str(time_between_bursts), str(warmup_time_s), str(perc_buffer_overlap), str(overlap_probability), "temp_memop_dist.csv"]
-                                                                    else:
-                                                                        dto_command_base = dto_command_base_settable
-                                                                        dto_command = dto_command_base + [str(nt), str(0), str(mem_op), str(size), str(ni), str(mem_buf_size), str(num_b), str(r),numa_alloc_policy[numa_alloc_policy_src], numa_alloc_policy[numa_alloc_policy_dst], str(nbt), str(burst_size), str(time_between_bursts), str(warmup_time_s), str(perc_buffer_overlap), str(overlap_probability), str(in_cache_prob), str(int(collect_raw_times))]
-
-                                                                if output_type == 'emon':
-                                                                    outfile = os.path.join(results_dir,'{}_{}.emon.txt'.format(name,output_name))
-                                                                    errfile = os.path.join(results_dir,'{}_{}.stderr.txt'.format(name,output_name))
-
-                                                                    of = open(outfile,'w')
-                                                                    ef = open(errfile, 'w')
-
-                                                                    dto_process = subprocess.Popen(dto_command, env=dto_env, stdout=1, stderr=1)
-                                                                    time.sleep(5)
-
-                                                                    emon_process = subprocess.Popen(emon_command, stdout=of, stderr=ef)
-                                                                    time.sleep(60)
-
-                                                                    kill_process = subprocess.Popen(['sudo', 'pkill', 'emon'])
-                                                                    kill_dto = subprocess.Popen(['pkill', dto_command_base[0].split('/')[-1]])
-                                                                    ret = kill_process.wait()
-                                                                    ret = kill_dto.wait()
-
-                                                                    emon_process.kill()
-                                                                    dto_process.kill()
-                                                                    of.close()
-                                                                    ef.close()
-
+                                                                    dto_command_base = dto_command_base_settable
+                                                                    dto_command = dto_command_base + [str(nt), str(delay), str(mem_op), str(size), str(ni), str(alloc_size), '1', str(r), numa_alloc_policy[numa_alloc_policy_src], numa_alloc_policy[numa_alloc_policy_dst], str(nbt), str(burst_size), str(time_between_bursts), str(warmup_time_s), str(perc_buffer_overlap), str(overlap_probability), str(in_cache_prob), str(int(collect_raw_times))]
+                                                            else:
+                                                                if distribution_filepath is not None:
+                                                                    dto_command_base = dto_command_base_distribution
+                                                                    dto_command = dto_command_base + [str(nt), str(delay), str(ni), str(mem_buf_size), str(num_b), str(r),numa_alloc_policy[numa_alloc_policy_src], numa_alloc_policy[numa_alloc_policy_dst], str(nbt), str(burst_size), str(time_between_bursts), str(warmup_time_s), str(perc_buffer_overlap), str(overlap_probability), distribution_filepath]
+                                                                elif generate_distfile:
+                                                                    dto_command_base = dto_command_base_distribution
+                                                                    dto_command = dto_command_base + [str(nt), str(delay), str(ni), str(mem_buf_size), str(num_b), str(r),numa_alloc_policy[numa_alloc_policy_src], numa_alloc_policy[numa_alloc_policy_dst], str(nbt), str(burst_size), str(time_between_bursts), str(warmup_time_s), str(perc_buffer_overlap), str(overlap_probability), "temp_memop_dist.csv"]
                                                                 else:
-                                                                    outfiles = []
-                                                                    dto_procs = []
+                                                                    dto_command_base = dto_command_base_settable
+                                                                    dto_command = dto_command_base + [str(nt), str(delay), str(mem_op), str(size), str(ni), str(mem_buf_size), str(num_b), str(r),numa_alloc_policy[numa_alloc_policy_src], numa_alloc_policy[numa_alloc_policy_dst], str(nbt), str(burst_size), str(time_between_bursts), str(warmup_time_s), str(perc_buffer_overlap), str(overlap_probability), str(in_cache_prob), str(int(collect_raw_times))]
 
-                                                                    if separate_processes:
-                                                                        num_proc = num_threads
+                                                            if output_type == 'emon':
+                                                                outfile = os.path.join(results_dir,'{}_{}.emon.txt'.format(name,output_name))
+                                                                errfile = os.path.join(results_dir,'{}_{}.stderr.txt'.format(name,output_name))
+
+                                                                of = open(outfile,'w')
+                                                                ef = open(errfile, 'w')
+                                                                cmd = taskset_commands[0] + dto_command
+                                                                #print(cmd)
+                                                                dto_process = subprocess.Popen(cmd, env=dto_env, stdout=1, stderr=1)
+                                                                time.sleep(60)
+
+                                                                emon_process = subprocess.Popen(emon_command, stdout=of, stderr=ef)
+                                                                time.sleep(5*60)
+
+                                                                kill_process = subprocess.Popen(['sudo', 'pkill', 'emon'])
+                                                                kill_dto = subprocess.Popen(['pkill', dto_command_base[0].split('/')[-1]])
+                                                                ret = kill_process.wait()
+                                                                ret = kill_dto.wait()
+
+                                                                emon_process.kill()
+                                                                dto_process.kill()
+                                                                of.close()
+                                                                ef.close()
+
+                                                            else:
+                                                                outfiles = []
+                                                                dto_procs = []
+
+                                                                if separate_processes:
+                                                                    num_proc = num_threads
+                                                                else:
+                                                                    num_proc = 1
+
+                                                                if dto_version == 'dev_dsatime' and num_threads > 1:
+                                                                    dc = dto_command.copy()
+                                                                    dc[1] = str(nt[0])
+                                                                    dc[5] = str(ni[0])
+                                                                    dc[6] = str(int(alloc_size/num_threads))
+                                                                    
+                                                                    cmd = taskset_commands[0] + dc
+                                                                    cmd.append(str(1))  # monitor dsa
+
+                                                                    if dry_run:
+                                                                        print(' '.join(cmd))
                                                                     else:
-                                                                        num_proc = 1
+                                                                        if output_type in ['DTO-python', 'micro']:
+                                                                            ext = 'py'
+                                                                        else:
+                                                                            ext = 'txt'
+                                                                        
+                                                                        outfile = os.path.join(results_dir,'{}_{}.{}'.format(name,output_name,ext))    
+                                                                        outfiles.append(open(outfile,'w'))
 
+                                                                        if output_type == 'perf':
+                                                                                cmd = perf_command + cmd
+
+                                                                        if output_type in ['DTO-python', 'micro']:
+                                                                            outfiles[0].write("'''\n\n")
+                                                                            outfiles[0].flush()
+                                                                        #print(cmd)
+                                                                        dto_procs.append(subprocess.Popen(cmd, env=dto_env, stdout=outfiles[0], stderr=outfiles[0])) # stdout=1, stderr=1) #
+                                                                    
+                                                                    dc = dto_command.copy()
+                                                                    dc[1] = str(nt[1])
+                                                                    dc[5] = str(ni[1])
+                                                                    dc[6] = str(int(alloc_size/num_threads)*(num_threads-1))
+                                                                    cmd = taskset_commands[1] + dc
+
+                                                                    if dry_run:
+                                                                        print(' '.join(cmd))
+                                                                    else:
+                                                                        dto_procs.append(subprocess.Popen(cmd, env=dto_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+                                                                    
+                                                                else:
                                                                     for p in range(num_proc):
 
                                                                         if run_taskset:
                                                                             cmd = taskset_commands[p] + dto_command
+
+                                                                        if dto_version == 'dev_dsatime':
+                                                                            cmd.append(str(1))  # do not monitor dsa
 
                                                                         if dry_run:
                                                                             print(' '.join(cmd))
@@ -659,15 +776,16 @@ for alg_version in alg_versions:
                                                                         if output_type in ['DTO-python', 'micro']:
                                                                             outfiles[p].write("'''\n\n")
                                                                             outfiles[p].flush()
+                                                                        #print(cmd)
                                                                         dto_procs.append(subprocess.Popen(cmd, env=dto_env, stdout=outfiles[p], stderr=outfiles[p])) # stdout=1, stderr=1) #
 
-                                                                    if not dry_run:
-                                                                        for p in range(num_proc):
-                                                                            ret = dto_procs[p].wait()
-                                                                            time.sleep(1)
-                                                                            outfiles[p].flush()
-                                                                            outfiles[p].close()
-                                                                
+                                                                if not dry_run:
+                                                                    for p in range(num_proc):
+                                                                        ret = dto_procs[p].wait()
+                                                                        time.sleep(1)
+                                                                        outfiles[p].flush()
+                                                                        outfiles[p].close()
+                                                            
                                                                 if not dry_run:
                                                                     time.sleep(1)
 

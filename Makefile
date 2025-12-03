@@ -7,7 +7,13 @@ all: libdto dto-test-wodto
 DML_LIB_CXX=-D_GNU_SOURCE
 
 libdto: dto.c
-	gcc -shared -fPIC -Wl,-soname,libdto.so dto.c $(DML_LIB_CXX) -DDTO_STATS_SUPPORT -o libdto.so.1.0 -laccel-config -ldl -lnuma
+	gcc -shared -fPIC -Wl,-soname,libdto.so dto.c $(DML_LIB_CXX) -DDTO_STATS_SUPPORT -o libdto.so.1.0 -laccel-config -ldl -lnuma -mwaitpkg
+
+libdto2: upstream_dto_max_bw_hill_climb_algo.c
+	gcc -shared -fPIC -Wl,-soname,libdto.so upstream_dto_max_bw_hill_climb_algo.c $(DML_LIB_CXX) -DDTO_STATS_SUPPORT -o libdto.so.1.0 -laccel-config -ldl -lnuma -mwaitpkg
+
+libdto-split: dto_split.c
+	gcc -shared -fPIC -Wl,-soname,libdto-split.so dto_split.c $(DML_LIB_CXX) -DDTO_STATS_SUPPORT -o libdto-split.so.1.0 -laccel-config -ldl -lnuma -mwaitpkg
 
 libdto-localq: extern_dto.c
 	gcc -shared -fPIC -Wl,-soname,libdto-localq.so dto.c $(DML_LIB_CXX) -DDTO_STATS_SUPPORT -o libdto-localq.so.1.0 -laccel-config -ldl -lnuma -mwaitpkg
@@ -35,10 +41,13 @@ libmindto: min_dto.c
 	gcc -shared -fPIC -Wl,-soname,libmindto.so min_dto.c $(DML_LIB_CXX) -DDTO_STATS_SUPPORT -o libmindto.so.1.0 -laccel-config -ldl -lnuma
 
 libdto-dev: dev-dto.c
-	gcc -shared -fPIC -Wl,-soname,libdevdto.so dev-dto.c $(DML_LIB_CXX) -DDTO_STATS_SUPPORT -o libdevdto.so.1.0 -laccel-config -ldl -lnuma
+	gcc -shared -fPIC -Wl,-soname,libdevdto.so dev-dto.c $(DML_LIB_CXX) -DDTO_STATS_SUPPORT -o libdevdto.so.1.0 -laccel-config -ldl -lnuma -mwaitpkg
 
 libdto-dev-with-time: dev-dto-with-time.c
 	gcc -shared -fPIC -Wl,-soname,libdevdto-with-time.so dev-dto-with-time.c $(DML_LIB_CXX) -DDTO_STATS_SUPPORT -o libdevdto-with-time.so.1.0 -laccel-config -ldl -lnuma
+
+libdto-dev-with-dsa-time: dev-dto.c
+	gcc -shared -fPIC -Wl,-soname,libdevdto-with-dsa-time.so dev-dto.c $(DML_LIB_CXX) -DDTO_STATS_SUPPORT -DCOLLECT_DSA_TIMESTAMPS -o libdevdto-with-dsa-time.so.1.0 -laccel-config -ldl -lnuma -mwaitpkg
 
 libdto-dev-with-time-cpu-dsa-portion-flipped: dev-dto.c
 	gcc -shared -fPIC -Wl,-soname,libdevdto.so dev-dto-with-time-cpu-dsa-portion-flipped.c $(DML_LIB_CXX) -DDTO_STATS_SUPPORT -o libdevdto.so.1.0 -laccel-config -ldl -lnuma
@@ -108,6 +117,9 @@ dto-test-set-dev5: dto-test-settable-size5.c
 dto-test-set-dev5-with-time: dto-test-settable-size5.c
 	gcc -g dto-test-settable-size5.c $(DML_LIB_CXX) -o dto-test-settable-size-dev5-with-time -ldevdto-with-time -lpthread -lnuma -L ./
 
+dto-test-set-dev5-with-dsa-time: dto-test-settable-size5-dsa-times.c
+	gcc -g dto-test-settable-size5-dsa-times.c $(DML_LIB_CXX) -o dto-test-settable-size-dev5-with-dsa-time -ldevdto-with-dsa-time -lpthread -lnuma -L ./
+
 dto-test-set-dev5-localq: dto-test-settable-size5.c
 	gcc -g dto-test-settable-size5.c $(DML_LIB_CXX) -o dto-test-settable-size-dev5-localq -ldevdto-localq -lpthread -lnuma -L ./
 
@@ -116,6 +128,9 @@ dto-test-set-dev5_2: dto-test-settable-size5_2.c
 
 dto-test-set5: dto-test-settable-size5.c
 	gcc -g dto-test-settable-size5.c $(DML_LIB_CXX) -o dto-test-settable-size5 -ldto -lpthread -lnuma -L ./
+
+dto-test-set-split5: dto-test-settable-size5.c
+	gcc -g dto-test-settable-size5.c $(DML_LIB_CXX) -o dto-test-settable-size5-split -ldto-split -lpthread -lnuma -L ./
 
 dto-test-set5-localq: dto-test-settable-size5.c
 	gcc -g dto-test-settable-size5.c $(DML_LIB_CXX) -o dto-test-settable-size5-localq -ldto-localq -lpthread -lnuma -L ./

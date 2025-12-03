@@ -32,9 +32,9 @@
 
 #define UMWAIT_DELAY_DEFAULT 100000
 /* C0.1 state */
-#define UMWAIT_STATE 1
-
-#define DEFAULT_SLEEP_TIME_USEC 8  //20 //sleep mode wait
+#define C01_STATE 1
+#define C02_STATE 0
+#define TPAUSE_DELAY 1000
 
 #define USE_ORIG_FUNC(n, use_dsa) (use_std_lib_calls == 1 || !use_dsa || n < dsa_min_size)
 #define TS_NS(s, e) (((e.tv_sec*1000000000) + e.tv_nsec) - ((s.tv_sec*1000000000) + s.tv_nsec))
@@ -48,14 +48,22 @@
  */
 #define MAX_WQS 32
 #define MAX_NUMA_NODES 32
-#define DTO_DEFAULT_MIN_SIZE 8192
-#define DTO_DEFAULT_MAX_SIZE 2097152 
+#define DTO_DEFAULT_MIN_SIZE 65536
 #define DTO_INITIALIZED 0
 #define DTO_INITIALIZING 1
 
+#define NSEC_PER_SEC (1000000000)
+#define MSEC_PER_SEC (1000)
+#define NSEC_PER_MSEC (NSEC_PER_SEC/MSEC_PER_SEC)
 // thread specific variables
 static __thread struct dsa_hw_desc thr_desc;
+
+#ifdef COLLECT_DSA_TIMESTAMPS
+static struct dsa_completion_record thr_comp __attribute__((aligned(32)));       // completion record must be shared with dsa time collection thread
+#else
 static __thread struct dsa_completion_record thr_comp __attribute__((aligned(32)));
+#endif
+
 static __thread uint64_t thr_bytes_completed;
 
 // orignal std memory functions
@@ -86,7 +94,7 @@ enum wait_options {
 	WAIT_BUSYPOLL = 0,
 	WAIT_UMWAIT,
 	WAIT_YIELD, 	//sleep mode wait
-	WAIT_SLEEP
+	WAIT_TPAUSE
 };
 
 enum numa_aware {
@@ -108,6 +116,70 @@ static const char * const numa_aware_names[] = {
 	[NA_CPU_CENTRIC] = "cpu-centric"
 };
 
+static atomic_ullong cycles;
+static atomic_ullong c_ops;
+
+static inline uint64_t
+get_ms(void)
+{
+	struct timeval tp;
+
+	gettimeofday(&tp, NULL);
+
+	return tp.tv_sec*1000+tp.tv_usec/1000;
+}
+
+static __always_inline uint64_t
+rdtsc(void)
+{
+	uint64_t tsc;
+	unsigned int dummy;
+
+	/*
+	 * https://www.felixcloutier.com/x86/rdtscp
+	 * The RDTSCP instruction is not a serializing instruction, but it
+	 * does wait until all previous instructions have executed and all
+	 * previous loads are globally visible
+	 *
+	 * If software requires RDTSCP to be executed prior to execution of
+	 * any subsequent instruction (including any memory accesses), it can
+	 * execute LFENCE immediately after RDTSCP
+	 */
+	tsc = __rdtscp(&dummy);
+	__builtin_ia32_lfence();
+
+	return tsc;
+}
+
+static void
+calibrate(uint64_t *cycles_per_sec)
+{
+	uint64_t  start;
+	uint64_t  end;
+	uint64_t starttick, endtick;
+	uint64_t ms_diff, cycle_diff;
+
+	endtick = get_ms();
+
+	while (endtick == (starttick = get_ms()))
+		;
+
+	// Measure cycle diff for 500 ms 
+	start = rdtsc();
+	while ((endtick = get_ms())  < (starttick + 500))
+		;
+	end = rdtsc();
+
+	cycle_diff = end - start;
+	ms_diff = endtick - starttick;
+
+	// ms * cycles_per_sec = cycle_diff * 1000 
+
+	*cycles_per_sec = (cycle_diff * (uint64_t)1000)/ms_diff;
+}
+
+
+
 // global workqueue variables
 static struct dto_wq wqs[MAX_WQS];
 static struct dto_device* devices[MAX_NUMA_NODES];
@@ -121,8 +193,7 @@ static uint8_t use_std_lib_calls;
 static enum numa_aware is_numa_aware;
 static uint8_t opposite_numa = 0;
 static size_t dsa_min_size = DTO_DEFAULT_MIN_SIZE;
-static size_t dsa_max_size = DTO_DEFAULT_MAX_SIZE;  
-static int wait_method = WAIT_YIELD;
+static int wait_method = WAIT_BUSYPOLL;
 //static size_t cpu_size_fraction;
 
 static uint8_t dto_dsa_memcpy = 1;
@@ -131,17 +202,26 @@ static uint8_t dto_dsa_memset = 1;
 static uint8_t dto_dsa_memcmp = 1;
 
 static uint8_t dto_dsa_cc = 1;
+static bool dto_use_c02 = true; //C02 state is default -
+								//C02 avg exit latency is ~500 ns
+                                //and C01 is about ~240 ns on SPR
 
+#define TPAUSE_C02_DELAY_NS 6000 //in this case we are offloading so delay can
+                                 //be ~6 us as this is around the time a > 64KB 
+                                 //copy takes to complete
+
+#define TPAUSE_C01_DELAY_NS 1000 //keep smaller because we want to wake up
+                                 //with lower latency
+								 
 static uint8_t make_adjustments = 1;
 
 static uint8_t dto_num_autotune_instances = 1;
 static uint8_t dto_per_op_autotune_instances = 0;
 
 static uint64_t dto_stats_num_warmup_ops = 0;
-
+static uint64_t tpause_wait_time = TPAUSE_C02_DELAY_NS;
 
 static unsigned long dto_umwait_delay = UMWAIT_DELAY_DEFAULT;
-static unsigned int dto_sleep_time_usec = DEFAULT_SLEEP_TIME_USEC; //sleep mode wait
 
 static uint8_t autotune_exclude_failed = 0;
 
@@ -170,7 +250,7 @@ static const char * const memop_names[] = {
 #define HIST_BUCKET_SIZE 4096
 #define HIST_NO_BUCKETS 512
 
-// update stats
+// update stats - JJS
 #define HIST_AVG_WAIT_BUCKET_SIZE 0.1
 #define HIST_AVG_WAIT_BUCKETS 512
 #define HIST_CPU_FRACT_BUCKET_SIZE 1
@@ -200,7 +280,7 @@ static const char * const stat_group_names[] = {
 	[DSA_FAIL_CODES] = "failure reason"
 };
 
-static const char * const stat_group_names2[] = {  
+static const char * const stat_group_names2[] = {  //JJS
 	[STDC_CALL] = "stdc",
 	[DSA_CALL_SUCCESS] = "dsa_success",
 	[DSA_CALL_FAILED] = "dsa_failed",
@@ -227,13 +307,16 @@ static const char * const wait_names[] = {
 	[WAIT_BUSYPOLL] = "busypoll",
 	[WAIT_UMWAIT] = "umwait",
 	[WAIT_YIELD] = "yield",
-	[WAIT_SLEEP] = "sleep",  //sleep mode wait
+    [WAIT_TPAUSE] = "tpause"
 };
 
 static int collect_stats;
 static int collect_alg_stats;
-static int collect_alg_stats_latest_updates;
-static int collect_alg_stats_latest_cpufracts;
+static int collect_alg_stats_latest_values;
+static int collect_alg_stats_raw_times;
+static int collect_alg_stats_raw_values;
+static int collect_alg_stats_access_times;
+static int collect_alg_stats_dsa_timestamps;
 
 static char dto_log_path[PATH_MAX];
 static int log_fd = -1;
@@ -253,6 +336,7 @@ enum update_type {
 
 #define INVALID_NUM_WAITS 100000
 #define INVALID_CPU_FRACT 101
+#define INVALID_WAIT_TIME 65535
 
 
 enum numa_stats_type { 
@@ -306,14 +390,14 @@ static __thread uint64_t thr_bytes_completed_cpu;
 		}								\
 	} while (0)								\
 
-static void update_alg_stats(double avg_num_waits, int update_type, int cpu_size_fraction, int dsa_min_size, size_t n, uint8_t alg_instance);
+static void update_alg_stats(double avg_num_waits, uint32_t avg_wait_time, uint32_t avg_cpu_time, uint32_t avg_total_time, int update_type, int cpu_size_fraction, int dsa_min_size, size_t n, uint8_t alg_instance, uint8_t in_cache);
 
-//update stats collection 
-#define DTO_COLLECT_ALG_STATS(cs, avg_num_waits, update_type, cpu_size_fraction, dsa_min_size, trans_size, bucket)			\
+//update stats collection - JJS
+#define DTO_COLLECT_ALG_STATS(cs, avg_num_waits, avg_times, avg_cpu_time, avg_total_time, update_type, cpu_size_fraction, dsa_min_size, trans_size, bucket, in_cache)			\
 	do {	\
 		if (unlikely(cs)) {							\
 			if (global_op_counter >= dto_stats_num_warmup_ops) {   \
-				update_alg_stats(avg_num_waits, update_type, cpu_size_fraction, dsa_min_size, trans_size, bucket);						\
+				update_alg_stats(avg_num_waits, avg_times, avg_cpu_time, avg_total_time, update_type, cpu_size_fraction, dsa_min_size, trans_size, bucket, in_cache);						\
 			} \
 		}  \
 	} while (0)								\
@@ -330,21 +414,41 @@ static atomic_int fail_counter[HIST_NO_BUCKETS][MAX_FAILURES];
 static atomic_int dto_wq_depth[MAX_WQS];
 static atomic_ulong num_dto_requests[HIST_NO_REQS][MAX_WQS];
 
-//update stats collection 
+//update stats collection - JJS
 static atomic_ullong avg_waits_counter[HIST_NO_BUCKETS][HIST_AVG_WAIT_BUCKETS];
 static atomic_ullong cpu_fract_counter[HIST_CPU_FRACT_BUCKETS];
 static atomic_ullong min_size_counter[HIST_MIN_SIZE_BUCKETS];
 static atomic_ullong update_type_counter[MAX_UPDATE_TYPE];
-static atomic_ullong num_adjustment_ops[MAX_AUTOTUNE_OP_TYPES*MAX_AUTOTUNE_INSTANCES];
+static atomic_ullong num_adjustment_ops[MAX_AUTOTUNE_OP_TYPES*MAX_AUTOTUNE_INSTANCES][2];
 
 //static atomic_ullong num_queue_full;
 
 static atomic_ullong global_op_counter = 0; 
+static atomic_ullong dto_op_counter = 0; 
+static atomic_ullong sample_counter = 0;
+static atomic_ullong number_in_cache = 0;
 
 #define NUM_LATEST_UPDATES 100000
+#define MAX_OPS 1000000
 
-static atomic_uint_fast16_t latest_updates[MAX_AUTOTUNE_OP_TYPES*MAX_AUTOTUNE_INSTANCES][NUM_LATEST_UPDATES];
-static atomic_uint_fast8_t latest_cpu_fract[MAX_AUTOTUNE_OP_TYPES*MAX_AUTOTUNE_INSTANCES][NUM_LATEST_UPDATES];
+static atomic_uint_fast16_t latest_updates[MAX_AUTOTUNE_OP_TYPES*MAX_AUTOTUNE_INSTANCES][2][NUM_LATEST_UPDATES];
+static atomic_uint_fast8_t latest_cpu_fract[MAX_AUTOTUNE_OP_TYPES*MAX_AUTOTUNE_INSTANCES][2][NUM_LATEST_UPDATES];
+static atomic_uint_fast16_t latest_avg_times[MAX_AUTOTUNE_OP_TYPES*MAX_AUTOTUNE_INSTANCES][2][NUM_LATEST_UPDATES];
+static atomic_uint_fast16_t latest_avg_cpu_times[MAX_AUTOTUNE_OP_TYPES*MAX_AUTOTUNE_INSTANCES][2][NUM_LATEST_UPDATES];
+static atomic_uint_fast16_t latest_avg_total_times[MAX_AUTOTUNE_OP_TYPES*MAX_AUTOTUNE_INSTANCES][2][NUM_LATEST_UPDATES];
+static atomic_uint_fast16_t raw_wait_times[MAX_OPS];
+static atomic_uint_fast16_t raw_num_waits[MAX_OPS];
+static atomic_uint_fast16_t raw_in_cache[MAX_OPS];
+static atomic_uint_fast32_t raw_cpu_times[MAX_OPS];
+static atomic_uint_fast32_t raw_total_times[MAX_OPS];
+static atomic_uint_fast16_t access_times[MAX_OPS];       
+
+#ifdef COLLECT_DSA_TIMESTAMPS
+static uint64_t op_start_timestamps[MAX_OPS];
+static uint64_t op_end_timestamps[MAX_OPS];
+static uint64_t dsa_end_timestamps[MAX_OPS];
+static uint64_t wait_start_timestamps[MAX_OPS];
+#endif
 
 enum stats_output_types {
 	STATS_TEXT = 0,
@@ -372,7 +476,7 @@ static int get_num_dto_requests(int index) {
 static int init_dto(void) __attribute__((constructor));
 static void cleanup_dto(void) __attribute__((destructor));
 
-static int umwait_support;
+static int waitpkg_support;
 
 static enum {
 	LOG_LEVEL_FATAL,
@@ -403,20 +507,21 @@ static unsigned int log_level = LOG_LEVEL_FATAL;
 #define DMS_STEP_INCREMENT 1024
 #define DMS_STEP_DECREMENT 1024
 
-
 /* Auto tuning variables */
 //static atomic_ullong num_descs;
 //static atomic_ullong adjust_num_descs;
 //static atomic_ullong adjust_num_waits;
 
 struct auto_tune_state {
-	atomic_ullong num_descs;
-	atomic_ullong adjust_num_descs;
-	atomic_ullong adjust_num_waits;
-	atomic_ulong adjust_num_waits_min;  //JJS - min waits
-	size_t cpu_size_fraction;
+	atomic_ullong num_descs[2];
+	atomic_ullong adjust_num_descs[2];
+	atomic_ullong adjust_num_waits[2];
+	size_t cpu_size_fraction[2];
 	uint32_t wq_index_offset;
 	uint32_t num_wqs;
+	uint32_t adjust_wait_time;
+	uint32_t adjust_cpu_time;
+	uint32_t adjust_total_time;
 	atomic_uchar next_wq;
 };
 
@@ -428,7 +533,7 @@ static size_t auto_tune_buckets[MAX_AUTOTUNE_INSTANCES];
 static double min_avg_waits = MIN_AVG_YIELD_WAITS;
 static double max_avg_waits = MAX_AVG_YIELD_WAITS;
 static uint8_t auto_adjust_knobs = 1;
-static uint8_t use_min_waits = 0;                 //JJS - min waits
+static uint8_t use_split_algorithm = 1;
 //static __thread uint8_t adjust = 0;
 //static atomic_uchar dto_updating = 0;
 
@@ -528,33 +633,29 @@ static __always_inline void dsa_wait_busy_poll(const volatile uint8_t *comp)
 	}
 }
 
-static __always_inline void __dsa_wait_umwait(const volatile uint8_t *comp)
+static __always_inline void dsa_wait_tpause(const volatile uint8_t *comp)
 {
-	umonitor(comp);
-
-	// Hardware never writes 0 to this field. Software should initialize this field to 0
-	// so it can detect when the completion record has been written
-	if (*comp == 0) {
-		uint64_t delay = __rdtsc() + dto_umwait_delay;
-
-		umwait(delay, UMWAIT_STATE);
+	while (*comp == 0) {
+            uint64_t delay = _rdtsc() + tpause_wait_time;
+            _tpause(C02_STATE, delay);
 	}
 }
 
-static __always_inline void dsa_wait_umwait(const volatile uint8_t *comp)
+static __always_inline void __dsa_wait_umwait(const volatile uint8_t *comp)
 {
+	_umonitor((void*)comp);
 
-	while (*comp == 0)
-		__dsa_wait_umwait(comp);
+        uint64_t delay = _rdtsc() + UMWAIT_DELAY_DEFAULT;
+	_umwait(C02_STATE, delay);
 }
 
 //sleep mode wait
-static __always_inline void dsa_wait_sleep(const volatile uint8_t *comp)
+static __always_inline void dsa_wait_umwait(const volatile uint8_t *comp)
 {
 	//int count=0;
 	while (*comp == 0) {
 	//		++count;
-	        usleep(dto_sleep_time_usec);	
+	    __dsa_wait_umwait(comp);
         }
 	//if(count>1)
 	//	printf("slept %d\n",count);
@@ -562,49 +663,45 @@ static __always_inline void dsa_wait_sleep(const volatile uint8_t *comp)
 
 static __always_inline void __dsa_wait(const volatile uint8_t *comp)
 {
-	if (wait_method == WAIT_YIELD)
+        switch(wait_method) {
+            case WAIT_YIELD:
 		sched_yield();
-	else if (wait_method == WAIT_UMWAIT)
+                break;
+            case WAIT_UMWAIT:
 		__dsa_wait_umwait(comp);
-	else if (wait_method == WAIT_SLEEP)  //sleep mode wait
-		dsa_wait_sleep(comp);
-	else
+                break;
+            case WAIT_TPAUSE:
+                _tpause( C01_STATE, _rdtsc() + TPAUSE_C01_DELAY_NS); 
+                break;
+            default:
 		_mm_pause();
+        }
 }
 
 static __always_inline void dsa_wait_no_adjust(const volatile uint8_t *comp)
 {
-	if (wait_method == WAIT_YIELD)
+    switch (wait_method) {
+        case WAIT_YIELD:
 		dsa_wait_yield(comp);
-	else if (wait_method == WAIT_UMWAIT)
+            break;
+        case WAIT_UMWAIT:
 		dsa_wait_umwait(comp);
-	else
+            break;
+        case WAIT_BUSYPOLL:
 		dsa_wait_busy_poll(comp);
-}
-
-/*
-static __always_inline uint16_t get_request_size_bucket(size_t size) {
-	for (int i = 0; i < dto_num_autotune_instances; ++i) {
+            break;
+        case WAIT_TPAUSE:
+            dsa_wait_tpause(comp);
 		//LOG_TRACE("get_bucket size %lu i %d bucket edge %lu\n",size,i,auto_tune_buckets[i]);
-		if (size < auto_tune_buckets[i]) {
-			return i;
-		}
-	}
-
-	return dto_num_autotune_instances-1;
+            break;
+		default:
+            dsa_wait_busy_poll(comp);
+    }
 }
-*/
 
 static __always_inline uint16_t get_algorithm_instance(size_t size, uint8_t op) {
 
 	int instance=0;
-
-	/*	
-	if (dto_num_autotune_instances == 1)
-		instance = 0;
-	else
-		instance = get_request_size_bucket(size);
-	*/
 
 	if (dto_per_op_autotune_instances) {
 		//if (op != MEMSET)
@@ -616,6 +713,28 @@ static __always_inline uint16_t get_algorithm_instance(size_t size, uint8_t op) 
 	return instance;
 }
 
+#ifdef COLLECT_DSA_TIMESTAMPS
+void get_comp_field_pointer(const volatile uint8_t **comp)
+{
+    *comp = &thr_comp.status;
+}
+void monitor_dsa_end_times( uint64_t* num_ops, uint64_t max_ops)
+{
+    uint64_t sample = 0;
+    uint8_t previous_comp = thr_comp.status;
+    uint8_t current_comp;
+    while(*num_ops < max_ops) {
+        current_comp = thr_comp.status;
+        if (previous_comp != current_comp) {
+            if(current_comp != 0) {
+                dsa_end_timestamps[sample++] = rdtsc();
+            }
+            previous_comp = current_comp;
+        }
+        _mm_pause();
+    }
+}
+#endif
 
 /* A simple auto-tuning heuristic.
  * Goal of the Heuristic:
@@ -635,35 +754,58 @@ static __always_inline uint16_t get_algorithm_instance(size_t size, uint8_t op) 
  *      - If cpu_size_fraction not too low, decrease it by CSF_STEP_DECREMENT
  *      - else if dsa_min_size not too low, decrease it by DMS_STEP_DECREMENT
  */
-static __always_inline void dsa_wait_and_adjust(const volatile uint8_t *comp, size_t transaction_size, size_t unsplit_size, uint8_t op)
+static __always_inline void dsa_wait_and_adjust(const volatile uint8_t *comp, size_t transaction_size, size_t unsplit_size, uint8_t op, uint64_t start1, uint16_t in_cache)
 {
 	uint64_t local_num_waits = 0;
+	uint64_t start, end, cycles, total_cycles, cpu_cycles;
 
+	number_in_cache += in_cache;
+
+	start = rdtsc();
 	//LOG_TRACE("calling get_algorithm_instance\n");
 	uint16_t bucket = get_algorithm_instance(unsplit_size, op);
 	//LOG_TRACE("get_algorithm_instance returned %u\n",bucket);
 
-	//printf("dsa_wait_and_adjust unsplit size %d\n", unsplit_size);
-	
-	/*
-	if (++auto_tune_states[bucket].num_descs < 128000) {
+	if ((++auto_tune_states[bucket].num_descs[in_cache] & DESCS_PER_RUN) != DESCS_PER_RUN) {
+	//if ((++auto_tune_states[bucket].num_descs % 16) != 0) {
 		//LOG_TRACE("dsa_wait_and_adjust size %lu instance %u num_descs %u returning\n",unsplit_size, bucket, auto_tune_states[bucket].num_descs);
-		while (*comp == 0)
+		while (*comp == 0){
 			__dsa_wait(comp);
+			local_num_waits++;
+		}
+
+		if (collect_alg_stats & (collect_alg_stats_raw_times | collect_alg_stats_dsa_timestamps)) {
+			end = rdtsc();
+			cycles = (end - start);
+			total_cycles = (end - start1);
+			cpu_cycles = start-start1;
+
+			if (collect_alg_stats_raw_times) {
+				raw_cpu_times[dto_op_counter] = cpu_cycles;
+				raw_total_times[dto_op_counter] = total_cycles; 
+				raw_wait_times[dto_op_counter] = cycles;
+			}
+
+			#ifdef COLLECT_DSA_TIMESTAMPS
+			if (collect_alg_stats & collect_alg_stats_dsa_timestamps) {
+				op_start_timestamps[dto_op_counter] = start1;
+				wait_start_timestamps[dto_op_counter] = start;
+				op_end_timestamps[dto_op_counter] = end;
+			}
+			#endif
+		}
+
+		if (collect_alg_stats_raw_values) {
+			raw_num_waits[dto_op_counter] = local_num_waits;
+			raw_in_cache[dto_op_counter] = in_cache;
+		}
+
+		dto_op_counter++;
 
 		return;
-
 	}
 
-	else  */
-	if ((++auto_tune_states[bucket].num_descs & DESCS_PER_RUN) != DESCS_PER_RUN) {
-		//LOG_TRACE("dsa_wait_and_adjust size %lu instance %u num_descs %u returning\n",unsplit_size, bucket, auto_tune_states[bucket].num_descs);
-		while (*comp == 0)
-			__dsa_wait(comp);
-
-		return;
-	}
-	
+	//printf("collect sample num descs %llu,  %d\n",auto_tune_states[bucket].num_descs[in_cache], in_cache);
 
 	/* Run the heuristics as well as wait for DSA */
 	while (*comp == 0) {
@@ -671,60 +813,92 @@ static __always_inline void dsa_wait_and_adjust(const volatile uint8_t *comp, si
 		local_num_waits++;
 	}
 
+	if (collect_alg_stats & (collect_alg_stats_raw_times | collect_alg_stats_dsa_timestamps)) {
+		end = rdtsc();
+		cycles = (end - start);
+		total_cycles = (end - start1);
+		cpu_cycles = start-start1;
+
+		if (collect_alg_stats_raw_times) {
+			raw_cpu_times[dto_op_counter] = cpu_cycles;
+			raw_total_times[dto_op_counter] = total_cycles; 
+			raw_wait_times[dto_op_counter] = cycles;
+		}
+		
+		#ifdef COLLECT_DSA_TIMESTAMPS
+		if (collect_alg_stats & collect_alg_stats_dsa_timestamps) {
+			op_start_timestamps[dto_op_counter] = start1;
+			wait_start_timestamps[dto_op_counter] = start;
+			op_end_timestamps[dto_op_counter] = end;
+		}
+		#endif
+	}
+
+	if (collect_alg_stats_raw_values) {
+		raw_num_waits[dto_op_counter] = local_num_waits;
+		raw_in_cache[dto_op_counter] = in_cache;
+	}
+
+	dto_op_counter++;
+
 	if(autotune_exclude_failed && *comp != DSA_COMP_SUCCESS) {
 		return;
 	}
 
-	if (use_min_waits)
-		auto_tune_states[bucket].adjust_num_waits_min = auto_tune_states[bucket].adjust_num_waits_min < local_num_waits ? auto_tune_states[bucket].adjust_num_waits_min : local_num_waits;   //JJS - min waits
-	else
-		auto_tune_states[bucket].adjust_num_waits += local_num_waits;
+	total_cycles = (end - start1);
+	cpu_cycles = start-start1;
 
-	auto_tune_states[bucket].adjust_num_descs++;
 
-	//printf("bucket %d local_num_waits %d adjust num waits %d adjust num desc %d\n", bucket,local_num_waits, auto_tune_states[bucket].adjust_num_waits, auto_tune_states[bucket].adjust_num_descs);
+	auto_tune_states[bucket].adjust_num_waits[in_cache] += local_num_waits;
+	auto_tune_states[bucket].adjust_num_descs[in_cache]++;
+	
+	auto_tune_states[bucket].adjust_wait_time += cycles;
+	auto_tune_states[bucket].adjust_cpu_time += cpu_cycles;
+	auto_tune_states[bucket].adjust_total_time += total_cycles;
 
-	if (auto_tune_states[bucket].adjust_num_descs >= NUM_DESCS) {
+	//adjust_num_descs++;
+	//adjust_num_waits += local_num_waits;
+
+	//printf("bucket %d local_num_waits %d adjust num waits %d adjust num desc %d\n", bucket,local_num_waits, auto_tune_states[bucket].adjust_num_waits[in_cache], auto_tune_states[bucket].adjust_num_descs[in_cache]);
+
+	if (auto_tune_states[bucket].adjust_num_descs[in_cache] >= NUM_DESCS) {
 		//LOG_TRACE("dsa_wait_and_adjust size %lu instance %u num_descs %u adj_num_desc %u num_waits %u running alg\n",
 		//			unsplit_size, bucket, auto_tune_states[bucket].num_descs, auto_tune_states[bucket].adjust_num_descs,auto_tune_states[bucket].adjust_num_waits);
-		unsigned long long temp = auto_tune_states[bucket].adjust_num_descs;
+		unsigned long long temp = auto_tune_states[bucket].adjust_num_descs[in_cache];
 
-		if (temp && atomic_compare_exchange_strong(&auto_tune_states[bucket].adjust_num_descs, &temp, 0)) {
-			double avg_num_waits;
-			if (use_min_waits) {                                                               //JJS - min waits
-				avg_num_waits = (double)auto_tune_states[bucket].adjust_num_waits_min; 
-				auto_tune_states[bucket].adjust_num_waits_min = 100000;       
-			}
-			else {
-				avg_num_waits = (double)auto_tune_states[bucket].adjust_num_waits / temp;   
-				auto_tune_states[bucket].adjust_num_waits = 0;
-			}
-			//printf("In algorithm bucket %d adjust num waits %d temp %d adjust num desc %d\n", bucket, auto_tune_states[bucket].adjust_num_waits, temp, auto_tune_states[bucket].adjust_num_descs);
-
-			//adjust_num_descs_lt += temp;
-			//adjust_num_waits_lt += adjust_num_waits;
-			//double avg_num_waits_lt = (double)adjust_num_waits_lt / adjust_num_descs_lt;
+		if (temp && atomic_compare_exchange_strong(&auto_tune_states[bucket].adjust_num_descs[in_cache], &temp, 0)) {
+			//printf("Algorithm iteration num descs %llu\n",auto_tune_states[bucket].num_descs);
+			double avg_num_waits = (double)auto_tune_states[bucket].adjust_num_waits[in_cache] / temp;
+			
+			auto_tune_states[bucket].adjust_num_waits[in_cache] = 0;
 
 			int ut = NO_CHANGE;
-			
+
+			//adjust_num_waits = 0;
 			if (make_adjustments) {
 				if (avg_num_waits > max_avg_waits) {
-					if (auto_tune_states[bucket].cpu_size_fraction < MAX_CPU_SIZE_FRACTION) {
-						auto_tune_states[bucket].cpu_size_fraction += CSF_STEP_INCREMENT;
-						//printf("avg num waits %d new cpu fract increased to %d\n",avg_num_waits,auto_tune_states[bucket].cpu_size_fraction);
+					if (auto_tune_states[bucket].cpu_size_fraction[in_cache] < MAX_CPU_SIZE_FRACTION) {
+						auto_tune_states[bucket].cpu_size_fraction[in_cache] += CSF_STEP_INCREMENT;
+						//printf("in cache %d: avg num waits %f new cpu fract increased to %d\n",in_cache,avg_num_waits,auto_tune_states[bucket].cpu_size_fraction[in_cache]);
 						ut = INCR_FRACT;
 					}
 				} else if (avg_num_waits < min_avg_waits) {
-					if (auto_tune_states[bucket].cpu_size_fraction >= CSF_STEP_DECREMENT) {
-						auto_tune_states[bucket].cpu_size_fraction -= CSF_STEP_DECREMENT;
-						//printf("avg num waits %d new cpu fract decreased to %d\n",avg_num_waits,auto_tune_states[bucket].cpu_size_fraction);
+					if (auto_tune_states[bucket].cpu_size_fraction[in_cache] >= CSF_STEP_DECREMENT) {
+						auto_tune_states[bucket].cpu_size_fraction[in_cache] -= CSF_STEP_DECREMENT;
+						//printf("in cache %d: avg num waits %f new cpu fract decreased to %d\n",in_cache,avg_num_waits,auto_tune_states[bucket].cpu_size_fraction[in_cache]);
 						ut = DECR_FRACT;
 					}
 				}
 				//LOG_TRACE("dsa_wait_and_adjust instance %u cpu fract %u\n", bucket, auto_tune_states[bucket].cpu_size_fraction);
 			}
 #ifdef DTO_STATS_SUPPORT
-			DTO_COLLECT_ALG_STATS(collect_alg_stats, avg_num_waits, ut, auto_tune_states[bucket].cpu_size_fraction, dsa_min_size, unsplit_size, bucket);
+			uint32_t avg_wait_time = auto_tune_states[bucket].adjust_wait_time / temp;
+			uint32_t avg_cpu_time = auto_tune_states[bucket].adjust_cpu_time / temp;
+			uint32_t avg_total_time = auto_tune_states[bucket].adjust_total_time / temp;
+			auto_tune_states[bucket].adjust_wait_time = 0;
+			auto_tune_states[bucket].adjust_cpu_time = 0;
+			auto_tune_states[bucket].adjust_total_time = 0;
+			DTO_COLLECT_ALG_STATS(collect_alg_stats, avg_num_waits, avg_wait_time, avg_cpu_time, avg_total_time, ut, auto_tune_states[bucket].cpu_size_fraction[in_cache], dsa_min_size, unsplit_size, bucket, in_cache);
 #endif
 		}
 	}
@@ -735,10 +909,10 @@ static __always_inline void dsa_wait_and_adjust(const volatile uint8_t *comp, si
 }   
 
 static __always_inline int dsa_wait(struct dto_wq *wq,
-	struct dsa_hw_desc *hw, size_t unsplit_size, volatile uint8_t *comp, uint8_t op)
+	struct dsa_hw_desc *hw, size_t unsplit_size, volatile uint8_t *comp, uint8_t op, uint64_t start, uint16_t in_cache)
 {
 	if (auto_adjust_knobs)
-		dsa_wait_and_adjust(comp, hw->xfer_size, unsplit_size, op);
+		dsa_wait_and_adjust(comp, hw->xfer_size, unsplit_size, op, start, in_cache);
 	else
 		dsa_wait_no_adjust(comp);
 
@@ -864,7 +1038,7 @@ static void update_stats(int op, size_t n, uint8_t overlapping, size_t bytes_com
 
 }
 
-static void update_alg_stats(double avg_num_waits, int update_type, int cpu_size_fraction, int dsa_min_size, size_t n, uint8_t alg_instance)
+static void update_alg_stats(double avg_num_waits, uint32_t avg_wait_time, uint32_t avg_cpu_time, uint32_t avg_total_time, int update_type, int cpu_size_fraction, int dsa_min_size, size_t n, uint8_t alg_instance, uint8_t in_cache)
 {
 
 	int size_bucket = (n / HIST_BUCKET_SIZE);
@@ -892,20 +1066,26 @@ static void update_alg_stats(double avg_num_waits, int update_type, int cpu_size
 
 	++update_type_counter[update_type];
 
-	if (collect_alg_stats_latest_updates) {
+	if (collect_alg_stats_latest_values) {
 		if ((uint16_t) avg_num_waits == INVALID_NUM_WAITS)
 			avg_num_waits = avg_num_waits-1;
-		latest_updates[alg_instance][num_adjustment_ops[alg_instance] % NUM_LATEST_UPDATES] = (uint16_t) avg_num_waits;  //update_type;
-		
-	}
-	if (collect_alg_stats_latest_cpufracts)
-		latest_cpu_fract[alg_instance][num_adjustment_ops[alg_instance] % NUM_LATEST_UPDATES] = cpu_size_fraction;
+		latest_updates[alg_instance][in_cache][num_adjustment_ops[alg_instance][in_cache] % NUM_LATEST_UPDATES] = (uint16_t) avg_num_waits;  //update_type;
 
-	++num_adjustment_ops[alg_instance];
+		latest_cpu_fract[alg_instance][in_cache][num_adjustment_ops[alg_instance][in_cache] % NUM_LATEST_UPDATES] = cpu_size_fraction;
+
+		latest_avg_times[alg_instance][in_cache][num_adjustment_ops[alg_instance][in_cache] % NUM_LATEST_UPDATES] = avg_wait_time;
+		latest_avg_cpu_times[alg_instance][in_cache][num_adjustment_ops[alg_instance][in_cache] % NUM_LATEST_UPDATES] = avg_cpu_time;
+		latest_avg_total_times[alg_instance][in_cache][num_adjustment_ops[alg_instance][in_cache] % NUM_LATEST_UPDATES] = avg_total_time;
+
+		++num_adjustment_ops[alg_instance][in_cache];
+	}
 }
 
 static void print_alg_stats(void)
 {
+	LOG_STATS("Non-dict format no longer supported for alg stats\n");
+
+	/*
 	LOG_STATS("avg_num_waits: ");
 
 	for (int b = 0; b < HIST_NO_BUCKETS; ++b) {
@@ -956,33 +1136,14 @@ static void print_alg_stats(void)
 		LOG_STATS("%lld, ", update_type_counter[i]);
 	}
 	LOG_STATS("\n");
-
-	/*
-	LOG_STATS("num_adjustment_ops: %lld,\n",num_adjustment_ops);
-
-	LOG_STATS("latest_updates: ");
-	u_int64_t last;
-	if ((num_adjustment_ops % NUM_LATEST_UPDATES) != 0)
-		last = (num_adjustment_ops % NUM_LATEST_UPDATES) - 1;
-	else
-		last = NUM_LATEST_UPDATES - 1;
-
-	num_adjustment_ops = num_adjustment_ops % NUM_LATEST_UPDATES;
-
-	while (num_adjustment_ops != last) {
-		if (latest_updates[num_adjustment_ops] != INVALID_UPDATE_TYPE)
-			LOG_STATS("%lld, ", latest_updates[num_adjustment_ops]);
-		
-		num_adjustment_ops = (num_adjustment_ops + 1) % NUM_LATEST_UPDATES;
-	}
-	LOG_STATS("%lld, ", latest_updates[last]);
-	LOG_STATS("\n");
-	*/
-	
+*/
 }
 
 static void print_alg_stats_dict(void)
 {
+	LOG_STATS("'dto_ops': %llu,\n",dto_op_counter);
+	LOG_STATS("'ops_in_cache': %llu,\n",number_in_cache);
+
 	LOG_STATS("'avg_num_waits': {");
 
 	for (int b = 0; b < HIST_NO_BUCKETS; ++b) {
@@ -1031,61 +1192,217 @@ static void print_alg_stats_dict(void)
 	}
 	LOG_STATS("],\n");
 
-	LOG_STATS("'num_adjustment_ops': [");
-	for (int i=0;i<MAX_AUTOTUNE_OP_TYPES*MAX_AUTOTUNE_INSTANCES;++i) {
-		LOG_STATS("%lld,",num_adjustment_ops[i]);
-	}
-	LOG_STATS("],\n");
+	if (collect_alg_stats_latest_values) {
+		LOG_STATS("'num_adjustment_ops': {");
+		for (int i=0;i<MAX_AUTOTUNE_OP_TYPES*MAX_AUTOTUNE_INSTANCES;++i) {
+			LOG_STATS("%d:[%lld, %lld],\n",i,num_adjustment_ops[i][0],num_adjustment_ops[i][1]);
+		}
+		LOG_STATS("},\n");
 
-	if (collect_alg_stats_latest_updates) {
 		LOG_STATS("'latest_avg_num_waits': {");
 		for (int i=0;i<MAX_AUTOTUNE_OP_TYPES*MAX_AUTOTUNE_INSTANCES;++i) {
-			LOG_STATS("%d:[",i);
-			u_int64_t last;
-			u_int64_t num = num_adjustment_ops[i];
-			if ((num % NUM_LATEST_UPDATES) != 0)
-				last = (num % NUM_LATEST_UPDATES) - 1;
-			else
-				last = NUM_LATEST_UPDATES - 1;
+			LOG_STATS("%d:{",i);
+			for (int j=0;j<2;++j) {
+				LOG_STATS("%d:[",j);
+				u_int64_t last;
+				u_int64_t num = num_adjustment_ops[i][j];
+				if ((num % NUM_LATEST_UPDATES) != 0)
+					last = (num % NUM_LATEST_UPDATES) - 1;
+				else
+					last = NUM_LATEST_UPDATES - 1;
 
-			num = num % NUM_LATEST_UPDATES;
+				num = num % NUM_LATEST_UPDATES;
 
-			while (num != last) {
-				if (latest_updates[i][num] != INVALID_NUM_WAITS)
-					LOG_STATS("%u, ", latest_updates[i][num]);
-				
-				num = (num + 1) % NUM_LATEST_UPDATES;
-			}
-			LOG_STATS("%u, ", latest_updates[i][last]);
-			LOG_STATS("],\n");
+				while (num != last) {
+					if (latest_updates[i][j][num] != INVALID_NUM_WAITS)
+						LOG_STATS("%u, ", latest_updates[i][j][num]);
+
+					num = (num + 1) % NUM_LATEST_UPDATES;
+				}
+				LOG_STATS("%u, ", latest_updates[i][j][last]);
+				LOG_STATS("],\n");
+			}		
+			LOG_STATS("},\n");
 		}
 		LOG_STATS("},\n");
-	}
 
-	if (collect_alg_stats_latest_cpufracts) {
+		// latest_cpu_fracts follows the same pattern
 		LOG_STATS("'latest_cpu_fracs': {");
 		for (int i=0;i<MAX_AUTOTUNE_OP_TYPES*MAX_AUTOTUNE_INSTANCES;++i) {
-			LOG_STATS("%d:[",i);
-			u_int64_t last;
-			u_int64_t num = num_adjustment_ops[i];
-			if ((num % NUM_LATEST_UPDATES) != 0)
-				last = (num % NUM_LATEST_UPDATES) - 1;
-			else
-				last = NUM_LATEST_UPDATES - 1;
+			LOG_STATS("%d:{",i);
+			for (int j=0;j<2;++j) {
+				LOG_STATS("%d:[",j);
+				u_int64_t last;
+				u_int64_t num = num_adjustment_ops[i][j];
+				if ((num % NUM_LATEST_UPDATES) != 0)
+					last = (num % NUM_LATEST_UPDATES) - 1;
+				else
+					last = NUM_LATEST_UPDATES - 1;
 
-			num = num % NUM_LATEST_UPDATES;
+				num = num % NUM_LATEST_UPDATES;
 
-			while (num != last) {
-				if (latest_cpu_fract[i][num] != INVALID_CPU_FRACT)
-					LOG_STATS("%lld, ", latest_cpu_fract[i][num]);
-				
-				num = (num + 1) % NUM_LATEST_UPDATES;
+				while (num != last) {
+					if (latest_cpu_fract[i][j][num] != INVALID_CPU_FRACT)
+						LOG_STATS("%lld, ", latest_cpu_fract[i][j][num]);
+					
+					num = (num + 1) % NUM_LATEST_UPDATES;
+				}
+				LOG_STATS("%lld, ", latest_cpu_fract[i][j][last]);
+				LOG_STATS("],\n");
 			}
-			LOG_STATS("%lld, ", latest_cpu_fract[i][last]);
+			LOG_STATS("},\n");
+		}
+		LOG_STATS("},\n");
+
+		LOG_STATS("'latest_avg_wait_times': {");
+		for (int i=0;i<MAX_AUTOTUNE_OP_TYPES*MAX_AUTOTUNE_INSTANCES;++i) {
+			LOG_STATS("%d:{",i);
+			for (int j=0;j<2;++j) {
+				LOG_STATS("%d:[",j);
+				u_int64_t last;
+				u_int64_t num = num_adjustment_ops[i][j];
+				if ((num % NUM_LATEST_UPDATES) != 0)
+					last = (num % NUM_LATEST_UPDATES) - 1;
+				else
+					last = NUM_LATEST_UPDATES - 1;
+
+				num = num % NUM_LATEST_UPDATES;
+
+				while (num != last) {
+					if (latest_avg_times[i][j][num] != INVALID_WAIT_TIME)
+						LOG_STATS("%lld, ", latest_avg_times[i][j][num]);
+
+					num = (num + 1) % NUM_LATEST_UPDATES;
+				}
+				LOG_STATS("%lld, ", latest_avg_times[i][j][last]);
+				LOG_STATS("],\n");
+			}
+			LOG_STATS("},\n");
+		}
+		LOG_STATS("},\n");
+
+		LOG_STATS("'latest_avg_cpu_times': {");
+		for (int i=0;i<MAX_AUTOTUNE_OP_TYPES*MAX_AUTOTUNE_INSTANCES;++i) {
+			LOG_STATS("%d:{",i);
+			for (int j=0;j<2;++j) {
+				LOG_STATS("%d:[",j);
+				u_int64_t last;
+				u_int64_t num = num_adjustment_ops[i][j];
+				if ((num % NUM_LATEST_UPDATES) != 0)
+					last = (num % NUM_LATEST_UPDATES) - 1;
+				else
+					last = NUM_LATEST_UPDATES - 1;
+				num = num % NUM_LATEST_UPDATES;
+				while (num != last) {
+					if (latest_avg_cpu_times[i][j][num] != INVALID_WAIT_TIME)
+						LOG_STATS("%lld, ", latest_avg_cpu_times[i][j][num]);
+					num = (num + 1) % NUM_LATEST_UPDATES;
+				}
+				LOG_STATS("%lld, ", latest_avg_cpu_times[i][j][last]);
 			LOG_STATS("],\n");
+			}
+			LOG_STATS("},\n");
+		}
+		LOG_STATS("},\n");
+
+		LOG_STATS("'latest_avg_total_times': {");
+		for (int i=0;i<MAX_AUTOTUNE_OP_TYPES*MAX_AUTOTUNE_INSTANCES;++i) {
+			LOG_STATS("%d:{",i);
+			for (int j=0;j<2;++j) {
+				LOG_STATS("%d:[",j);
+				u_int64_t last;
+				u_int64_t num = num_adjustment_ops[i][j];
+				if ((num % NUM_LATEST_UPDATES) != 0)
+					last = (num % NUM_LATEST_UPDATES) - 1;
+				else
+					last = NUM_LATEST_UPDATES - 1;
+				num = num % NUM_LATEST_UPDATES;
+				while (num != last) {
+					if (latest_avg_total_times[i][j][num] != INVALID_WAIT_TIME)
+						LOG_STATS("%lld, ", latest_avg_total_times[i][j][num]);
+					num = (num + 1) % NUM_LATEST_UPDATES;
+				}
+
+				LOG_STATS("%lld, ", latest_avg_total_times[i][j][last]);
+				LOG_STATS("],\n");
+			}
+			LOG_STATS("},\n");
 		}
 		LOG_STATS("},\n");
 	}
+
+	if (collect_alg_stats_raw_times) {
+
+		LOG_STATS("'all_total_times': [");
+		for (uint64_t i=0;i<dto_op_counter;++i){
+			LOG_STATS("%llu, ", raw_total_times[i]);
+		}
+		LOG_STATS("],\n");
+
+		LOG_STATS("'all_wait_times': [");
+		for (uint64_t i=0;i<dto_op_counter;++i){
+			LOG_STATS("%llu, ", raw_wait_times[i]);
+		}
+		LOG_STATS("],\n");
+
+        LOG_STATS("'all_cpu_times': [");
+		for (uint64_t i=0;i<dto_op_counter;++i){
+			LOG_STATS("%llu, ", raw_cpu_times[i]);
+		}
+		LOG_STATS("],\n");
+	}
+
+	if (collect_alg_stats_access_times) {
+		LOG_STATS("'all_access_times': [");
+		for (uint64_t i=0;i<dto_op_counter;++i){
+			LOG_STATS("%llu, ", access_times[i]);
+		}
+		LOG_STATS("],\n");
+	}
+
+	if (collect_alg_stats_raw_values) {
+		LOG_STATS("'all_num_waits': [");
+		for (uint64_t i=0;i<dto_op_counter;++i){
+			LOG_STATS("%llu, ", raw_num_waits[i]);
+		}
+		LOG_STATS("],\n");
+		LOG_STATS("'all_in_cache': [");
+		for (uint64_t i=0;i<dto_op_counter;++i){
+			LOG_STATS("%llu, ", raw_in_cache[i]);
+		}
+		LOG_STATS("],\n");
+	}
+		
+
+	#ifdef COLLECT_DSA_TIMESTAMPS
+	if (collect_alg_stats_dsa_timestamps) {
+        LOG_STATS("'op_start_timestamps': [");
+		for (uint64_t i=0;i<dto_op_counter;++i){
+			LOG_STATS("%llu, ", op_start_timestamps[i]);
+		}
+		LOG_STATS("],\n");
+        LOG_STATS("'op_end_timestamps': [");
+		for (uint64_t i=0;i<dto_op_counter;++i){
+			LOG_STATS("%llu, ", op_end_timestamps[i]);
+		}
+		LOG_STATS("],\n");
+        LOG_STATS("'dsa_end_timestamps': [");
+		for (uint64_t i=0;i<dto_op_counter;++i){
+			LOG_STATS("%llu, ", dsa_end_timestamps[i]);
+		}
+		LOG_STATS("],\n");
+		LOG_STATS("'wait_start_timestamps': [");
+		for (uint64_t i=0;i<dto_op_counter;++i){
+			LOG_STATS("%llu, ", wait_start_timestamps[i]);
+		}
+		LOG_STATS("],\n");
+	}
+	#endif	
+
+	uint64_t cycles_per_sec;
+	calibrate(&cycles_per_sec);
+	LOG_STATS("'cycles_per_sec': %llu,\n",cycles_per_sec);
+
 }
 
 static void print_stats(void)
@@ -1244,7 +1561,7 @@ static void print_stats(void)
 	//LOG_STATS("Number of DSA Queue Full: %llu\n", num_queue_full);
 
 	if(collect_alg_stats)
-		print_alg_stats();
+		print_alg_stats_dict();
 }
 
 
@@ -1379,231 +1696,7 @@ static void print_stats_old_format(void)
 	}
 }
 
-/*
 
-static void print_stats_backup(void)
-{
-	struct timespec dto_end_time;
-	uint64_t total_memop_time=0;
-
-	if (likely(!collect_stats))
-		return;
-
-	clock_gettime(CLOCK_BOOTTIME, &dto_end_time);
-
-	LOG_STATS("DTO Run Time: %ld ms\n", TS_NS(dto_start_time, dto_end_time)/1000000);
-
-	// display stats
-	for (int t = 0; t < 2; ++t) {
-		if (t == 0)
-			LOG_STATS("\n******** Number of Memory Operations ********\n");
-		else
-			LOG_STATS("\n******** Average Memory Operation Latency (us)  ********\n");
-
-		LOG_STATS("%17s    ", "");
-		for (int g = 0; g < MAX_STAT_GROUP; ++g) {
-			if (t == 0) {
-				if (g == DSA_FAIL_CODES)
-					LOG_STATS("<***** %-13s *****> ", stat_group_names[g]);
-				else
-					LOG_STATS("<******************************** %-13s *********************************> ", stat_group_names[g]);
-			} else {
-				if (g != DSA_FAIL_CODES)
-					LOG_STATS("<******** %-13s ********> ", stat_group_names[g]);
-
-			}
-		}
-		LOG_STATS("\n");
-
-		LOG_STATS("%-17s -- ", "Byte Range");
-		for (int g = 0; g < MAX_STAT_GROUP - 1; ++g) {
-			for (int o = 0; o < MAX_MEMOP; ++o)
-				LOG_STATS("%-13s ", memop_names[o]);
-			if (t == 0) {
-				LOG_STATS("%-13s ", "bytes");
-				LOG_STATS("%-13s ", "bytes_cpu");
-			}
-		}
-		if (t == 0)
-			for (int o = 1; o < MAX_FAILURES; ++o)
-				LOG_STATS("%-6s ", failure_names[o]);
-		LOG_STATS("\n");
-
-		for (int b = 0; b < HIST_NO_BUCKETS; ++b) {
-			bool empty = true;
-
-			for (int g = 0; g < MAX_STAT_GROUP; ++g) {
-				for (int o = 0; o < MAX_MEMOP; ++o) {
-					if (op_counter[b][g][o] != 0) {
-						empty = false;
-						break;
-					}
-				}
-				if (!empty)
-					break;
-			}
-			if (empty)
-				continue;
-
-			if (b < (HIST_NO_BUCKETS-1))
-				LOG_STATS("% 8d-%-8d -- ", b*4096, ((b+1)*4096)-1);
-			else
-				LOG_STATS("   >=%-12d -- ", b*4096);
-
-			for (int g = 0; g < MAX_STAT_GROUP - 1; ++g) {
-				for (int o = 0; o < MAX_MEMOP; ++o) {
-					if (t == 0) {
-						LOG_STATS("%-13lld ", op_counter[b][g][o]);
-						continue;
-					}
-					if (op_counter[b][g][o] != 0) {
-						total_memop_time += (lat_counter[b][g][o]/1000);
-						double avg_us = ((double) lat_counter[b][g][o])/(((double) op_counter[b][g][o]) * 1000.0);
-
-						LOG_STATS("%-8.2f ", avg_us);
-					} else {
-						LOG_STATS("%-8d ", 0);
-					}
-				}
-				if (t == 0) {
-					LOG_STATS("%-13lld ", bytes_counter[b][g]);
-					LOG_STATS("%-13lld ", bytes_counter_cpu[b][g]);
-				}
-			}
-			if (t == 0)
-				for (int o = 1; o < MAX_FAILURES; ++o)
-					LOG_STATS("%-6d ", fail_counter[b][o]);
-			LOG_STATS("\n");
-		}
-	}
-
-	LOG_STATS("Total memory op time %llu\n ",total_memop_time);
-
-	for(int i=0; i < num_wqs; ++i) {
-		LOG_STATS("Work Queue Occupancy %d: ", i);
-		for( int j=0; j<HIST_NO_REQS;++j) {
-			LOG_STATS("%d,",num_dto_requests[j][i]);
-		}
-		LOG_STATS("\n");
-	}
-
-	
-	//LOG_STATS("Numa node counts\n");
-	//LOG_STATS("    MEMESET Destination\n");
-	//for (int i=0;i<num_numa_nodes;++i) 
-	//	LOG_STATS("        Numa %d: %lu\n",i,numa_node_counts[MEMSET_DST][i]);
-	
-	//LOG_STATS("    MEMECPY Source\n");
-	//for (int i=0;i<num_numa_nodes;++i)
-	//	LOG_STATS("        Numa %d: %lu\n",i,numa_node_counts[MEMCPY_SRC][i]);
-	
-	//LOG_STATS("    MEMECPY Destination\n");
-	//for (int i=0;i<num_numa_nodes;++i)
-	//	LOG_STATS("        Numa %d: %lu\n",i,numa_node_counts[MEMCPY_DST][i]);
-
-	
-
-	//LOG_STATS("Number of DSA Queue Full: %llu\n", num_queue_full);
-
-	if(collect_alg_stats)
-		print_alg_stats();
-}
-
-static void print_stats_old_format_backup(void)
-{
-	struct timespec dto_end_time;
-
-	if (likely(!collect_stats))
-		return;
-
-	clock_gettime(CLOCK_BOOTTIME, &dto_end_time);
-
-	LOG_STATS("DTO Run Time: %ld ms\n", TS_NS(dto_start_time, dto_end_time)/1000000);
-
-	// display stats
-	for (int t = 0; t < 2; ++t) {
-		if (t == 0)
-			LOG_STATS("\n******** Number of Memory Operations ********\n");
-		else 
-			LOG_STATS("\n******** Average Memory Operation Latency (us)  ********\n");
-
-		LOG_STATS("%17s    ", "");
-		for (int g = 0; g < MAX_STAT_GROUP; ++g) {
-			if (t == 0) {
-				if (g == DSA_FAIL_CODES)
-					LOG_STATS("<***** %-13s *****> ", stat_group_names[g]);
-				else if(g != DSA_CALL_FAILED_STDC_CALL)
-					LOG_STATS("<*************** %-13s ***************> ", stat_group_names[g]);
-			} else {
-				if (g != DSA_FAIL_CODES && g != DSA_CALL_FAILED_STDC_CALL)
-					LOG_STATS("<******** %-13s ********> ", stat_group_names[g]);
-
-			}
-		}
-		LOG_STATS("\n");
-
-		LOG_STATS("%-17s -- ", "Byte Range");
-		for (int g = 0; g < MAX_STAT_GROUP - 1; ++g) {
-			if (g != DSA_CALL_FAILED_STDC_CALL) {
-				for (int o = 0; o < MAX_MEMOP; ++o)
-					LOG_STATS("%-8s ", memop_names[o]);
-				if (t == 0)
-					LOG_STATS("%-12s ", "bytes");
-			}
-		}
-		if (t == 0)
-			for (int o = 1; o < MAX_FAILURES; ++o)
-				LOG_STATS("%-6s ", failure_names[o]);
-		LOG_STATS("\n");
-
-		for (int b = 0; b < HIST_NO_BUCKETS; ++b) {
-			bool empty = true;
-
-			for (int g = 0; g < MAX_STAT_GROUP; ++g) {
-				for (int o = 0; o < MAX_MEMOP; ++o) {
-					if (op_counter[b][g][o] != 0) {
-						empty = false;
-						break;
-					}
-				}
-				if (!empty)
-					break;
-			}
-			if (empty)
-				continue;
-
-			if (b < (HIST_NO_BUCKETS-1))
-				LOG_STATS("% 8d-%-8d -- ", b*4096, ((b+1)*4096)-1);
-			else
-				LOG_STATS("   >=%-12d -- ", b*4096);
-
-			for (int g = 0; g < MAX_STAT_GROUP - 1; ++g) {
-				if (g != DSA_CALL_FAILED_STDC_CALL) {
-					for (int o = 0; o < MAX_MEMOP; ++o) {
-						if (t == 0) {
-							LOG_STATS("%-8d ", op_counter[b][g][o]);
-							continue;
-						}
-						if (op_counter[b][g][o] != 0) {
-							double avg_us = ((double) lat_counter[b][g][o])/(((double) op_counter[b][g][o]) * 1000.0);
-
-							LOG_STATS("%-8.2f ", avg_us);
-						} else {
-							LOG_STATS("%-8d ", 0);
-						}
-					}
-				}
-				if (t == 0)
-					LOG_STATS("%-12lld ", bytes_counter[b][g]);
-			}
-			if (t == 0)
-				for (int o = 1; o < MAX_FAILURES; ++o)
-					LOG_STATS("%-6d ", fail_counter[b][o]);
-			LOG_STATS("\n");
-		}
-	}
-}
-*/
 
 static void print_stats_dict(void)
 {
@@ -1719,6 +1812,14 @@ static void print_stats_dict(void)
 
 	//LOG_STATS("'num_q_full': %llu,\n", num_queue_full);
 
+	float secs;
+	float latency = 1.0 * cycles / c_ops;
+	uint64_t cycles_per_sec;
+	calibrate(&cycles_per_sec);
+
+	secs = (float)cycles/cycles_per_sec;
+	float latency_ns = (latency * 1E9)/cycles_per_sec;
+
 	if(collect_alg_stats)
 		print_alg_stats_dict();
 	LOG_STATS("}\n");
@@ -1808,31 +1909,6 @@ static void correct_devices_list() {
 		}
 	}
 }
-
-/*
-static __always_inline  int get_numa_node_buf(void* buf) {
-	int numa_node = -1;
-	if (buf != NULL) {
-
-		int status[1] = {-1};
-		// get numa node of memory pointed by buf
-		//if (move_pages(0, 1, &buf, NULL, status, 0) == 0) {
-		//	numa_node = status[0];
-		//} else {
-		//	LOG_ERROR("move_pages call error: %d - %s", errno, strerror(errno));
-		//}
-
-		// alternatively get_mempolicy can be used
-		if (get_mempolicy(&numa_node, NULL, 0, (void *)buf, MPOL_F_NODE | MPOL_F_ADDR) != 0) {
-		 	LOG_ERROR("get_mempolicy call error: %d - %s", errno, strerror(errno));
-		 }
-	} else {
-		LOG_ERROR("NULL buffer delivered. Unable to detect numa node");
-	}
-	return numa_node;
-}
-*/
-
 
 static __always_inline  int get_numa_node(void* buf) {
 	int numa_node = -1;
@@ -2231,8 +2307,8 @@ static int dsa_init(void)
 	waitpkg = 0;
 	if (__get_cpuid(0, &leaf, unused, &waitpkg, unused + 1)) {
 		if (waitpkg & 0x20) {
-			LOG_TRACE("umwait supported\n");
-			umwait_support = 1;
+			LOG_TRACE("waitpkg supported\n");
+			waitpkg_support = 1;
 		}
 	}
 
@@ -2243,7 +2319,7 @@ static int dsa_init(void)
 			min_avg_waits = MIN_AVG_POLL_WAITS;
 			max_avg_waits = MAX_AVG_POLL_WAITS;
 		} else if (!strncmp(env_str, wait_names[WAIT_UMWAIT], strlen(wait_names[WAIT_UMWAIT]))) {
-			if (umwait_support) {
+			if (waitpkg_support) {
 				wait_method = WAIT_UMWAIT;
 				/* Use the same waits as busypoll for now */
 				min_avg_waits = MIN_AVG_POLL_WAITS;
@@ -2251,8 +2327,13 @@ static int dsa_init(void)
 			} else
 				LOG_ERROR("umwait not supported. Falling back to default wait method\n");
 		
-		} else if (!strncmp(env_str, wait_names[WAIT_SLEEP], strlen(wait_names[WAIT_SLEEP]))) {
-                    wait_method = WAIT_SLEEP;
+		} else if (!strncmp(env_str, wait_names[WAIT_TPAUSE], strlen(wait_names[WAIT_TPAUSE]))) {
+		    if (waitpkg_support) {
+			wait_method = WAIT_TPAUSE;
+                    } else {
+			LOG_ERROR("tpause not supported. Falling back to busypoll\n");
+                        wait_method = WAIT_BUSYPOLL;
+                    }
 		}
 	}
 
@@ -2274,6 +2355,9 @@ static int init_dto(void)
 
 	if (atomic_compare_exchange_strong(&dto_initializing, &init_notcomplete, 1)) {
 		char *env_str;
+
+		// TODO: this if for the DSA time collection version
+		thr_comp.status = 1;
 
 		env_str = getenv("DTO_STATS_OUTPUT_TYPE");
 		if (env_str != NULL) {
@@ -2413,7 +2497,8 @@ static int init_dto(void)
 		
 
 			for (int i=0;i<MAX_AUTOTUNE_OP_TYPES*MAX_AUTOTUNE_INSTANCES;++i){
-				num_adjustment_ops[i] = 0;
+				num_adjustment_ops[i][0] = 0;
+				num_adjustment_ops[i][1] = 0;
 			}
 
 			env_str = getenv("DTO_COLLECT_ALG_STATS");
@@ -2434,12 +2519,31 @@ static int init_dto(void)
 					dto_stats_num_warmup_ops = 0;
 			}
 
+			env_str = getenv("DTO_COLLECT_ALG_STATS_LATEST_VALUES");
+			if (env_str != NULL) {
+				errno = 0;
+				collect_alg_stats_latest_values = strtoul(env_str, NULL, 10);
+				if (errno)
+					collect_alg_stats_latest_values = 0;
 
-			for(int j=0;j<MAX_AUTOTUNE_OP_TYPES*MAX_AUTOTUNE_INSTANCES;++j)
-			{
-				for(int i=0;i<NUM_LATEST_UPDATES;++i) {
-					latest_updates[j][i] = INVALID_NUM_WAITS;
-					latest_cpu_fract[j][i] = INVALID_CPU_FRACT;
+				collect_alg_stats_latest_values = !!collect_alg_stats_latest_values;
+			}
+
+			if (collect_alg_stats_latest_values) {
+				for(int j=0;j<MAX_AUTOTUNE_OP_TYPES*MAX_AUTOTUNE_INSTANCES;++j)
+				{
+					for(int i=0;i<NUM_LATEST_UPDATES;++i) {
+						latest_updates[j][0][i] = INVALID_NUM_WAITS;
+						latest_cpu_fract[j][0][i] = INVALID_CPU_FRACT;
+						latest_avg_times[j][0][i] = INVALID_WAIT_TIME;
+						latest_avg_cpu_times[j][0][i] = INVALID_WAIT_TIME;
+						latest_avg_total_times[j][0][i] = INVALID_WAIT_TIME;
+						latest_updates[j][1][i] = INVALID_NUM_WAITS;
+						latest_cpu_fract[j][1][i] = INVALID_CPU_FRACT;
+						latest_avg_times[j][1][i] = INVALID_WAIT_TIME;
+						latest_avg_cpu_times[j][1][i] = INVALID_WAIT_TIME;
+						latest_avg_total_times[j][1][i] = INVALID_WAIT_TIME;
+					}
 				}
 			}
 
@@ -2453,40 +2557,49 @@ static int init_dto(void)
 				stats_prefix[99] = '\0';
 			}
 
-			env_str = getenv("DTO_COLLECT_ALG_STATS_LATEST_UPDATES");
+			env_str = getenv("DTO_COLLECT_ALG_STATS_RAW_VALUES");
 			if (env_str != NULL) {
 				errno = 0;
-				collect_alg_stats_latest_updates = strtoul(env_str, NULL, 10);
+				collect_alg_stats_raw_values = strtoul(env_str, NULL, 10);
 				if (errno)
-					collect_alg_stats_latest_updates = 0;
+					collect_alg_stats_raw_values = 0;
 
-				collect_alg_stats_latest_updates = !!collect_alg_stats_latest_updates;
+				collect_alg_stats_raw_values = !!collect_alg_stats_raw_values;
 			}
 
-			env_str = getenv("DTO_COLLECT_ALG_STATS_LATEST_CPUFRACTS");
+			env_str = getenv("DTO_COLLECT_ALG_STATS_RAW_TIMES");
 			if (env_str != NULL) {
 				errno = 0;
-				collect_alg_stats_latest_cpufracts = strtoul(env_str, NULL, 10);
+				collect_alg_stats_raw_times = strtoul(env_str, NULL, 10);
 				if (errno)
-					collect_alg_stats_latest_cpufracts = 0;
+					collect_alg_stats_raw_times = 0;
 
-				collect_alg_stats_latest_cpufracts = !!collect_alg_stats_latest_cpufracts;
+				collect_alg_stats_raw_times = !!collect_alg_stats_raw_times;
+			}
+
+			env_str = getenv("DTO_COLLECT_ALG_STATS_ACCESS_TIMES");
+			if (env_str != NULL) {
+				errno = 0;
+				collect_alg_stats_access_times = strtoul(env_str, NULL, 10);
+				if (errno)
+					collect_alg_stats_access_times = 0;
+
+				collect_alg_stats_access_times = !!collect_alg_stats_access_times;
+			}
+
+			env_str = getenv("DTO_COLLECT_ALG_STATS_DSA_TIMESTAMPS");
+			if (env_str != NULL) {
+				errno = 0;
+				collect_alg_stats_dsa_timestamps = strtoul(env_str, NULL, 10);
+				if (errno)
+					collect_alg_stats_dsa_timestamps = 0;
+
+				collect_alg_stats_dsa_timestamps = !!collect_alg_stats_dsa_timestamps;
 			}
 		}
 		//num_numa_nodes = numa_num_configured_nodes();
 
 #endif
-		/*
-		env_str = getenv("DTO_NUM_AUTOTUNE_INSTANCES");
-		if (env_str != NULL) {
-			errno = 0;
-			dto_num_autotune_instances = strtoul(env_str, NULL, 10);
-			if (errno)
-				dto_num_autotune_instances = 1;
-			else if (dto_num_autotune_instances > MAX_AUTOTUNE_INSTANCES)
-				dto_num_autotune_instances = MAX_AUTOTUNE_INSTANCES;
-		}
-		*/
 		
 		env_str = getenv("DTO_PER_OP_AUTOTUNE_INSTANCES");
 		if (env_str != NULL) {
@@ -2544,17 +2657,6 @@ static int init_dto(void)
 					dsa_min_size = DTO_DEFAULT_MIN_SIZE;
 			}
 
-
-			env_str = getenv("DTO_MAX_BYTES");   
-
-			if (env_str != NULL) {
-				errno = 0;
-				dsa_max_size = strtoul(env_str, NULL, 10);
-				if (errno)
-					dsa_max_size = DTO_DEFAULT_MAX_SIZE;
-			}
-
-
 			env_str = getenv("DTO_CPU_SIZE_FRACTION");
 			size_t cpu_size_fraction = 33;
 
@@ -2583,18 +2685,15 @@ static int init_dto(void)
 				auto_adjust_knobs = !!auto_adjust_knobs;
 			}
 
-			env_str = getenv("DTO_AUTO_ADJUST_USE_MIN");                //JJS - min waits
-
+			env_str = getenv("DTO_AUTO_ADJUST_USE_SPLIT_ALGORITHM");                
 			if (env_str != NULL) {
 				errno = 0;
-				use_min_waits = strtoul(env_str, NULL, 10);
+				use_split_algorithm = strtoul(env_str, NULL, 10);
 				if (errno)
-					use_min_waits = 1;
+					use_split_algorithm = 1;
 
-				use_min_waits = !!use_min_waits;
+				use_split_algorithm = !!use_split_algorithm;
 			}
-
-			
 
 			if (numa_available() != -1) {
 				env_str = getenv("DTO_IS_NUMA_AWARE");
@@ -2632,14 +2731,26 @@ static int init_dto(void)
 				use_std_lib_calls = 1;
 			}
 
-			//sleep mode wait
-			env_str = getenv("DTO_SLEEP_DELAY_US");
-			if (env_str != NULL) {
-				errno = 0;
-				dto_sleep_time_usec = strtoul(env_str, NULL, 10);
-				if (errno || dto_sleep_time_usec == 0)
-					dto_sleep_time_usec = DEFAULT_SLEEP_TIME_USEC;
-			}
+            if (wait_method == WAIT_TPAUSE) {
+		        unsigned int num, den, freq;
+		        unsigned int empty;
+		        unsigned long long tmp;
+		        __get_cpuid( 0x15, &den, &num, &freq, &empty );
+		        freq /= 1000;
+		        LOG_TRACE( "Core Freq = %u kHz\n", freq );
+		        LOG_TRACE( "TSC Mult  = %u\n", num );
+		        LOG_TRACE( "TSC Den   = %u\n", den );
+				
+				freq *= num;
+		        freq /= den;
+		        LOG_TRACE( "CPU freq = %u kHz\n", freq );
+
+		        LOG_TRACE( "Requested wait: %llu nsec\n", tpause_wait_time );
+		        tmp = tpause_wait_time;
+		        tmp *= freq;
+		        tpause_wait_time = tmp / NSEC_PER_MSEC;
+		        LOG_TRACE( "Requested wait duration: %llu cycles\n", tpause_wait_time );
+            }
 
 			//Allow user to set the number of DSAs to use without having to change the configuration. 
 			// THIS ASSUMES that there is one WQ for each DSA, which doesn't have to be the case!!!!!!!!!!!!!
@@ -2657,10 +2768,11 @@ static int init_dto(void)
 			if (dto_num_wqs > 0)
 				num_wqs = num_wqs < dto_num_wqs ? num_wqs : dto_num_wqs;
 
-			uint32_t range = dsa_max_size - dsa_min_size;
+			struct dto_wq *wq = &wqs[next_wq];
+			uint32_t range = wq->max_transfer_size - dsa_min_size;
 			uint32_t step_size = range / dto_num_autotune_instances;
-			auto_tune_buckets[dto_num_autotune_instances-1] = dsa_max_size;
-			
+			auto_tune_buckets[dto_num_autotune_instances-1] = wq->max_transfer_size;
+
 			//LOG_TRACE("min size %u max size %u range %u step_size %u\n", dsa_min_size, dsa_max_size, range, step_size);
 			//LOG_TRACE("%d:%u\n",0,auto_tune_buckets[0]);
 			for(int i=0; i < dto_num_autotune_instances-1; ++i) {
@@ -2677,11 +2789,11 @@ static int init_dto(void)
 
 			for(int i=0; i < dto_num_autotune_instances; ++i) {
 				for(int j=0; j < MAX_AUTOTUNE_OP_TYPES; ++j) {
-					auto_tune_states[i+(j*MAX_AUTOTUNE_INSTANCES)].cpu_size_fraction = cpu_size_fraction;
+					auto_tune_states[i+(j*MAX_AUTOTUNE_INSTANCES)].cpu_size_fraction[0] = cpu_size_fraction;
+					auto_tune_states[i+(j*MAX_AUTOTUNE_INSTANCES)].cpu_size_fraction[1] = cpu_size_fraction;
 					auto_tune_states[i+(j*MAX_AUTOTUNE_INSTANCES)].wq_index_offset = i*num_wqs_per_bucket;
 					auto_tune_states[i+(j*MAX_AUTOTUNE_INSTANCES)].num_wqs = num_wqs_per_bucket;
 					auto_tune_states[i+(j*MAX_AUTOTUNE_INSTANCES)].next_wq = 0;
-					auto_tune_states[i+(j*MAX_AUTOTUNE_INSTANCES)].adjust_num_waits_min = 100000; // JJS - min waits
 				}
 			}
 
@@ -2727,36 +2839,6 @@ static void cleanup_dto(void)
 	cleanup_devices();
 }
 
-/*
-static __always_inline  struct dto_wq *get_wq_special(void* buf, size_t n, uint32_t thread_id, uint64_t transaction_num)  //, uint8_t op)
-{
-	struct dto_wq* wq = NULL;
-
-	if (is_numa_aware) {
-		int status[1] = {-1};
-
-		// get the numa node for the target DSA device
-		const int numa_node = get_numa_node(buf);
-		if (numa_node >= 0 && numa_node < MAX_NUMA_NODES) {
-			struct dto_device* dev = devices[numa_node];
-			if (dev != NULL &&
-				dev->num_wqs > 0) {
-				wq = dev->wqs[dev->next_wq++ % dev->num_wqs];
-			}
-		}
-	}
-
-	if (wq == NULL) {
-
-		
-		printf("thread %d transaction %llu next wq %d\n",thread_id, transaction_num, next_wq);
-		wq = &wqs[next_wq++ % num_wqs];
-	}
-
-	return wq;
-}
-*/
-
 static __always_inline  struct dto_wq *get_wq(void* buf, size_t n)  //, uint8_t op)
 {
 	struct dto_wq* wq = NULL;
@@ -2777,19 +2859,6 @@ static __always_inline  struct dto_wq *get_wq(void* buf, size_t n)  //, uint8_t 
 
 	if (wq == NULL) {
 
-		/*
-		if (dto_num_autotune_instances == 1)
-			wq = &wqs[next_wq++ % num_wqs];
-
-		else {
-
-			uint16_t instance = get_algorithm_instance(n, 0);  //uint8_t op);
-			wq = &wqs[auto_tune_states[instance].next_wq];
-			//printf("size %d alg instance %d wq %d\n",n,instance,auto_tune_states[instance].next_wq);
-
-			auto_tune_states[instance].next_wq = ((auto_tune_states[instance].next_wq+1) % auto_tune_states[instance].num_wqs) + auto_tune_states[instance].wq_index_offset;
-		}
-		*/
 		//printf("next wq %d\n",next_wq);
 		wq = &wqs[next_wq++ % num_wqs];
 	}
@@ -2801,7 +2870,8 @@ static void dto_memset(void *s, int c, size_t n, int *result)
 {
 	//LOG_TRACE("dto_memset size %d value %x pointer %x descriptor %x\n",n,c,s,&thr_desc);
 	
-	uint64_t memset_pattern;
+	uint64_t memset_pattern, start, end;
+	uint16_t in_cache = false;
 	size_t cpu_size, dsa_size, unsplit_size;
 	struct dto_wq *wq = get_wq(s, n);
 
@@ -2815,10 +2885,21 @@ static void dto_memset(void *s, int c, size_t n, int *result)
 	thr_desc.completion_addr = (uint64_t)&thr_comp;
 	thr_desc.pattern = memset_pattern;
 
+	if (use_split_algorithm) {
+		volatile uint32_t *test_p = (uint32_t *) s;
+		start = rdtsc();
+		uint32_t test = *test_p;
+		end = rdtsc();
+		in_cache = (end - start) < 200;
+	}
+
+	if (collect_alg_stats_access_times)
+			access_times[dto_op_counter] = end - start;
+
 	/* cpu_size_fraction gauranteed to be >= 0 and < 1 */
 	//uint16_t bucket = get_algorithm_instance(n);
 	//LOG_TRACE("got bucket %d\n", bucket);
-	size_t cpu_size_fraction = auto_tune_states[get_algorithm_instance(n,MEMSET)].cpu_size_fraction;
+	size_t cpu_size_fraction = auto_tune_states[get_algorithm_instance(n,MEMSET)].cpu_size_fraction[in_cache];
 	//LOG_TRACE("dto_memset size %d cpu fraction %d, alg instance %u\n",n,cpu_size_fraction,get_algorithm_instance(n,MEMSET));
 	cpu_size = n * cpu_size_fraction / 100;
 	dsa_size = n - cpu_size;
@@ -2828,15 +2909,13 @@ static void dto_memset(void *s, int c, size_t n, int *result)
 	thr_bytes_completed_cpu = 0;
 #endif
 
-	int max_transfer_size = dsa_max_size < wq->max_transfer_size ? dsa_max_size : wq->max_transfer_size;  
-
-	//if (dsa_size <= wq->max_transfer_size) {
-	if (dsa_size <= max_transfer_size) {  
+	if (dsa_size <= wq->max_transfer_size) {
 		thr_desc.dst_addr = (uint64_t) s + cpu_size;
 		thr_desc.xfer_size = (uint32_t) dsa_size;
 		thr_comp.status = 0;
 		unsplit_size = n;
 		//LOG_TRACE("dto_memset size %d \n",unsplit_size);
+		start = rdtsc();
 		*result = dsa_submit(wq, &thr_desc, 1);
 		if (likely(*result == SUCCESS)) {
 			if (cpu_size) {
@@ -2846,11 +2925,12 @@ static void dto_memset(void *s, int c, size_t n, int *result)
 				thr_bytes_completed_cpu = cpu_size;
 #endif
 			}
-			*result = dsa_wait(wq, &thr_desc, unsplit_size, &thr_comp.status, MEMSET);
+			*result = dsa_wait(wq, &thr_desc, unsplit_size, &thr_comp.status, MEMSET, start, in_cache);
 		}
 	} else {
 		uint32_t threshold;
-		threshold = max_transfer_size * 100 / (100 - cpu_size_fraction);
+		size_t current_cpu_size_fraction = cpu_size_fraction;  // the cpu_size_fraction might be changed by the auto tune algorithm 
+		threshold = wq->max_transfer_size * 100 / (100 - current_cpu_size_fraction);
 		//LOG_TRACE("dto_memset size %d value %x in the loop\n",n,c);
 
 		do {
@@ -2866,6 +2946,7 @@ static void dto_memset(void *s, int c, size_t n, int *result)
 			thr_desc.dst_addr = (uint64_t) s + cpu_size + thr_bytes_completed;
 			thr_desc.xfer_size = (uint32_t) dsa_size;
 			thr_comp.status = 0;
+			start = rdtsc();
 			*result = dsa_submit(wq, &thr_desc, 1);
 			if (*result == SUCCESS) {
 				if (cpu_size) {
@@ -2877,7 +2958,7 @@ static void dto_memset(void *s, int c, size_t n, int *result)
 					thr_bytes_completed_cpu += cpu_size;
 #endif
 				}
-				*result = dsa_wait(wq, &thr_desc, unsplit_size, &thr_comp.status, MEMSET);
+				*result = dsa_wait(wq, &thr_desc, unsplit_size, &thr_comp.status, MEMSET,start, in_cache);
 			}
 
 			if (*result != SUCCESS)
@@ -2902,142 +2983,10 @@ static bool is_overlapping_buffers (void *dest, const void *src, size_t n)
 	return true;
 }
 
-/*
-static uint8_t dto_memcpymove_special(void *dest, const void *src, size_t n, bool is_memcpy, int *result, uint32_t thread_id, uint64_t transaction_num)
-{
-	struct dto_wq *wq = get_wq(dest, n);
-	size_t cpu_size, dsa_size, unsplit_size;
-	char is_overlapping = 0;
-
-	//printf("work queue %d \n",wq->index);
-
-	//printf("thread id %d transaction %llu work queue %d \n",thread_id, transaction_num, wq->index);
-
-	thr_desc.opcode = DSA_OPCODE_MEMMOVE;
-	thr_desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
-	if (dto_dsa_cc && (wq->dsa_gencap & GENCAP_CC_MEMORY))
-		thr_desc.flags |= IDXD_OP_FLAG_CC;
-	thr_desc.completion_addr = (uint64_t)&thr_comp;
-
-	uint8_t op;
-	if (is_memcpy)
-		op = MEMCOPY;
-	else
-		op = MEMMOVE;
-
-	size_t cpu_size_fraction = auto_tune_states[get_algorithm_instance(n,op)].cpu_size_fraction;
-
-	//LOG_TRACE("dto_memcpymove size %d cpu fraction %d alg instance %u\n",n,cpu_size_fraction,get_algorithm_instance(n,MEMCOPY));
-	
-	if (!is_memcpy && is_overlapping_buffers(dest, src, n)) {
-		cpu_size = 0;
-		is_overlapping = 1;
-	}
-	else {
-		cpu_size = n * cpu_size_fraction / 100;
-	}
-
-	dsa_size = n - cpu_size;
-
-	thr_bytes_completed = 0;
-
-#ifdef DTO_STATS_SUPPORT
-	thr_bytes_completed_cpu = 0;
-#endif
-
-	int max_transfer_size = dsa_max_size < wq->max_transfer_size ? dsa_max_size : wq->max_transfer_size;  
-
-	//printf("size %u max tranfer size %u\n",n,max_transfer_size);
-
-	//if (dsa_size <= wq->max_transfer_size) {
-	if (dsa_size <= max_transfer_size) {  
-		thr_desc.src_addr = (uint64_t) src + cpu_size;
-		thr_desc.dst_addr = (uint64_t) dest + cpu_size;
-		thr_desc.xfer_size = (uint32_t) dsa_size;
-		thr_comp.status = 0;
-		unsplit_size = n;
-		//LOG_TRACE("dto_memcpy size %d \n",unsplit_size);
-		if (is_overlapping){
-			if (dto_overlapping_memmove_action == OVERLAPPING_DSA) {
-				*result = dsa_execute(wq, &thr_desc, &thr_comp.status);
-			} else {
-				thr_bytes_completed = 0;
-				*result = SUCCESS;
-			}
-		} else {
-			*result = dsa_submit(wq, &thr_desc, 1);
-			if (*result == SUCCESS) {
-				if (cpu_size) {
-					if (is_memcpy)
-						orig_memcpy(dest, src, cpu_size);
-					else
-						orig_memmove(dest, src, cpu_size);
-					thr_bytes_completed += cpu_size;
-#ifdef DTO_STATS_SUPPORT
-					thr_bytes_completed_cpu += cpu_size ;
-#endif
-				}
-				*result = dsa_wait(wq, &thr_desc,  unsplit_size, &thr_comp.status,op);
-			}
-		}
-	} else {
-		uint32_t threshold;
-		threshold = max_transfer_size * 100 / (100 - cpu_size_fraction);
-
-		do {
-			size_t len;
-
-			len = n <= threshold ? n : threshold;
-
-			if (!is_memcpy && is_overlapping_buffers(dest, src, len))
-				cpu_size = 0;
-			else
-				cpu_size = len * cpu_size_fraction / 100;
-
-			dsa_size = len - cpu_size;
-
-			thr_desc.src_addr = (uint64_t) src + cpu_size + thr_bytes_completed;
-			thr_desc.dst_addr = (uint64_t) dest + cpu_size + thr_bytes_completed;
-			thr_desc.xfer_size = (uint32_t) dsa_size;
-			thr_comp.status = 0;
-			unsplit_size = len;
-			//LOG_TRACE("dto_memcpy size %d \n",unsplit_size);
-			if (is_overlapping){
-				*result = dsa_execute(wq, &thr_desc, &thr_comp.status);
-			}
-			else{
-				*result = dsa_submit(wq, &thr_desc, 1);
-				if (*result == SUCCESS) {
-					if (cpu_size) {
-						const void *src1 = src + thr_bytes_completed;
-						void *dest1 = dest + thr_bytes_completed;
-
-						if (is_memcpy)
-							orig_memcpy(dest1, src1, cpu_size);
-						else
-							orig_memmove(dest1, src1, cpu_size);
-						thr_bytes_completed += cpu_size;
-#ifdef DTO_STATS_SUPPORT
-						thr_bytes_completed_cpu += cpu_size ;
-#endif
-					}
-					*result = dsa_wait(wq, &thr_desc,  unsplit_size, &thr_comp.status, op);
-				}
-			}
-
-			if (*result != SUCCESS)
-				break;
-			n -= len;
-			
-		} while (n >= dsa_min_size);
-	}
-	return wq->index;
-}
-
-*/
-
 static uint8_t dto_memcpymove(void *dest, const void *src, size_t n, bool is_memcpy, int *result)
 {
+	uint64_t start, end;
+	uint16_t in_cache = 0;
 	struct dto_wq *wq = get_wq(dest, n);
 	size_t cpu_size, dsa_size, unsplit_size;
 	char is_overlapping = 0;
@@ -3056,7 +3005,15 @@ static uint8_t dto_memcpymove(void *dest, const void *src, size_t n, bool is_mem
 	else
 		op = MEMMOVE;
 
-	size_t cpu_size_fraction = auto_tune_states[get_algorithm_instance(n,op)].cpu_size_fraction;
+	if (use_split_algorithm) {
+		volatile uint32_t *test_p = (uint32_t *) src;
+		start = rdtsc();
+		uint32_t test = *test_p;
+		end = rdtsc();
+		in_cache = (end - start) < 200;
+	}
+
+	size_t cpu_size_fraction = auto_tune_states[get_algorithm_instance(n,op)].cpu_size_fraction[in_cache];
 
 	//LOG_TRACE("dto_memcpymove size %d cpu fraction %d alg instance %u\n",n,cpu_size_fraction,get_algorithm_instance(n,MEMCOPY));
 	/* cpu_size_fraction gauranteed to be >= 0 and < 1 */
@@ -3065,8 +3022,12 @@ static uint8_t dto_memcpymove(void *dest, const void *src, size_t n, bool is_mem
 		is_overlapping = 1;
 	}
 	else {
+		if (collect_alg_stats_access_times)
+			access_times[dto_op_counter] = end - start;
 		cpu_size = n * cpu_size_fraction / 100;
 	}
+
+	//printf("in cache %d, cpu percentage %d, cpu_size %d\n", in_cache, cpu_size_fraction, cpu_size);
 
 	dsa_size = n - cpu_size;
 
@@ -3076,12 +3037,9 @@ static uint8_t dto_memcpymove(void *dest, const void *src, size_t n, bool is_mem
 	thr_bytes_completed_cpu = 0;
 #endif
 
-	int max_transfer_size = dsa_max_size < wq->max_transfer_size ? dsa_max_size : wq->max_transfer_size;  
-
 	//printf("size %u max tranfer size %u\n",n,max_transfer_size);
 
-	//if (dsa_size <= wq->max_transfer_size) {
-	if (dsa_size <= max_transfer_size) {  
+	if (dsa_size <= wq->max_transfer_size) {
 		thr_desc.src_addr = (uint64_t) src + cpu_size;
 		thr_desc.dst_addr = (uint64_t) dest + cpu_size;
 		thr_desc.xfer_size = (uint32_t) dsa_size;
@@ -3096,6 +3054,7 @@ static uint8_t dto_memcpymove(void *dest, const void *src, size_t n, bool is_mem
 				*result = SUCCESS;
 			}
 		} else {
+			start = rdtsc();
 			*result = dsa_submit(wq, &thr_desc, 1);
 			if (*result == SUCCESS) {
 				if (cpu_size) {
@@ -3108,12 +3067,17 @@ static uint8_t dto_memcpymove(void *dest, const void *src, size_t n, bool is_mem
 					thr_bytes_completed_cpu += cpu_size ;
 #endif
 				}
-				*result = dsa_wait(wq, &thr_desc,  unsplit_size, &thr_comp.status,op);
+				*result = dsa_wait(wq, &thr_desc,  unsplit_size, &thr_comp.status,op,start, in_cache);
 			}
 		}
 	} else {
 		uint32_t threshold;
-		threshold = max_transfer_size * 100 / (100 - cpu_size_fraction);
+		size_t current_cpu_size_fraction = cpu_size_fraction;  // the cpu_size_fraction might be changed by the auto tune algorithm 
+		if (is_overlapping) {
+			threshold = wq->max_transfer_size;
+		} else {
+			threshold = wq->max_transfer_size * 100 / (100 - current_cpu_size_fraction);
+		}
 
 		do {
 			size_t len;
@@ -3137,6 +3101,7 @@ static uint8_t dto_memcpymove(void *dest, const void *src, size_t n, bool is_mem
 				*result = dsa_execute(wq, &thr_desc, &thr_comp.status);
 			}
 			else{
+				start = rdtsc();
 				*result = dsa_submit(wq, &thr_desc, 1);
 				if (*result == SUCCESS) {
 					if (cpu_size) {
@@ -3152,7 +3117,7 @@ static uint8_t dto_memcpymove(void *dest, const void *src, size_t n, bool is_mem
 						thr_bytes_completed_cpu += cpu_size ;
 #endif
 					}
-					*result = dsa_wait(wq, &thr_desc,  unsplit_size, &thr_comp.status, op);
+					*result = dsa_wait(wq, &thr_desc,  unsplit_size, &thr_comp.status, op, start, in_cache);
 				}
 			}
 
@@ -3181,10 +3146,7 @@ static int dto_memcmp(const void *s1, const void *s2, size_t n, int *result)
 
 	thr_bytes_completed = 0;
 
-	int max_transfer_size = dsa_max_size < wq->max_transfer_size ? dsa_max_size : wq->max_transfer_size;  
-
-	//if (n <= wq->max_transfer_size) {
-	if (n <= max_transfer_size) {  
+	if (n <= wq->max_transfer_size) {
 		thr_desc.src_addr = (uint64_t) s1;
 		thr_desc.src2_addr = (uint64_t) s2;
 		thr_desc.xfer_size = (uint32_t) n;
@@ -3193,8 +3155,7 @@ static int dto_memcmp(const void *s1, const void *s2, size_t n, int *result)
 		do {
 			size_t len;
 
-			//len = n <= wq->max_transfer_size ? n : wq->max_transfer_size;
-			len = n <= max_transfer_size ? n : max_transfer_size;  
+			len = n <= wq->max_transfer_size ? n : wq->max_transfer_size;
 
 			thr_desc.src_addr = (uint64_t) s1 + thr_bytes_completed;
 			thr_desc.src2_addr = (uint64_t) s2 + thr_bytes_completed;
@@ -3296,9 +3257,9 @@ void *memset(void *s1, int c, size_t n)
 
 #ifdef DTO_STATS_SUPPORT
 if (unlikely(collect_stats)) {
-	if (global_op_counter < dto_stats_num_warmup_ops) {  
+	//if (global_op_counter < dto_stats_num_warmup_ops) {  
 			++ global_op_counter;  
-	}
+	//}
 	/*
 	else {
 		if (unlikely(collect_stats)) {
@@ -3356,92 +3317,6 @@ if (unlikely(collect_stats)) {
 	return ret;
 }
 
-/*
-uint8_t memcpy_special(void *dest, const void *src, size_t n, uint32_t thread_id, uint64_t transaction_num)
-{
-	int result = 0;
-	void *ret = dest;
-	int use_orig_func = USE_ORIG_FUNC(n, dto_dsa_memcpy);
-#ifdef DTO_STATS_SUPPORT
-	struct timespec st, et;
-	size_t orig_n = n;
-#endif
-
-	uint8_t wq_index;
-
-	//LOG_TRACE("memcpy size %d src %x dest %x\n",n,src,dest);
-
-	if (unlikely(dto_initialized == 0)) {
-		
-		return dto_internal_memcpymove(dest, src, n);
-	}
-
-
-#ifdef DTO_STATS_SUPPORT
-	if (unlikely(collect_stats)) {
-		if (global_op_counter < dto_stats_num_warmup_ops) {  
-				++ global_op_counter;  
-		}
-		//else { 
-		//	if (n >= dsa_min_size) {
-				//LOG_TRACE("memcpy src numa node %d dest numa node %d\n",get_numa_node_buf((void*)src),get_numa_node_buf(dest));
-		//		numa_node_counts[MEMCPY_DST][get_numa_node_buf(dest)]++;
-		//		numa_node_counts[MEMCPY_SRC][get_numa_node_buf((void*)src)]++;
-		//	}
-		//}
-	}
-#endif
-
-
-	if (!use_orig_func) {
-#ifdef DTO_STATS_SUPPORT
-		DTO_COLLECT_STATS_START(collect_stats, st);
-#endif
-		wq_index = dto_memcpymove_special(dest, src, n, 1, &result,thread_id, transaction_num);
-
-#ifdef DTO_STATS_SUPPORT
-		DTO_COLLECT_STATS_DSA_END(collect_stats, st, et, MEMCOPY, n, 0, thr_bytes_completed, thr_bytes_completed_cpu, result);
-#endif
-		if (thr_bytes_completed != n) {
-			
-			//use_orig_func = 1;
-			n -= thr_bytes_completed;
-			if (thr_comp.result == 0) {
-				dest = (void *)((uint64_t)dest + thr_bytes_completed);
-				src = (const void *)((uint64_t)src + thr_bytes_completed);
-			}
-
-			// Add call to orig_memset here, so we can keep track of the stats for this case separately from the case where
-			// orig_memset was called from the start
-#ifdef DTO_STATS_SUPPORT
-			DTO_COLLECT_STATS_START(collect_stats, st);
-#endif
-
-			orig_memcpy(dest, src, n);
-
-#ifdef DTO_STATS_SUPPORT
-			DTO_COLLECT_STATS_CPU_END(collect_stats, st, et, MEMCOPY, n, orig_n, 0, use_orig_func);
-#endif
-
-		}
-	}
-
-	//if (use_orig_func) {
-	else {
-#ifdef DTO_STATS_SUPPORT
-		DTO_COLLECT_STATS_START(collect_stats, st);
-#endif
-
-		orig_memcpy(dest, src, n);
-
-#ifdef DTO_STATS_SUPPORT
-		DTO_COLLECT_STATS_CPU_END(collect_stats, st, et, MEMCOPY, n, orig_n, 0, use_orig_func);
-#endif
-	}
-	return wq_index;
-}
-*/
-
 void *memcpy(void *dest, const void *src, size_t n)
 {
 	int result = 0;
@@ -3466,9 +3341,9 @@ void *memcpy(void *dest, const void *src, size_t n)
 
 #ifdef DTO_STATS_SUPPORT
 	if (unlikely(collect_stats)) {
-		if (global_op_counter < dto_stats_num_warmup_ops) {  
+		//if (global_op_counter < dto_stats_num_warmup_ops) {  
 				++ global_op_counter;  
-		}
+		//}
 		//else { 
 		//	if (n >= dsa_min_size) {
 				//LOG_TRACE("memcpy src numa node %d dest numa node %d\n",get_numa_node_buf((void*)src),get_numa_node_buf(dest));
@@ -3552,9 +3427,9 @@ void *memmove(void *dest, const void *src, size_t n)
 
 #ifdef DTO_STATS_SUPPORT
 	if (unlikely(collect_stats)) {
-		if (global_op_counter < dto_stats_num_warmup_ops) {  
+		//if (global_op_counter < dto_stats_num_warmup_ops) {  
 				++ global_op_counter;  
-		}
+		//}
 	}
 #endif
 

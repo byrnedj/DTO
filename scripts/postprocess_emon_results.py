@@ -48,7 +48,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
 
     # Add arguments
-    parser.add_argument('--directory', type=str, help='directory where files are')
+    parser.add_argument('--directory', type=str, help='directory where files are (use full path)')
     parser.add_argument('--core-view', action='store_true', help='')
     parser.add_argument('--socket-view', action='store_true', help='')
     parser.add_argument('--parms', type= str, default=None)

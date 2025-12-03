@@ -25,7 +25,7 @@ export LD_LIBRARY_PATH=./   # dto is linked into the micro, but need to set ld_l
 
 num_threads=2  # Don't forget to adjust the taskset cpu list below
 size=800 # size in KB
-num_iter=10000000
+num_iter=10000
 total_buff_size=4194304  # total buffer size in KB (this gets divided into buffers of 'size' KB each)
 perc_in_cache=0
 

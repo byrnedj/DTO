@@ -539,5 +539,99 @@
 #python sweep_all_test_settable_size5.py --output-type perf --run-name tx-size-in-cache-perc-extern-with-stats --cfg-filepath ./configs/tx_size_comparison_subset.json  --dto-version extern --num-iter 10000000 --exclude-pfs  --num-dsas 1 --results-dirname  tx_size_in_cache_perc_sweep_minwaits 
 #python sweep_all_test_settable_size5.py --output-type perf --run-name tx-size-in-cache-perc-extern-with-stats --cfg-filepath ./configs/tx_size_comparison_subset_auto.json  --dto-version extern --num-iter 10000000 --exclude-pfs  --num-dsas 1 --results-dirname  tx_size_in_cache_perc_sweep_minwaits
 
-python sweep_all_test_settable_size5.py --output-type micro --run-name in-cache-prob-sweep-1dsa-minwait-dev-raw-times_3 --cfg-filepath ./configs/reddis_800_in_cache_prob_perc_sweep.json  --dto-version dev_time --collect-raw-times --alg-stats --num-iter 1000000  --exclude-pfs  --num-dsas  1 --results-dirname  in-cache-prob-dev_raw_times_1dsa_minwaits3_perc_sweep
+#python sweep_all_test_settable_size5.py --output-type micro --run-name in-cache-prob-sweep-1dsa-minwait-dev-raw-times_3 --cfg-filepath ./configs/reddis_800_in_cache_prob_perc_sweep.json  --dto-version dev_time --collect-raw-times --alg-stats --num-iter 1000000  --exclude-pfs  --num-dsas  1 --results-dirname  in-cache-prob-dev_raw_times_1dsa_minwaits3_perc_sweep
 
+#python sweep_all_test_settable_size5.py --output-type micro --run-name in-cache-prob-sweep-1dsa-maxbw-dev-with-times_1 --cfg-filepath ./configs/reddis_800_in_cache_prob_auto_threads2.json  --dto-version dev_time --alg-stats --num-iter 1000000 --exclude-pfs  --num-dsas 1 --results-dirname  in-cache-prob-dev_maxbw_with_times_1dsa
+
+#python sweep_all_test_settable_size5.py --output-type micro --run-name fine-cpu-fract-sweep-extern-raw-times_1 --cfg-filepath ./configs/fine_fract_sweep_1.json  --dto-version extern --no-stats --collect-raw-times --num-iter 1000000 --exclude-pfs  --num-dsas 1 --results-dirname  fine_fract_sweep_1
+
+#python sweep_all_test_settable_size5.py --output-type micro --run-name fine-cpu-fract-sweep-extern-raw-times_1 --cfg-filepath ./configs/fine_fract_sweep_2.json  --dto-version extern --no-stats --collect-raw-times --num-iter 1000000 --exclude-pfs  --num-dsas 1 --results-dirname  fine_fract_sweep_2
+
+#python sweep_all_test_settable_size5.py --output-type micro --run-name fine-cpu-fract-sweep-extern-raw-times_1 --cfg-filepath ./configs/fine_fract_sweep_3.json  --dto-version extern --no-stats --collect-raw-times --num-iter 1000000 --exclude-pfs  --num-dsas 1 --results-dirname  fine_fract_sweep_3
+
+#python sweep_all_test_settable_size5.py --output-type micro --run-name fine-cpu-fract-sweep-equiv-extern-raw-times_1 --cfg-filepath ./configs/fine_fract_sweep_3.json  --dto-version extern --no-stats --generate-equivalent-transactions --collect-raw-times --num-iter 1000000 --exclude-pfs  --num-dsas 1 --results-dirname  fine_fract_sweep_3_equiv
+
+#python sweep_all_test_settable_size5.py --output-type micro --run-name fine-cpu-fract-sweep-equiv-dev-algstats_1 --cfg-filepath ./configs/fine_fract_sweep_3.json  --dto-version dev_time --alg-stats --num-iter 1000000 --exclude-pfs  --num-dsas 1 --results-dirname  fine_fract_sweep_3_alg_stats 
+
+#python sweep_all_test_settable_size5.py --output-type micro --run-name fine-cpu-fract-sweep-equiv-extern-raw-times_1 --cfg-filepath ./configs/fine_fract_sweep_3.json  --dto-version extern --no-stats --generate-equivalent-transactions --num-iter 10000000 --exclude-pfs  --num-dsas 1 --results-dirname  fine_fract_sweep_3_equiv_long
+
+#python sweep_all_test_settable_size5.py --output-type micro --run-name fine-cpu-fract-sweep-equiv-dev-algstats_1 --cfg-filepath ./configs/fine_fract_sweep_100.json  --dto-version dev_time --alg-stats --num-iter 1000000 --exclude-pfs  --num-dsas 1 --results-dirname  fine_fract_sweep_100_alg_stats 
+
+#python sweep_all_test_settable_size5.py --output-type micro --run-name fine-cpu-fract-sweep-equiv-dev-algstats_1 --cfg-filepath ./configs/fine_fract_sweep_0_1thread.json  --dto-version dev_time --no-stats --generate-equivalent-transactions --num-iter 1000000 --exclude-pfs  --num-dsas 1 --results-dirname fine_fract_sweep_0_threads_eqiv
+
+#python sweep_all_test_settable_size5.py --output-type micro --run-name fine-cpu-fract-sweep-equiv-dev-algstats_1 --cfg-filepath ./configs/fine_fract_sweep_100.json  --dto-version dev_time --no-stats --generate-equivalent-transactions --num-iter 1000000 --exclude-pfs  --num-dsas 1 --results-dirname  fine_fract_sweep_100_micro_stats_equiv
+
+#python sweep_all_test_settable_size5.py --output-type micro --run-name fine-cpu-fract-sweep-equiv-dev-algstats_1 --cfg-filepath ./configs/fine_fract_sweep_100_2.json  --dto-version dev_time --no-stats --generate-equivalent-transactions --num-iter 1000000 --exclude-pfs  --num-dsas 1 --results-dirname  fine_fract_sweep_100_micro_stats_equiv_extended
+
+#python sweep_all_test_settable_size5.py --output-type micro --run-name fine-cpu-fract-sweep-equiv-dev-algstats_1 --cfg-filepath ./configs/fine_fract_sweep_0_threads.json  --dto-version dev_time --alg-stats --num-iter 1000000 --exclude-pfs  --num-dsas 1 --results-dirname fine_fract_sweep_0_alg_stats
+#python sweep_all_test_settable_size5.py --output-type micro --run-name fine-cpu-fract-sweep-equiv-dev-algstats_1 --cfg-filepath ./configs/fine_fract_sweep_0_threads.json  --dto-version dev_time --no-stats --generate-equivalent-transactions --num-iter 1000000 --exclude-pfs  --num-dsas 1 --results-dirname fine_fract_sweep_0_threads_eqiv
+
+#python sweep_all_test_settable_size5.py --output-type micro --run-name fine-cpu-fract-sweep-bimodal-dev_1 --cfg-filepath ./configs/fine_fract_sweep_0_100.json  --dto-version dev_time --alg-stats --collect-raw-times --num-iter 1000000 --exclude-pfs  --num-dsas 1 --results-dirname bimodal_sweep
+#python sweep_all_test_settable_size5.py --output-type micro --run-name fine-cpu-fract-sweep-bimodal-equiv-dev_1 --cfg-filepath ./configs/fine_fract_sweep_0_100.json  --dto-version dev_time --no-stats --collect-raw-times --generate-equivalent-transactions --num-iter 1000000 --exclude-pfs  --num-dsas 1 --results-dirname bimodal_sweep_equiv
+
+#python sweep_all_test_settable_size5.py --output-type micro --run-name in-cache-perc-sweep-dev_1 --cfg-filepath ./configs/800_auto_in_cache_perc_sweep.json  --dto-version dev_time --alg-stats --collect-raw-times --num-iter 1000000 --exclude-pfs  --num-dsas 1 --results-dirname in_cache_perc_sweep_full_stats
+
+#python sweep_all_test_settable_size5.py --output-type micro --run-name fine-cpu-fract-sweep-bimodal-dev_1 --cfg-filepath ./configs/fine_fract_sweep_0_100.json  --dto-version dev_time --alg-stats --collect-raw-times --num-iter 1000000 --exclude-pfs  --num-dsas 1 --results-dirname bimodal_sweep_full_stats
+#python sweep_all_test_settable_size5.py --output-type micro --run-name fine-cpu-fract-sweep-bimodal-equiv-dev_1 --cfg-filepath ./configs/fine_fract_sweep_0_100.json  --dto-version dev_time --alg-stats --collect-raw-times --generate-equivalent-transactions --num-iter 1000000 --exclude-pfs  --num-dsas 1 --results-dirname bimodal_sweep_equiv_fullstats
+
+#python sweep_all_test_settable_size5.py --output-type micro --run-name dsa-time-comp_1 --cfg-filepath ./configs/800_cpu_fract_in_cache_perc_sweep.json  --dto-version dev_dsatime --delay 1 --alg-stats --collect-raw-times --num-iter 1000000 --exclude-pfs  --num-dsas 1 --results-dirname dsa_time_comp
+#python sweep_all_test_settable_size5.py --output-type micro --run-name dsa-time-sep_1 --cfg-filepath ./configs/800_cpu_fract_in_cache_perc_sweep.json  --dto-version dev_dsatime --delay 1 --alg-stats --collect-raw-times --generate-equivalent-transactions --num-iter 1000000 --exclude-pfs  --num-dsas 1 --results-dirname dsa_time_sep
+
+#python sweep_all_test_settable_size5.py --output-type emon --run-name in-cache-perc-emon --cfg-filepath ./configs/junk.json  --dto-version extern  --no-stats --num-iter 1000000000 --exclude-pfs  --results-dirname in_cache_perc_emon2_16
+
+#sudo ../config_dsa_1_numa0.sh
+#python sweep_all_test_settable_size5.py --output-type emon --run-name in-cache-perc-dsa-0-emon --cfg-filepath ./configs/junk.json  --dto-version extern --no-stats --num-iter 10000000 --exclude-pfs  --results-dirname in_cache_perc_dsa_numa0_emon
+
+#sudo ../config_dsa_1_numa1.sh
+#python sweep_all_test_settable_size5.py --output-type emon --run-name in-cache-perc-dsa-1-emon --cfg-filepath ./configs/junk.json  --dto-version extern --no-stats --num-iter 10000000 --exclude-pfs  --results-dirname in_cache_perc_dsa_numa1_emon
+
+#python sweep_all_test_settable_size5.py --output-type micro --run-name dsa-time-comb_1 --cfg-filepath ./configs/800_cpu_fract_in_cache_perc_sweep.json  --dto-version dev_dsatime --delay 1 --alg-stats --num-iter 1000000 --exclude-pfs  --num-dsas 1 --results-dirname dsa_time_comb_2
+
+#python sweep_all_test_settable_size5.py --output-type micro --run-name dsa-time-comb_1 --cfg-filepath ./configs/800_cpu_fract_in_cache_perc_sweep_threads.json  --dto-version dev_dsatime --delay 1 --alg-stats --num-iter 1000000 --exclude-pfs  --num-dsas 1 --results-dirname dsa_time_comb_2_threads
+
+#python sweep_all_test_settable_size5.py --output-type micro --run-name dsa-time-comb-auto_1 --cfg-filepath ./configs/800_auto_50_in_cache_min_avg.json  --dto-version dev_dsatime --delay 1 --alg-stats --num-iter 1000000 --exclude-pfs  --num-dsas 1 --results-dirname dsa_time_comb_3threads_auto
+
+#python sweep_all_test_settable_size5.py --output-type micro --run-name dev-comb-auto_1 --cfg-filepath ./configs/800_auto_50_in_cache_min_avg.json  --dto-version dev --alg-stats --num-iter 10000000 --exclude-pfs  --num-dsas 1 --results-dirname 3threads_auto_dev
+
+#python sweep_all_test_settable_size5.py --output-type micro --run-name extern-comb-auto_1 --cfg-filepath ./configs/800_auto_50_in_cache_min_avg.json  --dto-version extern --no-stats --num-iter 10000000 --exclude-pfs  --num-dsas 1 --results-dirname 3threads_auto_extern
+
+#python sweep_all_test_settable_size5.py --output-type micro --run-name dsa-time-comb-auto_1 --cfg-filepath ./configs/junk.json  --dto-version dev_time --alg-stats --num-iter 1000000 --exclude-pfs  --num-dsas 1 --results-dirname access_times2
+
+#python sweep_all_test_settable_size5.py --output-type micro --run-name split-alg_1 --cfg-filepath ./configs/junk1.json  --dto-version dev_dsatime --delay 1 --alg-stats --num-iter 1000000 --exclude-pfs  --num-dsas 1 --results-dirname split_alg
+
+#python sweep_all_test_settable_size5.py --output-type micro --run-name split-alg_1 --cfg-filepath ./configs/junk.json  --dto-version dev_dsatime --delay 1 --alg-stats --num-iter 1000000 --exclude-pfs  --num-dsas 1 --results-dirname split_alg
+
+#sudo ../config_dsa_1_numa1.sh
+#python sweep_all_test_settable_size5.py --output-type micro --run-name split-alg-extern-numa1_1 --cfg-filepath ./configs/junk.json  --dto-version extern_split --no-stats --collect-raw-times --num-iter 1000000 --exclude-pfs  --num-dsas 1 --results-dirname split_alg_extern_numa1dsa
+#python sweep_all_test_settable_size5.py --output-type micro --run-name baseline-extern-numa1_1 --cfg-filepath ./configs/junk.json  --dto-version extern --no-stats --collect-raw-times --num-iter 1000000 --exclude-pfs  --num-dsas 1 --results-dirname baseline_extern_numa1dsa
+
+#sudo ../config_dsa_1_numa0.sh
+#python sweep_all_test_settable_size5.py --output-type micro --run-name split-alg-extern-numa0_1 --cfg-filepath ./configs/junk.json  --dto-version extern_split --no-stats --collect-raw-times --num-iter 1000000 --exclude-pfs  --num-dsas 1 --results-dirname split_alg_extern_numa0dsa
+#python sweep_all_test_settable_size5.py --output-type micro --run-name baseline-extern-numa0_1 --cfg-filepath ./configs/junk.json  --dto-version extern --no-stats --collect-raw-times --num-iter 1000000 --exclude-pfs  --num-dsas 1 --results-dirname baseline_extern_numa0dsa
+
+
+#sudo ../config_dsa_1_numa1.sh
+#python sweep_all_test_settable_size5.py --output-type micro --run-name split-alg-extern-numa1_1 --cfg-filepath ./configs/junk2.json  --dto-version extern_split --no-stats --num-iter 1000000 --exclude-pfs  --num-dsas 1 --results-dirname set_split_alg_extern_numa1dsa
+#python sweep_all_test_settable_size5.py --output-type micro --run-name baseline-extern-numa1_1 --cfg-filepath ./configs/junk2.json  --dto-version extern --no-stats --num-iter 1000000 --exclude-pfs  --num-dsas 1 --results-dirname set_baseline_extern_numa1dsa
+
+#python sweep_all_test_settable_size5.py --output-type micro --run-name sweep-split-alg-extern-numa1-long_1 --cfg-filepath ./configs/sweep_sizes_in_cache_percs2.json  --dto-version extern_split --no-stats --num-iter 10000000 --exclude-pfs  --num-dsas 1 --results-dirname sweep_sizes_split_alg_extern_numa1dsa_long
+#python sweep_all_test_settable_size5.py --output-type micro --run-name sweep-baseline-extern-numa1-long_1 --cfg-filepath ./configs/sweep_sizes_in_cache_percs2.json  --dto-version extern --no-stats --num-iter 10000000 --exclude-pfs  --num-dsas 1 --results-dirname sweep_sizes_baseline_extern_numa1dsa_long
+
+
+#python sweep_all_test_settable_size5.py --output-type micro --run-name split-alg-extern-numa1_1 --cfg-filepath ./configs/small_junk2.json  --dto-version extern_split --no-stats --num-iter 1000000 --exclude-pfs  --num-dsas 1 --results-dirname split_alg_extern_numa1dsa_small
+#python sweep_all_test_settable_size5.py --output-type micro --run-name baseline-extern-numa1_1 --cfg-filepath ./configs/small_junk2.json  --dto-version extern --no-stats --num-iter 1000000 --exclude-pfs  --num-dsas 1 --results-dirname baseline_extern_numa1dsa_small 
+
+#python sweep_all_test_settable_size5.py --output-type micro --run-name small-sweep-dsa-times_1 --cfg-filepath ./configs/small_50_in_cache_cpu_fract_sweep_threads.json  --dto-version dev_dsatime --delay 1 --alg-stats --alg-stats-raw-values --num-iter 1000000 --exclude-pfs  --num-dsas 1 --results-dirname small-sweep-50-dsa-times
+
+#python sweep_all_test_settable_size5.py --output-type micro --run-name small-sweep-dsa-times_1 --cfg-filepath ./configs/small_50_in_cache_cpu_fract_sweep_threads_auto.json  --dto-version dev_dsatime --delay 1 --alg-stats --alg-stats-raw-values --alg-stats-latest --num-iter 1000000 --exclude-pfs  --num-dsas 1 --results-dirname small-sweep-50-dsa-times
+
+#python sweep_all_test_settable_size5.py --output-type micro --run-name small-sweep-dsa-times_1 --cfg-filepath ./configs/small_50_in_cache_cpu_fract_sweep_threads_nodsa.json  --dto-version dev_dsatime --delay 1 --no-stats --num-iter 1000000 --exclude-pfs  --num-dsas 1 --results-dirname small-sweep-50-dsa-times
+
+python sweep_all_test_settable_size5.py --output-type micro --run-name small-sweep-dsa-times_1 --cfg-filepath ./configs/small_50_in_cache_cpu_fract_16K_threads.json  --dto-version dev_dsatime --use-split-alg --delay 1 --alg-stats --alg-stats-raw-values --num-iter 1000000 --exclude-pfs  --num-dsas 1 --results-dirname small-16K-sweep-50-dsa-times
+python sweep_all_test_settable_size5.py --output-type micro --run-name small-sweep-dsa-times_1 --cfg-filepath ./configs/small_50_in_cache_cpu_fract_16K_threads_auto.json  --dto-version dev_dsatime --use-split-alg --delay 1 --alg-stats --alg-stats-raw-values --alg-stats-latest --num-iter 1000000 --exclude-pfs  --num-dsas 1 --results-dirname small-16K-sweep-50-dsa-times
+
+python sweep_all_test_settable_size5.py --output-type micro --run-name split-alg-extern-numa1_1 --cfg-filepath ./configs/small_junk2.json  --dto-version extern --use-split-alg --no-stats --num-iter 1000000 --exclude-pfs  --num-dsas 1 --results-dirname split_alg_extern_numa1dsa_small2
+python sweep_all_test_settable_size5.py --output-type micro --run-name baseline-extern-numa1_1 --cfg-filepath ./configs/small_junk2.json  --dto-version extern --no-stats --num-iter 1000000 --exclude-pfs  --num-dsas 1 --results-dirname baseline_extern_numa1dsa_small2
+
+python sweep_all_test_settable_size5.py --output-type micro --run-name split-alg-dev-numa1_1 --cfg-filepath ./configs/small_junk2.json  --dto-version dev --use-split-alg --no-stats --num-iter 1000000 --exclude-pfs  --num-dsas 1 --results-dirname split_alg_dev_numa1dsa_small2
+python sweep_all_test_settable_size5.py --output-type micro --run-name baseline-dev-numa1_1 --cfg-filepath ./configs/small_junk2.json  --dto-version dev --no-stats --num-iter 1000000 --exclude-pfs  --num-dsas 1 --results-dirname baseline_dev_numa1dsa_small2
