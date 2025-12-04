@@ -1,0 +1,1 @@
+{"sizes": [800], "percentages": ["auto"], "mem_ops": [2], "thread_counts":[1,3], "numa_configs": ["unaware"], "scale_buf_sizes_with_tx_size": true, "total_buf_sizes":[8192], "alloc_types": ["single"], "rand_index_uses": [1], "cache_control_configs": [1], "in_cache_probabilities":[50], "wait_methods": ["busypoll"], "alg_versions": ["avg", "min"]}
