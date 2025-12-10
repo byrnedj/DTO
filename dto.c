@@ -65,6 +65,7 @@
 static __thread struct dsa_hw_desc thr_desc;
 static __thread struct dsa_completion_record thr_comp __attribute__((aligned(32)));
 static __thread uint64_t thr_bytes_completed;
+static __thread int16_t wq_index = -1;
 
 // original std memory functions
 static void * (*orig_memset)(void *s, int c, size_t n);
@@ -113,7 +114,9 @@ static const char * const numa_aware_names[] = {
 // global workqueue variables
 static struct dto_wq wqs[MAX_WQS];
 static struct dto_device* devices[MAX_NUMA_NODES];
+static atomic_int num_threads;
 static uint8_t num_wqs;
+static uint8_t max_wqs_supported;
 static atomic_uchar next_wq;
 static atomic_uchar dto_initialized;
 static atomic_uchar dto_initializing;
@@ -1223,6 +1226,9 @@ static int dsa_init_from_accfg(void)
 		correct_devices_list();
 	}
 
+        if (num_wqs > max_wqs_supported) {
+            num_wqs = max_wqs_supported;
+        }
 	accfg_unref(dto_ctx);
 	return 0;
 
@@ -1316,6 +1322,7 @@ static int dsa_init(void)
 static int init_dto(void)
 {
 	uint8_t init_notcomplete = 0;
+        num_threads = 0;
 
 	if (atomic_compare_exchange_strong(&dto_initializing, &init_notcomplete, 1)) {
 		char *env_str;
@@ -1523,6 +1530,14 @@ static int init_dto(void)
 				if (errno || dto_umwait_delay == 0)
 					dto_umwait_delay = UMWAIT_DELAY_DEFAULT;
 			}
+                        max_wqs_supported = 100;
+                        env_str = getenv("DTO_MAX_WQS_SUPPORTED");
+                        if (env_str != NULL) {
+                                errno = 0;
+                                max_wqs_supported = strtoul(env_str, NULL, 10);
+                                if (errno || max_wqs_supported == 0)
+                                        max_wqs_supported = 100;
+                        }
 
 			if (dsa_init()) {
 				LOG_ERROR("Didn't find any usable DSAs. Falling back to using CPUs.\n");
@@ -1548,9 +1563,9 @@ static int init_dto(void)
 
 			// display configuration
 			LOG_TRACE("log_level: %d, collect_stats: %d, use_std_lib_calls: %d, dsa_min_size: %lu, "
-				"cpu_size_fraction: %.2f, wait_method: %s, auto_adjust_knobs: %d, numa_awareness: %s, dto_dsa_cc: %d, dto_use_c02: %d\n",
+				"cpu_size_fraction: %.2f, wait_method: %s, auto_adjust_knobs: %d, numa_awareness: %s, dto_dsa_cc: %d, dto_use_c02: %d, max_wqs_supported: %d\n",
 				log_level, collect_stats, use_std_lib_calls, dsa_min_size,
-				cpu_size_fraction_float, wait_names[wait_method], auto_adjust_knobs, numa_aware_names[is_numa_aware], dto_dsa_cc, dto_use_c02);
+				cpu_size_fraction_float, wait_names[wait_method], auto_adjust_knobs, numa_aware_names[is_numa_aware], dto_dsa_cc, dto_use_c02, max_wqs_supported);
 			for (int i = 0; i < num_wqs; i++)
 				LOG_TRACE("[%d] wq_path: %s, wq_size: %d, dsa_cap: %lx\n", i,
 					wqs[i].wq_path, wqs[i].wq_size, wqs[i].dsa_gencap);
@@ -1582,9 +1597,41 @@ static void cleanup_dto(void)
 	cleanup_devices();
 }
 
+//static __always_inline  struct dto_wq *get_wq(void *buf) {
+//    struct dto_wq* wq = NULL;
+//
+//    if (wq_index != -1) {
+//        wq = &wqs[wq_index];
+//    } else {
+//        if (is_numa_aware) {
+//            int status[1] = {-1};
+//
+//            // get the numa node for the target DSA device
+//            const int numa_node = get_numa_node(pthread_getspecific(thread_buf_key));
+//            if (numa_node >= 0 && numa_node < MAX_NUMA_NODES) {
+//                struct dto_device* dev = devices[numa_node];
+//                if (dev != NULL &&
+//                    dev->num_wqs > 0) {
+//                    wq = dev->wqs[dev->next_wq++ % dev->num_wqs];
+//                }
+//            }
+//        }
+//
+//        if (wq == NULL) {
+//            wq = &wqs[next_wq++ % num_wqs];
+//        }
+//    }
+//
+//    return wq;
+//}
+
 static __always_inline  struct dto_wq *get_wq(void* buf)
 {
 	struct dto_wq* wq = NULL;
+        if (wq_index != -1) {
+            wq = &wqs[wq_index];
+            return wq;
+        }
 
 	if (is_numa_aware) {
 		int status[1] = {-1};
@@ -1601,7 +1648,10 @@ static __always_inline  struct dto_wq *get_wq(void* buf)
 	}
 
 	if (wq == NULL) {
-		wq = &wqs[next_wq++ % num_wqs];
+                num_threads++;
+                wq_index = num_threads % num_wqs;
+    		LOG_TRACE("Thread id %lu (tn: %d) assigned wq: %d\n", pthread_self(), num_threads, wq_index);
+		wq = &wqs[wq_index];
 	}
 
 	return wq;
