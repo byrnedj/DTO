@@ -11,10 +11,12 @@ export DTO_COLLECT_STATS=1
 
 export DTO_COLLECT_ALG_STATS=1
 export DTO_COLLECT_ALG_STATS_RAW_VALUES=1
-export DTO_COLLECT_ALG_STATS_RAW_TIMES=0
+export DTO_COLLECT_ALG_STATS_RAW_TIMES=1
 export DTO_COLLECT_ALG_STATS_ACCESS_TIMES=0
 export DTO_COLLECT_ALG_STATS_DSA_TIMESTAMPS=1
-export DTO_COLLECT_ALG_STATS_LATEST_VALUES=0
+export DTO_COLLECT_ALG_STATS_LATEST_VALUES=1
+
+export DTO_AUTO_ADJUST_USE_SPLIT_ALGORITHM=1
 
 export DTO_STATS_PREFIX=''
 export DTO_STATS_OUTPUT_TYPE=1
@@ -52,5 +54,7 @@ export DTO_OVERLAPPING_MEMMOVE_ACTION=1  # 0-CPU, 1-DSA
 
 #taskset -c 56-56 ./dto-test-settable-size-dev5 1 0 2 800 1000 4194304 1 1 0 0 0 1 0 0 0 0 50 0
 
-taskset -c 56-57 ./dto-test-settable-size-dev5-with-dsa-time 1 1 2 800 1000 4194304 1 1 0 0 0 1 0 0 0 0 50 0 1
+#taskset -c 56-57 ./dto-test-settable-size-dev5-with-dsa-time 1 1 2 800 1000 4194304 1 1 0 0 0 1 0 0 0 0 50 0 1
+
+taskset -c 56-56 ./dto-test-settable-size-dev5 1 0 2 800 10000 8388000 1 1 0 0 0 1 0 0 0 0 0 0
 

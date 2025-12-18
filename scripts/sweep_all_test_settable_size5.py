@@ -459,8 +459,8 @@ dto_env['DTO_AUTO_ADJUST_USE_SPLIT_ALGORITHM'] = '1' if use_split_alg else '0'
 
 if output_type == 'DTO-python':
     print("setting up for DTO-python")
-    dto_env['DTO_STATS_PREFIX']="'''"
-    #dto_env['DTO_STATS_PREFIX']=""
+    #dto_env['DTO_STATS_PREFIX']="'''"
+    dto_env['DTO_STATS_PREFIX']=""
     dto_env['DTO_STATS_OUTPUT_TYPE']='1'
     dto_env['DTO_COLLECT_STATS']='1'
     if alg_stats or alg_stats_latest or alg_stats_raw_times or alg_stats_raw_values or dto_version == 'dev_dsatime':
@@ -482,7 +482,8 @@ elif output_type in ['perf', 'micro', 'emon']:
         dto_env['DTO_COLLECT_STATS']='1'
         if alg_stats or alg_stats_latest or alg_stats_raw_times or alg_stats_raw_values or dto_version == 'dev_dsatime':
             dto_env['DTO_COLLECT_ALG_STATS']='1'
-            dto_env['DTO_STATS_PREFIX']="'''"
+            #dto_env['DTO_STATS_PREFIX']="'''"
+            dto_env['DTO_STATS_PREFIX']=""
             dto_env['DTO_STATS_OUTPUT_TYPE']='1'
         if alg_stats_latest:
             dto_env['DTO_COLLECT_ALG_STATS_LATEST_VALUES']='1'

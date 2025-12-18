@@ -626,7 +626,6 @@
 #python sweep_all_test_settable_size5.py --output-type micro --run-name small-sweep-dsa-times_1 --cfg-filepath ./configs/small_50_in_cache_cpu_fract_sweep_threads_auto.json  --dto-version dev_dsatime --delay 1 --alg-stats --alg-stats-raw-values --alg-stats-latest --num-iter 1000000 --exclude-pfs  --num-dsas 1 --results-dirname small-sweep-50-dsa-times
 
 #python sweep_all_test_settable_size5.py --output-type micro --run-name small-sweep-dsa-times_1 --cfg-filepath ./configs/small_50_in_cache_cpu_fract_sweep_threads_nodsa.json  --dto-version dev_dsatime --delay 1 --no-stats --num-iter 1000000 --exclude-pfs  --num-dsas 1 --results-dirname small-sweep-50-dsa-times
-
 #python sweep_all_test_settable_size5.py --output-type micro --run-name small-sweep-dsa-times_1 --cfg-filepath ./configs/small_50_in_cache_cpu_fract_16K_threads.json  --dto-version dev_dsatime --use-split-alg --delay 1 --alg-stats --alg-stats-raw-values --num-iter 1000000 --exclude-pfs  --num-dsas 1 --results-dirname small-16K-sweep-50-dsa-times
 #python sweep_all_test_settable_size5.py --output-type micro --run-name small-sweep-dsa-times_1 --cfg-filepath ./configs/small_50_in_cache_cpu_fract_16K_threads_auto.json  --dto-version dev_dsatime --use-split-alg --delay 1 --alg-stats --alg-stats-raw-values --alg-stats-latest --num-iter 1000000 --exclude-pfs  --num-dsas 1 --results-dirname small-16K-sweep-50-dsa-times
 
@@ -636,4 +635,83 @@
 #python sweep_all_test_settable_size5.py --output-type micro --run-name split-alg-dev-numa1_1 --cfg-filepath ./configs/small_junk2.json  --dto-version dev --use-split-alg --no-stats --num-iter 1000000 --exclude-pfs  --num-dsas 1 --results-dirname split_alg_dev_numa1dsa_small2
 #python sweep_all_test_settable_size5.py --output-type micro --run-name baseline-dev-numa1_1 --cfg-filepath ./configs/small_junk2.json  --dto-version dev --no-stats --num-iter 1000000 --exclude-pfs  --num-dsas 1 --results-dirname baseline_dev_numa1dsa_small2
 
-python sweep_all_test_settable_size5.py --output-type micro --run-name in-cache-perc-sweep-dev_1 --cfg-filepath ./configs/800_auto_in_cache_perc_sweep.json  --dto-version dev --alg-stats --alg-stats-access-times --num-iter 1000000 --exclude-pfs  --num-dsas 1 --results-dirname access_times_in_cache_perc_sweep
+#python sweep_all_test_settable_size5.py --output-type micro --run-name in-cache-perc-sweep-dev_1 --cfg-filepath ./configs/800_auto_in_cache_perc_sweep.json  --dto-version dev --alg-stats --alg-stats-access-times --num-iter 1000000 --exclude-pfs  --num-dsas 1 --results-dirname access_times_in_cache_perc_sweep
+
+#python sweep_all_test_settable_size5.py --output-type micro --run-name small-sweep-dsa-times_1 --cfg-filepath ./configs/small_50_in_cache_cpu_fract_sweep_threads.json  --dto-version dev_dsatime --delay 1 --alg-stats --alg-stats-raw-values --num-iter 1000000 --exclude-pfs  --num-dsas 1 --results-dirname small-sweep-50-dsa-times-baseline
+#python sweep_all_test_settable_size5.py --output-type micro --run-name small-sweep-dsa-times_1 --cfg-filepath ./configs/small_50_in_cache_cpu_fract_sweep_threads_auto.json  --dto-version dev_dsatime --delay 1 --alg-stats --alg-stats-raw-values --alg-stats-latest --num-iter 1000000 --exclude-pfs  --num-dsas 1 --results-dirname small-sweep-50-dsa-times-baseline
+
+
+#python sweep_all_test_settable_size5.py --output-type DTO-python --run-name num_wqs_sweep_1 --cfg-filepath ./configs/small_junk3.json  --dto-version dev --num-iter 1000000 --exclude-pfs  --num-dsas 1 --results-dirname num_wqs_sweep_1
+#python sweep_all_test_settable_size5.py --output-type DTO-python --run-name num_wqs_sweep_2 --cfg-filepath ./configs/small_junk3.json  --dto-version dev --num-iter 1000000 --exclude-pfs  --num-dsas 2 --results-dirname num_wqs_sweep_1
+#python sweep_all_test_settable_size5.py --output-type DTO-python --run-name num_wqs_sweep_3 --cfg-filepath ./configs/small_junk3.json  --dto-version dev --num-iter 1000000 --exclude-pfs  --num-dsas 3 --results-dirname num_wqs_sweep_1
+#python sweep_all_test_settable_size5.py --output-type DTO-python --run-name num_wqs_sweep_4 --cfg-filepath ./configs/small_junk3.json  --dto-version dev --num-iter 1000000 --exclude-pfs  --num-dsas 4 --results-dirname num_wqs_sweep_1
+#python sweep_all_test_settable_size5.py --output-type DTO-python --run-name num_wqs_sweep_5 --cfg-filepath ./configs/small_junk3.json  --dto-version dev --num-iter 1000000 --exclude-pfs  --num-dsas 5 --results-dirname num_wqs_sweep_1
+#python sweep_all_test_settable_size5.py --output-type DTO-python --run-name num_wqs_sweep_6 --cfg-filepath ./configs/small_junk3.json  --dto-version dev --num-iter 1000000 --exclude-pfs  --num-dsas 6 --results-dirname num_wqs_sweep_1
+#python sweep_all_test_settable_size5.py --output-type DTO-python --run-name num_wqs_sweep_7 --cfg-filepath ./configs/small_junk3.json  --dto-version dev --num-iter 1000000 --exclude-pfs  --num-dsas 7 --results-dirname num_wqs_sweep_1
+#python sweep_all_test_settable_size5.py --output-type DTO-python --run-name num_wqs_sweep_8 --cfg-filepath ./configs/small_junk3.json  --dto-version dev --num-iter 1000000 --exclude-pfs  --num-dsas 8 --results-dirname num_wqs_sweep_1
+
+#ython sweep_all_test_settable_size5.py --output-type DTO-python --run-name num_wqs_sweep_2 --cfg-filepath ./configs/small_junk3.json  --dto-version dev --num-threads-override 2 --num-iter 1000000 --exclude-pfs  --num-dsas 2 --results-dirname num_wqs_sweep_1
+#python sweep_all_test_settable_size5.py --output-type DTO-python --run-name num_wqs_sweep_3 --cfg-filepath ./configs/small_junk3.json  --dto-version dev --num-threads-override 2 --num-iter 1000000 --exclude-pfs  --num-dsas 3 --results-dirname num_wqs_sweep_1
+#python sweep_all_test_settable_size5.py --output-type DTO-python --run-name num_wqs_sweep_4 --cfg-filepath ./configs/small_junk3.json  --dto-version dev --num-threads-override 2 --num-iter 1000000 --exclude-pfs  --num-dsas 4 --results-dirname num_wqs_sweep_1
+#python sweep_all_test_settable_size5.py --output-type DTO-python --run-name num_wqs_sweep_5 --cfg-filepath ./configs/small_junk3.json  --dto-version dev --num-threads-override 2 --num-iter 1000000 --exclude-pfs  --num-dsas 5 --results-dirname num_wqs_sweep_1
+#python sweep_all_test_settable_size5.py --output-type DTO-python --run-name num_wqs_sweep_6 --cfg-filepath ./configs/small_junk3.json  --dto-version dev --num-threads-override 2 --num-iter 1000000 --exclude-pfs  --num-dsas 6 --results-dirname num_wqs_sweep_1
+#python sweep_all_test_settable_size5.py --output-type DTO-python --run-name num_wqs_sweep_7 --cfg-filepath ./configs/small_junk3.json  --dto-version dev --num-threads-override 2 --num-iter 1000000 --exclude-pfs  --num-dsas 7 --results-dirname num_wqs_sweep_1
+#python sweep_all_test_settable_size5.py --output-type DTO-python --run-name num_wqs_sweep_8 --cfg-filepath ./configs/small_junk3.json  --dto-version dev --num-threads-override 2 --num-iter 1000000 --exclude-pfs  --num-dsas 8 --results-dirname num_wqs_sweep_1
+
+#python sweep_all_test_settable_size5.py --output-type DTO-python --run-name num_wqs_sweep_3 --cfg-filepath ./configs/small_junk3.json  --dto-version dev --num-threads-override 3 --num-iter 1000000 --exclude-pfs  --num-dsas 3 --results-dirname num_wqs_sweep_1
+#python sweep_all_test_settable_size5.py --output-type DTO-python --run-name num_wqs_sweep_4 --cfg-filepath ./configs/small_junk3.json  --dto-version dev --num-threads-override 3 --num-iter 1000000 --exclude-pfs  --num-dsas 4 --results-dirname num_wqs_sweep_1
+#python sweep_all_test_settable_size5.py --output-type DTO-python --run-name num_wqs_sweep_5 --cfg-filepath ./configs/small_junk3.json  --dto-version dev --num-threads-override 3 --num-iter 1000000 --exclude-pfs  --num-dsas 5 --results-dirname num_wqs_sweep_1
+#python sweep_all_test_settable_size5.py --output-type DTO-python --run-name num_wqs_sweep_6 --cfg-filepath ./configs/small_junk3.json  --dto-version dev --num-threads-override 3 --num-iter 1000000 --exclude-pfs  --num-dsas 6 --results-dirname num_wqs_sweep_1
+#python sweep_all_test_settable_size5.py --output-type DTO-python --run-name num_wqs_sweep_7 --cfg-filepath ./configs/small_junk3.json  --dto-version dev --num-threads-override 3 --num-iter 1000000 --exclude-pfs  --num-dsas 7 --results-dirname num_wqs_sweep_1
+#python sweep_all_test_settable_size5.py --output-type DTO-python --run-name num_wqs_sweep_8 --cfg-filepath ./configs/small_junk3.json  --dto-version dev --num-threads-override 3 --num-iter 1000000 --exclude-pfs  --num-dsas 8 --results-dirname num_wqs_sweep_1
+
+
+#python sweep_all_test_settable_size5.py --output-type DTO-python --run-name num_wqs_sweep_4 --cfg-filepath ./configs/small_junk3.json  --dto-version dev --num-threads-override 4 --num-iter 1000000 --exclude-pfs  --num-dsas 4 --results-dirname num_wqs_sweep_1
+#python sweep_all_test_settable_size5.py --output-type DTO-python --run-name num_wqs_sweep_5 --cfg-filepath ./configs/small_junk3.json  --dto-version dev --num-threads-override 4 --num-iter 1000000 --exclude-pfs  --num-dsas 5 --results-dirname num_wqs_sweep_1
+#python sweep_all_test_settable_size5.py --output-type DTO-python --run-name num_wqs_sweep_6 --cfg-filepath ./configs/small_junk3.json  --dto-version dev --num-threads-override 4 --num-iter 1000000 --exclude-pfs  --num-dsas 6 --results-dirname num_wqs_sweep_1
+#python sweep_all_test_settable_size5.py --output-type DTO-python --run-name num_wqs_sweep_7 --cfg-filepath ./configs/small_junk3.json  --dto-version dev --num-threads-override 4 --num-iter 1000000 --exclude-pfs  --num-dsas 7 --results-dirname num_wqs_sweep_1
+#python sweep_all_test_settable_size5.py --output-type DTO-python --run-name num_wqs_sweep_8 --cfg-filepath ./configs/small_junk3.json  --dto-version dev --num-threads-override 4 --num-iter 1000000 --exclude-pfs  --num-dsas 8 --results-dirname num_wqs_sweep_1
+
+
+#python sweep_all_test_settable_size5.py --output-type DTO-python --run-name num_wqs_sweep_5 --cfg-filepath ./configs/small_junk3.json  --dto-version dev --num-threads-override 5 --num-iter 1000000 --exclude-pfs  --num-dsas 5 --results-dirname num_wqs_sweep_1
+#python sweep_all_test_settable_size5.py --output-type DTO-python --run-name num_wqs_sweep_6 --cfg-filepath ./configs/small_junk3.json  --dto-version dev --num-threads-override 5 --num-iter 1000000 --exclude-pfs  --num-dsas 6 --results-dirname num_wqs_sweep_1
+#python sweep_all_test_settable_size5.py --output-type DTO-python --run-name num_wqs_sweep_7 --cfg-filepath ./configs/small_junk3.json  --dto-version dev --num-threads-override 5 --num-iter 1000000 --exclude-pfs  --num-dsas 7 --results-dirname num_wqs_sweep_1
+#python sweep_all_test_settable_size5.py --output-type DTO-python --run-name num_wqs_sweep_8 --cfg-filepath ./configs/small_junk3.json  --dto-version dev --num-threads-override 5 --num-iter 1000000 --exclude-pfs  --num-dsas 8 --results-dirname num_wqs_sweep_1
+
+
+#python sweep_all_test_settable_size5.py --output-type DTO-python --run-name num_wqs_sweep_6 --cfg-filepath ./configs/small_junk3.json  --dto-version dev --num-threads-override 6 --num-iter 1000000 --exclude-pfs  --num-dsas 6 --results-dirname num_wqs_sweep_1
+#python sweep_all_test_settable_size5.py --output-type DTO-python --run-name num_wqs_sweep_7 --cfg-filepath ./configs/small_junk3.json  --dto-version dev --num-threads-override 6 --num-iter 1000000 --exclude-pfs  --num-dsas 7 --results-dirname num_wqs_sweep_1
+#python sweep_all_test_settable_size5.py --output-type DTO-python --run-name num_wqs_sweep_8 --cfg-filepath ./configs/small_junk3.json  --dto-version dev --num-threads-override 6 --num-iter 1000000 --exclude-pfs  --num-dsas 8 --results-dirname num_wqs_sweep_1
+
+
+#python sweep_all_test_settable_size5.py --output-type DTO-python --run-name num_wqs_sweep_7 --cfg-filepath ./configs/small_junk3.json  --dto-version dev --num-threads-override 7 --num-iter 1000000 --exclude-pfs  --num-dsas 7 --results-dirname num_wqs_sweep_1
+#python sweep_all_test_settable_size5.py --output-type DTO-python --run-name num_wqs_sweep_8 --cfg-filepath ./configs/small_junk3.json  --dto-version dev --num-threads-override 7 --num-iter 1000000 --exclude-pfs  --num-dsas 8 --results-dirname num_wqs_sweep_1
+
+#python sweep_all_test_settable_size5.py --output-type DTO-python --run-name num_wqs_sweep_8 --cfg-filepath ./configs/small_junk3.json  --dto-version dev --num-threads-override 8 --num-iter 1000000 --exclude-pfs  --num-dsas 8 --results-dirname num_wqs_sweep_1
+
+
+
+
+#python sweep_all_test_settable_size5.py --output-type DTO-python --run-name num_wqs_sweep_1 --cfg-filepath ./configs/small_junk3.json  --dto-version dev --num-iter 1000000 --exclude-pfs  --num-dsas 1 --results-dirname num_wqs_sweep_same_numa_1
+#python sweep_all_test_settable_size5.py --output-type DTO-python --run-name num_wqs_sweep_2 --cfg-filepath ./configs/small_junk3.json  --dto-version dev --num-iter 1000000 --exclude-pfs  --num-dsas 2 --results-dirname num_wqs_sweep_same_numa_1
+#python sweep_all_test_settable_size5.py --output-type DTO-python --run-name num_wqs_sweep_3 --cfg-filepath ./configs/small_junk3.json  --dto-version dev --num-iter 1000000 --exclude-pfs  --num-dsas 3 --results-dirname num_wqs_sweep_same_numa_1
+#python sweep_all_test_settable_size5.py --output-type DTO-python --run-name num_wqs_sweep_4 --cfg-filepath ./configs/small_junk3.json  --dto-version dev --num-iter 1000000 --exclude-pfs  --num-dsas 4 --results-dirname num_wqs_sweep_same_numa_1
+
+#python sweep_all_test_settable_size5.py --output-type DTO-python --run-name num_wqs_sweep_2 --cfg-filepath ./configs/small_junk3.json  --dto-version dev --num-threads-override 2 --num-iter 1000000 --exclude-pfs  --num-dsas 2 --results-dirname num_wqs_sweep_same_numa_1
+#python sweep_all_test_settable_size5.py --output-type DTO-python --run-name num_wqs_sweep_3 --cfg-filepath ./configs/small_junk3.json  --dto-version dev --num-threads-override 2 --num-iter 1000000 --exclude-pfs  --num-dsas 3 --results-dirname num_wqs_sweep_same_numa_1
+#python sweep_all_test_settable_size5.py --output-type DTO-python --run-name num_wqs_sweep_4 --cfg-filepath ./configs/small_junk3.json  --dto-version dev --num-threads-override 2 --num-iter 1000000 --exclude-pfs  --num-dsas 4 --results-dirname num_wqs_sweep_same_numa_1
+
+#python sweep_all_test_settable_size5.py --output-type DTO-python --run-name num_wqs_sweep_3 --cfg-filepath ./configs/small_junk3.json  --dto-version dev --num-threads-override 3 --num-iter 1000000 --exclude-pfs  --num-dsas 3 --results-dirname num_wqs_sweep_same_numa_1
+#python sweep_all_test_settable_size5.py --output-type DTO-python --run-name num_wqs_sweep_4 --cfg-filepath ./configs/small_junk3.json  --dto-version dev --num-threads-override 3 --num-iter 1000000 --exclude-pfs  --num-dsas 4 --results-dirname num_wqs_sweep_same_numa_1
+
+
+#python sweep_all_test_settable_size5.py --output-type DTO-python --run-name num_wqs_sweep_4 --cfg-filepath ./configs/small_junk3.json  --dto-version dev --num-threads-override 4 --num-iter 1000000 --exclude-pfs  --num-dsas 4 --results-dirname num_wqs_sweep_same_numa_1
+
+
+#python sweep_all_test_settable_size5.py --output-type DTO-python --run-name num_wqs_sweep_1 --cfg-filepath ./configs/small_junk3.json  --dto-version dev --num-iter 10000000 --exclude-pfs  --num-dsas 1 --results-dirname num_wqs_sweep_same_numa_2
+#python sweep_all_test_settable_size5.py --output-type DTO-python --run-name num_wqs_sweep_2 --cfg-filepath ./configs/small_junk3.json  --dto-version dev --num-iter 10000000 --exclude-pfs  --num-dsas 2 --results-dirname num_wqs_sweep_same_numa_2
+#python sweep_all_test_settable_size5.py --output-type DTO-python --run-name num_wqs_sweep_3 --cfg-filepath ./configs/small_junk3.json  --dto-version dev --num-iter 10000000 --exclude-pfs  --num-dsas 3 --results-dirname num_wqs_sweep_same_numa_2
+#python sweep_all_test_settable_size5.py --output-type DTO-python --run-name num_wqs_sweep_4 --cfg-filepath ./configs/small_junk3.json  --dto-version dev --num-iter 10000000 --exclude-pfs  --num-dsas 4 --results-dirname num_wqs_sweep_same_numa_2
+
+python sweep_all_test_settable_size5.py --output-type emon --run-name num_wqs_sweep_1 --cfg-filepath ./configs/small_junk4.json  --dto-version dev --no-stats --num-iter 100000000 --exclude-pfs  --num-dsas 1 --results-dirname num_wqs_sweep_same_numa_3
+python sweep_all_test_settable_size5.py --output-type emon --run-name num_wqs_sweep_2 --cfg-filepath ./configs/small_junk4.json  --dto-version dev --no-stats --num-iter 100000000 --exclude-pfs  --num-dsas 2 --results-dirname num_wqs_sweep_same_numa_3

@@ -441,7 +441,9 @@ static atomic_uint_fast16_t raw_num_waits[MAX_OPS];
 static atomic_uint_fast16_t raw_in_cache[MAX_OPS];
 static atomic_uint_fast32_t raw_cpu_times[MAX_OPS];
 static atomic_uint_fast32_t raw_total_times[MAX_OPS];
-static atomic_uint_fast16_t access_times[MAX_OPS];       
+static atomic_uint_fast16_t access_times[MAX_OPS];  
+static atomic_uint_fast32_t raw_sizes[MAX_OPS];
+static atomic_uint_fast32_t raw_dsa_sizes[MAX_OPS];
 
 #ifdef COLLECT_DSA_TIMESTAMPS
 static uint64_t op_start_timestamps[MAX_OPS];
@@ -798,6 +800,7 @@ static __always_inline void dsa_wait_and_adjust(const volatile uint8_t *comp, si
 		if (collect_alg_stats_raw_values) {
 			raw_num_waits[dto_op_counter] = local_num_waits;
 			raw_in_cache[dto_op_counter] = in_cache;
+			raw_dsa_sizes[dto_op_counter] = transaction_size;
 		}
 
 		dto_op_counter++;
@@ -837,6 +840,7 @@ static __always_inline void dsa_wait_and_adjust(const volatile uint8_t *comp, si
 	if (collect_alg_stats_raw_values) {
 		raw_num_waits[dto_op_counter] = local_num_waits;
 		raw_in_cache[dto_op_counter] = in_cache;
+		raw_dsa_sizes[dto_op_counter] = transaction_size;
 	}
 
 	dto_op_counter++;
@@ -1366,9 +1370,22 @@ static void print_alg_stats_dict(void)
 			LOG_STATS("%llu, ", raw_num_waits[i]);
 		}
 		LOG_STATS("],\n");
+
 		LOG_STATS("'all_in_cache': [");
 		for (uint64_t i=0;i<dto_op_counter;++i){
 			LOG_STATS("%llu, ", raw_in_cache[i]);
+		}
+		LOG_STATS("],\n");
+
+		LOG_STATS("'all_sizes': [");
+		for (uint64_t i=0;i<dto_op_counter;++i){
+			LOG_STATS("%llu, ", raw_sizes[i]);
+		}
+		LOG_STATS("],\n");
+
+		LOG_STATS("'all_dsa_sizes': [");
+		for (uint64_t i=0;i<dto_op_counter;++i){
+			LOG_STATS("%llu, ", raw_dsa_sizes[i]);
 		}
 		LOG_STATS("],\n");
 	}
@@ -2893,8 +2910,13 @@ static void dto_memset(void *s, int c, size_t n, int *result)
 		in_cache = (end - start) < 200;
 	}
 
-	if (collect_alg_stats_access_times)
-			access_times[dto_op_counter] = end - start;
+	if (collect_alg_stats_access_times) {
+		access_times[dto_op_counter] = end - start;
+	}
+
+	if (collect_alg_stats_raw_values) {
+		raw_sizes[dto_op_counter] = n;
+	}
 
 	/* cpu_size_fraction gauranteed to be >= 0 and < 1 */
 	//uint16_t bucket = get_algorithm_instance(n);
@@ -2902,7 +2924,7 @@ static void dto_memset(void *s, int c, size_t n, int *result)
 	size_t cpu_size_fraction = auto_tune_states[get_algorithm_instance(n,MEMSET)].cpu_size_fraction[in_cache];
 	//LOG_TRACE("dto_memset size %d cpu fraction %d, alg instance %u\n",n,cpu_size_fraction,get_algorithm_instance(n,MEMSET));
 	cpu_size = n * cpu_size_fraction / 100;
-	dsa_size = n - cpu_size;
+	dsa_size = n - cpu_size;	
 
 	thr_bytes_completed = 0;
 #ifdef DTO_STATS_SUPPORT
@@ -3022,8 +3044,12 @@ static uint8_t dto_memcpymove(void *dest, const void *src, size_t n, bool is_mem
 		is_overlapping = 1;
 	}
 	else {
-		if (collect_alg_stats_access_times)
+		if (collect_alg_stats_access_times) {
 			access_times[dto_op_counter] = end - start;
+		}
+		if (collect_alg_stats_raw_values) {
+			raw_sizes[dto_op_counter] = n;
+		}
 		cpu_size = n * cpu_size_fraction / 100;
 	}
 
