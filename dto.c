@@ -298,11 +298,10 @@ struct thread_stats {
 	int fail_counter[HIST_NO_BUCKETS][MAX_FAILURES];
 };
 
-/* Thread-local stats instance */
-static __thread struct thread_stats tl_stats;
-static __thread bool tl_stats_registered = false;
+/* Thread-local pointer to heap-allocated stats */
+static __thread struct thread_stats *tl_stats = NULL;
 
-/* Global registry of all thread-local stats for aggregation */
+/* Global registry of all thread stats for aggregation */
 #define MAX_STAT_THREADS 256
 static struct thread_stats *global_stats_registry[MAX_STAT_THREADS];
 static atomic_int global_stats_count = 0;
@@ -490,12 +489,16 @@ static void dto_log(int req_log_level, const char *fmt, ...)
 static void child (void)
 {
 #ifdef DTO_STATS_SUPPORT
-	/* Reset the thread-local stats and global registry */
-	memset(&tl_stats, 0, sizeof(tl_stats));
-	tl_stats_registered = false;
+	/* Reset the thread-local stats pointer and global registry */
+	tl_stats = NULL;
 
 	pthread_mutex_lock(&stats_registry_lock);
-	memset(global_stats_registry, 0, sizeof(global_stats_registry));
+	/* Free old stats structures */
+	int count = atomic_load(&global_stats_count);
+	for (int i = 0; i < count && i < MAX_STAT_THREADS; ++i) {
+		free(global_stats_registry[i]);
+		global_stats_registry[i] = NULL;
+	}
 	global_stats_count = 0;
 	pthread_mutex_unlock(&stats_registry_lock);
 #endif
@@ -1315,13 +1318,16 @@ static void update_stats(int op, size_t n, bool overlapping, size_t bytes_comple
 
 	int bucket = (n / HIST_BUCKET_SIZE);
 
-	/* Register this thread's stats on first use */
-	if (unlikely(!tl_stats_registered)) {
+	/* Allocate and register this thread's stats on first use */
+	if (unlikely(tl_stats == NULL)) {
+		tl_stats = calloc(1, sizeof(struct thread_stats));
+		if (tl_stats == NULL)
+			return;  /* Out of memory, skip stats */
+
 		pthread_mutex_lock(&stats_registry_lock);
 		int idx = atomic_fetch_add(&global_stats_count, 1);
 		if (idx < MAX_STAT_THREADS) {
-			global_stats_registry[idx] = &tl_stats;
-			tl_stats_registered = true;
+			global_stats_registry[idx] = tl_stats;
 		}
 		pthread_mutex_unlock(&stats_registry_lock);
 	}
@@ -1330,11 +1336,11 @@ static void update_stats(int op, size_t n, bool overlapping, size_t bytes_comple
 		bucket = HIST_NO_BUCKETS-1;
 
 	/* Update thread-local stats (no atomics needed!) */
-	++tl_stats.op_counter[bucket][group][op];
-	tl_stats.bytes_counter[bucket][group] += bytes_completed;
-	tl_stats.lat_counter[bucket][group][op] += elapsed_ns;
+	++tl_stats->op_counter[bucket][group][op];
+	tl_stats->bytes_counter[bucket][group] += bytes_completed;
+	tl_stats->lat_counter[bucket][group][op] += elapsed_ns;
 	if (group == DSA_CALL_FAILED)
-		++tl_stats.fail_counter[bucket][error_code];
+		++tl_stats->fail_counter[bucket][error_code];
 }
 
 static void print_stats(void)
