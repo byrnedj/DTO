@@ -2069,6 +2069,16 @@ static int init_dto(void)
 
 			dto_dsa_cc = !!dto_dsa_cc;
 		}
+		
+                env_str = getenv("DTO_DSA_BOF");
+		if (env_str != NULL) {
+			errno = 0;
+			dto_dsa_bof = strtoul(env_str, NULL, 10);
+			if (errno)
+				dto_dsa_bof = 0;
+
+			dto_dsa_bof = !!dto_dsa_bof;
+		}
 
 		env_str = getenv("DTO_DSA_BATCH");
 		if (env_str != NULL) {
@@ -2297,10 +2307,10 @@ static int init_dto(void)
     
 			// display configuration
 			LOG_TRACE("log_level: %d, collect_stats: %d, use_std_lib_calls: %d, dsa_min_size: %lu, "
-				"cpu_size_fraction: %.2f, wait_method: %s, auto_adjust_knobs: %d, numa_awareness: %s, dto_dsa_cc: %d, dto_dsa_batch: %d, "
+				"cpu_size_fraction: %.2f, wait_method: %s, auto_adjust_knobs: %d, numa_awareness: %s, dto_dsa_cc: %d, dto_dsa_batch: %d, dto_dsa_bof: %d, "
 				"dto_hugepages: %d, dto_page_size: %zu, dto_use_c02: %d, max_wqs_supported: %d\n",
 				log_level, collect_stats, use_std_lib_calls, dsa_min_size,
-				cpu_size_fraction_float, wait_names[wait_method], auto_adjust_knobs, numa_aware_names[is_numa_aware], dto_dsa_cc, dto_dsa_batch,
+				cpu_size_fraction_float, wait_names[wait_method], auto_adjust_knobs, numa_aware_names[is_numa_aware], dto_dsa_cc, dto_dsa_batch, dto_dsa_bof,
 				dto_hugepages, dto_page_size, dto_use_c02, max_wqs_supported);
 			for (int i = 0; i < num_wqs; i++)
 				LOG_TRACE("[%d] wq_path: %s, wq_size: %d, dsa_cap: %lx\n", i,
@@ -2459,6 +2469,84 @@ static __always_inline  struct dto_wq *get_wq(void* buf)
 	}
 
 	return wq;
+}
+
+static void dto_memset_api(void *s, int c, size_t n)
+{
+        int r = 0;
+        int *result = &r;
+
+	uint64_t memset_pattern;
+	size_t cpu_size, dsa_size;
+	struct dto_wq *wq = get_wq(s);
+
+	for (int i = 0; i < 8; ++i)
+		((uint8_t *) &memset_pattern)[i] = (uint8_t) c;
+
+	thr_desc.opcode = DSA_OPCODE_MEMFILL;
+	thr_desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
+	if (dto_dsa_cc && (wq->dsa_gencap & GENCAP_CC_MEMORY))
+		thr_desc.flags |= IDXD_OP_FLAG_CC;
+        if (dto_dsa_bof)
+            thr_desc.flags |= IDXD_OP_FLAG_BOF;
+	thr_desc.completion_addr = (uint64_t)&thr_comp;
+	thr_desc.pattern = memset_pattern;
+
+	/* cpu_size_fraction guaranteed to be >= 0 and < 100 */
+        uint64_t cpu_frac = auto_adjust_knobs == AUTO_ADJUST_KNOBS_V2 ?
+            tl_cpu_size_fraction : cpu_size_fraction;
+	cpu_size = n * cpu_frac / 100;
+	dsa_size = n - cpu_size;
+
+	thr_bytes_completed = 0;
+	if (dsa_size <= wq->max_transfer_size) {
+		thr_desc.dst_addr = (uint64_t) s + cpu_size;
+		thr_desc.xfer_size = (uint32_t) dsa_size;
+		thr_comp.status = 0;
+		*result = dsa_submit(wq, &thr_desc);
+		if (likely(*result == SUCCESS)) {
+			if (cpu_size) {
+				orig_memset(s, c, cpu_size);
+				thr_bytes_completed = cpu_size;
+			}
+			*result = dsa_wait(wq, &thr_desc, &thr_comp.status);
+		}
+	} else {
+		uint32_t threshold;
+		size_t current_cpu_size_fraction = cpu_frac;  // the cpu_size_fraction might be changed by the auto tune algorithm
+		threshold = wq->max_transfer_size * 100 / (100 - current_cpu_size_fraction);
+
+		do {
+			size_t len;
+
+			len = n <= threshold ? n : threshold;
+
+			cpu_size = len * current_cpu_size_fraction / 100;
+			dsa_size = len - cpu_size;
+
+			thr_desc.dst_addr = (uint64_t) s + cpu_size + thr_bytes_completed;
+			thr_desc.xfer_size = (uint32_t) dsa_size;
+			thr_comp.status = 0;
+			*result = dsa_submit(wq, &thr_desc);
+			if (*result == SUCCESS) {
+				if (cpu_size) {
+					void *s1 = s + thr_bytes_completed;
+
+					orig_memset(s1, c, cpu_size);
+					thr_bytes_completed += cpu_size;
+				}
+				*result = dsa_wait(wq, &thr_desc, &thr_comp.status);
+			}
+
+			if (*result != SUCCESS)
+				break;
+			n -= len;
+			/* If remaining bytes are less than dsa_min_size,
+			 * dont submit to DSA. Instead, complete remaining
+			 * bytes on CPU
+			 */
+		} while (n >= dsa_min_size);
+	}
 }
 
 static void dto_memset(void *s, int c, size_t n, int *result)
@@ -2729,6 +2817,8 @@ static bool dto_memcpymove(void *dest, const void *src, size_t n, bool is_memcpy
 	thr_desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
 	if (dto_dsa_cc && (wq->dsa_gencap & GENCAP_CC_MEMORY))
 		thr_desc.flags |= IDXD_OP_FLAG_CC;
+        if (dto_dsa_bof)
+            thr_desc.flags |= IDXD_OP_FLAG_BOF;
 	thr_desc.completion_addr = (uint64_t)&thr_comp;
 
         uint64_t cpu_frac = auto_adjust_knobs == AUTO_ADJUST_KNOBS_V2 ?
