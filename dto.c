@@ -290,10 +290,23 @@ static struct timespec dto_start_time;
 		}								\
 	} while (0)								\
 
-static atomic_int op_counter[HIST_NO_BUCKETS][MAX_STAT_GROUP][MAX_MEMOP];
-static atomic_ullong bytes_counter[HIST_NO_BUCKETS][MAX_STAT_GROUP];
-static atomic_ullong lat_counter[HIST_NO_BUCKETS][MAX_STAT_GROUP][MAX_MEMOP];
-static atomic_int fail_counter[HIST_NO_BUCKETS][MAX_FAILURES];
+/* Thread-local stats structure */
+struct thread_stats {
+	int op_counter[HIST_NO_BUCKETS][MAX_STAT_GROUP][MAX_MEMOP];
+	unsigned long long bytes_counter[HIST_NO_BUCKETS][MAX_STAT_GROUP];
+	unsigned long long lat_counter[HIST_NO_BUCKETS][MAX_STAT_GROUP][MAX_MEMOP];
+	int fail_counter[HIST_NO_BUCKETS][MAX_FAILURES];
+};
+
+/* Thread-local stats instance */
+static __thread struct thread_stats tl_stats;
+static __thread bool tl_stats_registered = false;
+
+/* Global registry of all thread-local stats for aggregation */
+#define MAX_STAT_THREADS 256
+static struct thread_stats *global_stats_registry[MAX_STAT_THREADS];
+static atomic_int global_stats_count = 0;
+static pthread_mutex_t stats_registry_lock = PTHREAD_MUTEX_INITIALIZER;
 #endif
 
 /* call initialize/cleanup functions when library is loaded/unloaded */
@@ -477,20 +490,14 @@ static void dto_log(int req_log_level, const char *fmt, ...)
 static void child (void)
 {
 #ifdef DTO_STATS_SUPPORT
-	int i, j, k;
+	/* Reset the thread-local stats and global registry */
+	memset(&tl_stats, 0, sizeof(tl_stats));
+	tl_stats_registered = false;
 
-	/* Reset the counters */
-	for (i = 0; i < HIST_NO_BUCKETS; i++) {
-		for (j = 0; j < MAX_STAT_GROUP; j++) {
-			for (k = 0; k < MAX_MEMOP; k++) {
-				op_counter[i][j][k] = 0;
-				lat_counter[i][j][k] = 0;
-			}
-			bytes_counter[i][j] = 0;
-		}
-		for (j = 0; j < MAX_FAILURES; j++)
-			fail_counter[i][j] = 0;
-	}
+	pthread_mutex_lock(&stats_registry_lock);
+	memset(global_stats_registry, 0, sizeof(global_stats_registry));
+	global_stats_count = 0;
+	pthread_mutex_unlock(&stats_registry_lock);
 #endif
 	dto_initializing = 0;
 	dto_initialized = 0;
@@ -1308,19 +1315,33 @@ static void update_stats(int op, size_t n, bool overlapping, size_t bytes_comple
 
 	int bucket = (n / HIST_BUCKET_SIZE);
 
+	/* Register this thread's stats on first use */
+	if (unlikely(!tl_stats_registered)) {
+		pthread_mutex_lock(&stats_registry_lock);
+		int idx = atomic_fetch_add(&global_stats_count, 1);
+		if (idx < MAX_STAT_THREADS) {
+			global_stats_registry[idx] = &tl_stats;
+			tl_stats_registered = true;
+		}
+		pthread_mutex_unlock(&stats_registry_lock);
+	}
+
 	if (bucket >= HIST_NO_BUCKETS)  /* last bucket includes remaining sizes */
 		bucket = HIST_NO_BUCKETS-1;
-	++op_counter[bucket][group][op];
-	bytes_counter[bucket][group] += bytes_completed;
-	lat_counter[bucket][group][op] += elapsed_ns;
-	if (group == DSA_CALL_FAILED)
-		++fail_counter[bucket][error_code];
 
+	/* Update thread-local stats (no atomics needed!) */
+	++tl_stats.op_counter[bucket][group][op];
+	tl_stats.bytes_counter[bucket][group] += bytes_completed;
+	tl_stats.lat_counter[bucket][group][op] += elapsed_ns;
+	if (group == DSA_CALL_FAILED)
+		++tl_stats.fail_counter[bucket][error_code];
 }
 
 static void print_stats(void)
 {
 	struct timespec dto_end_time;
+	struct thread_stats aggregated_stats;
+	int num_threads;
 
 	if (likely(!collect_stats))
 		return;
@@ -1328,6 +1349,31 @@ static void print_stats(void)
 	clock_gettime(CLOCK_BOOTTIME, &dto_end_time);
 
 	dto_stats_log("DTO Run Time: %ld ms\n", TS_NS(dto_start_time, dto_end_time)/1000000);
+
+	/* Aggregate all thread-local stats */
+	memset(&aggregated_stats, 0, sizeof(aggregated_stats));
+
+	pthread_mutex_lock(&stats_registry_lock);
+	num_threads = atomic_load(&global_stats_count);
+	for (int tid = 0; tid < num_threads && tid < MAX_STAT_THREADS; ++tid) {
+		struct thread_stats *ts = global_stats_registry[tid];
+		if (ts == NULL)
+			continue;
+
+		for (int b = 0; b < HIST_NO_BUCKETS; ++b) {
+			for (int g = 0; g < MAX_STAT_GROUP; ++g) {
+				for (int o = 0; o < MAX_MEMOP; ++o) {
+					aggregated_stats.op_counter[b][g][o] += ts->op_counter[b][g][o];
+					aggregated_stats.lat_counter[b][g][o] += ts->lat_counter[b][g][o];
+				}
+				aggregated_stats.bytes_counter[b][g] += ts->bytes_counter[b][g];
+			}
+			for (int f = 0; f < MAX_FAILURES; ++f) {
+				aggregated_stats.fail_counter[b][f] += ts->fail_counter[b][f];
+			}
+		}
+	}
+	pthread_mutex_unlock(&stats_registry_lock);
 
 	// display stats
 	for (int t = 0; t < 2; ++t) {
@@ -1368,7 +1414,7 @@ static void print_stats(void)
 
 			for (int g = 0; g < MAX_STAT_GROUP; ++g) {
 				for (int o = 0; o < MAX_MEMOP; ++o) {
-					if (op_counter[b][g][o] != 0) {
+					if (aggregated_stats.op_counter[b][g][o] != 0) {
 						empty = false;
 						break;
 					}
@@ -1387,11 +1433,11 @@ static void print_stats(void)
 			for (int g = 0; g < MAX_STAT_GROUP - 1; ++g) {
 				for (int o = 0; o < MAX_MEMOP; ++o) {
 					if (t == 0) {
-						dto_stats_log("%-8d ", op_counter[b][g][o]);
+						dto_stats_log("%-8d ", aggregated_stats.op_counter[b][g][o]);
 						continue;
 					}
-					if (op_counter[b][g][o] != 0) {
-						double avg_us = ((double) lat_counter[b][g][o])/(((double) op_counter[b][g][o]) * 1000.0);
+					if (aggregated_stats.op_counter[b][g][o] != 0) {
+						double avg_us = ((double) aggregated_stats.lat_counter[b][g][o])/(((double) aggregated_stats.op_counter[b][g][o]) * 1000.0);
 
 						dto_stats_log("%-8.2f ", avg_us);
 					} else {
@@ -1399,11 +1445,11 @@ static void print_stats(void)
 					}
 				}
 				if (t == 0)
-					dto_stats_log("%-12lld ", bytes_counter[b][g]);
+					dto_stats_log("%-12lld ", aggregated_stats.bytes_counter[b][g]);
 			}
 			if (t == 0)
 				for (int o = 1; o < MAX_FAILURES; ++o)
-					dto_stats_log("%-6d ", fail_counter[b][o]);
+					dto_stats_log("%-6d ", aggregated_stats.fail_counter[b][o]);
 			dto_stats_log("\n");
 		}
 	}
