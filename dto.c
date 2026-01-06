@@ -56,6 +56,7 @@
 #define DTO_DEFAULT_USLEEP 20
 #define DTO_INITIALIZED 0
 #define DTO_INITIALIZING 1
+#define WQ_PATH 24 // max length of wq path string, e.g., /dev/dsa/wq0.0
 
 #define NSEC_PER_SEC (1000000000)
 #define MSEC_PER_SEC (1000)
@@ -74,15 +75,15 @@ static void * (*orig_memmove)(void *dest, const void *src, size_t n);
 static int (*orig_memcmp)(const void *s1, const void *s2, size_t n);
 
 struct dto_wq {
+	int wq_fd;
+	bool wq_mmapped;
+	void *wq_portal;
 	struct accfg_wq *acc_wq;
-	char wq_path[PATH_MAX];
 	uint64_t dsa_gencap;
 	int wq_size;
 	uint32_t max_transfer_size;
-	int wq_fd;
-	void *wq_portal;
-	bool wq_mmapped;
-};
+	char wq_path[WQ_PATH];
+} __attribute__((aligned(64)));
 
 struct dto_device {
 	struct dto_wq* wqs[MAX_WQS];
@@ -123,7 +124,7 @@ static atomic_uchar dto_initializing;
 static uint8_t use_std_lib_calls;
 static enum numa_aware is_numa_aware;
 static size_t dsa_min_size = DTO_DEFAULT_MIN_SIZE;
-static int wait_method = WAIT_YIELD;
+static int wait_method = WAIT_BUSYPOLL;
 static size_t cpu_size_fraction;   // range of values is 0 to 99
 
 static uint8_t dto_dsa_memcpy = 1;
@@ -152,6 +153,7 @@ static uint8_t fork_handler_registered;
 enum memop {
 	MEMSET = 0x0,
 	MEMCOPY,
+	MEMMOVE_INTERNAL,
 	MEMCOPY_ASYNC,
 	MEMMOVE,
 	MEMCMP,
@@ -161,7 +163,8 @@ enum memop {
 static const char * const memop_names[] = {
 	[MEMSET] = "set",
 	[MEMCOPY] = "cpy",
-	[MEMCOPY_ASYNC] = "cpy_async",
+	[MEMCOPY_ASYNC] = "acpy",
+	[MEMMOVE_INTERNAL] = "movi",
 	[MEMMOVE] = "mov",
 	[MEMCMP] = "cmp"
 };
@@ -1630,6 +1633,7 @@ static __always_inline  struct dto_wq *get_wq(void* buf)
 	struct dto_wq* wq = NULL;
         if (wq_index != -1) {
             wq = &wqs[wq_index];
+            __builtin_prefetch(wq, 0, 3);
             return wq;
         }
 
@@ -1886,6 +1890,7 @@ __attribute__((visibility("default"))) void dto_memcpy_async(void *dest, const v
 
 static void dto_memcpymove(void *dest, const void *src, size_t n, bool is_memcpy, int *result)
 {
+        
 	struct dto_wq *wq = get_wq(dest);
 	size_t cpu_size, dsa_size;
 
@@ -2023,6 +2028,107 @@ static int dto_memcmp(const void *s1, const void *s2, size_t n, int *result)
 	}
 	return cmp_result;
 }
+
+
+static inline void *fast_memmove(void *dst, const void *src, size_t n) {
+    unsigned char *d = (unsigned char *)dst;
+    const unsigned char *s = (const unsigned char *)src;
+
+    if (d == s || n == 0) return dst;
+
+    // If no harmful overlap, we can copy forward.
+    // Harmful overlap exists when dst starts inside [src, src+n).
+    if (d < s || d >= s + n) {
+        // -------- forward copy --------
+        // Small sizes: straight byte copy often wins.
+        if (n < 32) {
+            while (n--) *d++ = *s++;
+            return dst;
+        }
+
+        // Align destination to word boundary (helps word stores).
+        const size_t W = sizeof(size_t);
+        while (((uintptr_t)d & (W - 1)) && n) {
+            *d++ = *s++;
+            --n;
+        }
+
+        // Word copy (unaligned source is OK in portable C if we only
+        // do word loads from aligned addresses; but s may be unaligned.
+        // We therefore only do word copies when BOTH are aligned.
+        if ((((uintptr_t)s & (W - 1)) == 0) && n >= W) {
+            size_t *dw = (size_t *)d;
+            const size_t *sw = (const size_t *)s;
+
+            // Copy 4 words per iteration (unroll).
+            while (n >= 4 * W) {
+                dw[0] = sw[0];
+                dw[1] = sw[1];
+                dw[2] = sw[2];
+                dw[3] = sw[3];
+                dw += 4;
+                sw += 4;
+                n  -= 4 * W;
+            }
+            while (n >= W) {
+                *dw++ = *sw++;
+                n -= W;
+            }
+
+            d = (unsigned char *)dw;
+            s = (const unsigned char *)sw;
+        }
+
+        // Tail bytes
+        while (n--) *d++ = *s++;
+        return dst;
+    } else {
+        // -------- backward copy (overlap) --------
+        d += n;
+        s += n;
+
+        if (n < 32) {
+            while (n--) *--d = *--s;
+            return dst;
+        }
+
+        const size_t W = sizeof(size_t);
+
+        // Align destination end to word boundary.
+        while (((uintptr_t)d & (W - 1)) && n) {
+            *--d = *--s;
+            --n;
+        }
+
+        // Word copy backwards only when BOTH are aligned.
+        if ((((uintptr_t)s & (W - 1)) == 0) && n >= W) {
+            size_t *dw = (size_t *)d;
+            const size_t *sw = (const size_t *)s;
+
+            // Copy backwards in chunks.
+            while (n >= 4 * W) {
+                dw -= 4;
+                sw -= 4;
+                dw[3] = sw[3];
+                dw[2] = sw[2];
+                dw[1] = sw[1];
+                dw[0] = sw[0];
+                n -= 4 * W;
+            }
+            while (n >= W) {
+                *--dw = *--sw;
+                n -= W;
+            }
+
+            d = (unsigned char *)dw;
+            s = (const unsigned char *)sw;
+        }
+
+        while (n--) *--d = *--s;
+        return dst;
+    }
+}
+
 
 /* The dto_internal_mem* APIs are used only when mem* APIs are
  * called before DTO is properly initialized. So these
@@ -2204,12 +2310,18 @@ void *memmove(void *dest, const void *src, size_t n)
 #endif
 		if (thr_bytes_completed != n) {
 			/* fallback to std call if job is only partially completed */
-			use_orig_func = 1;
 			n -= thr_bytes_completed;
 			if (thr_comp.result == 0) {
 				dest = (void *)((uint64_t)dest + thr_bytes_completed);
 				src = (const void *)((uint64_t)src + thr_bytes_completed);
 			}
+#ifdef DTO_STATS_SUPPORT
+			DTO_COLLECT_STATS_START(collect_stats, st);
+#endif
+			fast_memmove(dest, src, n);
+#ifdef DTO_STATS_SUPPORT
+			DTO_COLLECT_STATS_CPU_END(collect_stats, st, et, MEMMOVE_INTERNAL, n, n);
+#endif
 		}
 	}
 
