@@ -1888,11 +1888,13 @@ static void dto_memset(void *s, int c, size_t n, int *result)
  *
  * Note: Addresses should be page-aligned for best results.
  */
-void dto_memset_pages(void *start_addr, void *end_addr, size_t page_size)
+__attribute__((visibility("default"))) void dto_memset_pages(void *start_addr, void *end_addr, size_t page_size)
 {
 	size_t total_size, num_pages, i;
 	struct dsa_hw_desc descs[MAX_PAGES_PER_CALL];
 	struct dsa_completion_record comps[MAX_PAGES_PER_CALL] __attribute__((aligned(32)));
+        orig_memset(comps, 0, sizeof(comps));
+        orig_memset(descs, 0, sizeof(descs));
 	uint8_t wq_indices[MAX_PAGES_PER_CALL];
 	bool submitted[MAX_PAGES_PER_CALL];
 	uint64_t zero_pattern = 0;
