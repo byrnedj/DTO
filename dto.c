@@ -52,6 +52,7 @@
 #define WQ_MMAPPED 1
 #define MAX_WQS 32
 #define MAX_NUMA_NODES 32
+#define MAX_PAGES_PER_CALL 256
 #define DTO_DEFAULT_MIN_SIZE 32768
 #define DTO_DEFAULT_USLEEP 20
 #define DTO_INITIALIZED 0
@@ -119,6 +120,7 @@ static atomic_int num_threads;
 static uint8_t num_wqs;
 static uint8_t max_wqs_supported;
 static atomic_uchar next_wq;
+static atomic_uchar memset_pages_rr;
 static atomic_uchar dto_initialized;
 static atomic_uchar dto_initializing;
 static uint8_t use_std_lib_calls;
@@ -1872,6 +1874,119 @@ static void dto_memset(void *s, int c, size_t n, int *result)
 			 * bytes on CPU
 			 */
 		} while (n >= dsa_min_size);
+	}
+}
+
+/**
+ * dto_memset_pages - Zero-fill memory pages using DSA descriptors
+ * @start_addr: Starting virtual address (should be page-aligned)
+ * @end_addr: Ending virtual address (exclusive)
+ * @page_size: Size of each page in bytes
+ *
+ * Distributes work across all available DSA work queues in round-robin
+ * fashion for optimal performance. Falls back to CPU memset on errors.
+ *
+ * Note: Addresses should be page-aligned for best results.
+ */
+void dto_memset_pages(void *start_addr, void *end_addr, size_t page_size)
+{
+	size_t total_size, num_pages, i;
+	struct dsa_hw_desc descs[MAX_PAGES_PER_CALL];
+	struct dsa_completion_record comps[MAX_PAGES_PER_CALL] __attribute__((aligned(32)));
+	uint8_t wq_indices[MAX_PAGES_PER_CALL];
+	bool submitted[MAX_PAGES_PER_CALL];
+	uint64_t zero_pattern = 0;
+	size_t pages_to_process;
+	void *current_addr;
+
+	/* Input validation */
+	if (start_addr >= end_addr || page_size == 0)
+		return;
+
+	total_size = (size_t)((char *)end_addr - (char *)start_addr);
+	num_pages = total_size / page_size;
+
+	if (num_pages == 0)
+		return;
+
+	/* Fall back to CPU if no work queues available */
+	if (num_wqs == 0) {
+		orig_memset(start_addr, 0, total_size);
+		return;
+	}
+
+	current_addr = start_addr;
+
+	/* Process pages in batches of MAX_PAGES_PER_CALL */
+	while (num_pages > 0) {
+		pages_to_process = num_pages > MAX_PAGES_PER_CALL ? MAX_PAGES_PER_CALL : num_pages;
+
+		/* Initialize tracking arrays */
+		for (i = 0; i < pages_to_process; i++) {
+			submitted[i] = false;
+		}
+
+		/* Submit phase - distribute descriptors across all WQs in round-robin */
+		for (i = 0; i < pages_to_process; i++) {
+			uint8_t wq_idx = memset_pages_rr++ % num_wqs;
+			struct dto_wq *wq = &wqs[wq_idx];
+			void *page_addr = (char *)current_addr + (i * page_size);
+
+			/* Check if page_size exceeds max transfer size */
+			if (page_size > wq->max_transfer_size) {
+				/* Fall back to CPU for this page */
+				orig_memset(page_addr, 0, page_size);
+				continue;
+			}
+
+			/* Setup descriptor for memfill operation */
+			descs[i].opcode = DSA_OPCODE_MEMFILL;
+			descs[i].flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR | IDXD_OP_FLAG_BOF;
+
+			/* Add cache control if supported */
+			if (dto_dsa_cc && (wq->dsa_gencap & GENCAP_CC_MEMORY))
+				descs[i].flags |= IDXD_OP_FLAG_CC;
+
+			descs[i].completion_addr = (uint64_t)&comps[i];
+			descs[i].dst_addr = (uint64_t)page_addr;
+			descs[i].xfer_size = (uint32_t)page_size;
+			descs[i].pattern = zero_pattern;
+
+			/* Initialize completion record */
+			comps[i].status = 0;
+
+			/* Prefetch WQ portal for better performance */
+			__builtin_prefetch(wq->wq_portal, 1, 3);
+
+			/* Submit descriptor */
+			int ret = dsa_submit(wq, &descs[i]);
+			if (ret == SUCCESS) {
+				wq_indices[i] = wq_idx;
+				submitted[i] = true;
+			} else {
+				/* Submission failed, fall back to CPU for this page */
+				orig_memset(page_addr, 0, page_size);
+			}
+		}
+
+		/* Wait phase - wait for all submitted descriptors */
+		for (i = 0; i < pages_to_process; i++) {
+			if (submitted[i]) {
+				struct dto_wq *wq = &wqs[wq_indices[i]];
+				void *page_addr = (char *)current_addr + (i * page_size);
+
+				int ret = dsa_wait(wq, &descs[i], &comps[i].status);
+
+				/* On error, fall back to CPU */
+				if (ret != SUCCESS) {
+					orig_memset(page_addr, 0, page_size);
+				}
+			}
+		}
+
+		/* Update for next batch */
+		current_addr = (char *)current_addr + (pages_to_process * page_size);
+		num_pages -= pages_to_process;
 	}
 }
 
