@@ -11,6 +11,7 @@ typedef void(*callback_t)(void*);
 void dto_memcpy_async(void *dest, const void *src, size_t n, callback_t cb, void* args);
 uint64_t dto_memcpy_crc_async(void *dest, const void *src, size_t n, callback_t cb, void* args);
 uint64_t dto_crc(const void *src, size_t n, callback_t cb, void* args);
+void dto_memset_pages(void *start_addr, void *end_addr, size_t page_size);
 
 #ifdef __cplusplus
 }
