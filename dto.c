@@ -1912,7 +1912,7 @@ __attribute__((visibility("default"))) void dto_memset_pages(void *start_addr, v
 		return;
 
 	/* Fall back to CPU if no work queues available */
-	if (num_wqs == 0) {
+	if (num_wqs == 0 || !dto_dsa_memset) {
 		orig_memset(start_addr, 0, total_size);
 		return;
 	}
@@ -1988,6 +1988,7 @@ __attribute__((visibility("default"))) void dto_memset_pages(void *start_addr, v
 
 		/* Update for next batch */
 		current_addr = (char *)current_addr + (pages_to_process * page_size);
+                //fprintf(stderr, "Processed %zu pages, %zu remaining\n", pages_to_process, num_pages - pages_to_process);
 		num_pages -= pages_to_process;
 	}
 }
