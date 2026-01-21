@@ -756,12 +756,12 @@ void monitor_dsa_end_times( uint64_t* num_ops, uint64_t max_ops)
  *      - If cpu_size_fraction not too low, decrease it by CSF_STEP_DECREMENT
  *      - else if dsa_min_size not too low, decrease it by DMS_STEP_DECREMENT
  */
-static __always_inline void dsa_wait_and_adjust(const volatile uint8_t *comp, size_t transaction_size, size_t unsplit_size, uint8_t op, uint64_t start1, uint16_t in_cache)
+static __always_inline void dsa_wait_and_adjust(const volatile uint8_t *comp, size_t transaction_size, size_t unsplit_size, uint8_t op, uint64_t start1, uint16_t in_cache, uint16_t collect_in_cache)
 {
 	uint64_t local_num_waits = 0;
 	uint64_t start, end, cycles, total_cycles, cpu_cycles;
 
-	number_in_cache += in_cache;
+	number_in_cache += collect_in_cache;
 
 	start = rdtsc();
 	//LOG_TRACE("calling get_algorithm_instance\n");
@@ -799,7 +799,7 @@ static __always_inline void dsa_wait_and_adjust(const volatile uint8_t *comp, si
 
 		if (collect_alg_stats_raw_values) {
 			raw_num_waits[dto_op_counter] = local_num_waits;
-			raw_in_cache[dto_op_counter] = in_cache;
+			raw_in_cache[dto_op_counter] = collect_in_cache;
 			raw_dsa_sizes[dto_op_counter] = transaction_size;
 		}
 
@@ -839,7 +839,7 @@ static __always_inline void dsa_wait_and_adjust(const volatile uint8_t *comp, si
 
 	if (collect_alg_stats_raw_values) {
 		raw_num_waits[dto_op_counter] = local_num_waits;
-		raw_in_cache[dto_op_counter] = in_cache;
+		raw_in_cache[dto_op_counter] = collect_in_cache;
 		raw_dsa_sizes[dto_op_counter] = transaction_size;
 	}
 
@@ -902,7 +902,7 @@ static __always_inline void dsa_wait_and_adjust(const volatile uint8_t *comp, si
 			auto_tune_states[bucket].adjust_wait_time = 0;
 			auto_tune_states[bucket].adjust_cpu_time = 0;
 			auto_tune_states[bucket].adjust_total_time = 0;
-			DTO_COLLECT_ALG_STATS(collect_alg_stats, avg_num_waits, avg_wait_time, avg_cpu_time, avg_total_time, ut, auto_tune_states[bucket].cpu_size_fraction[in_cache], dsa_min_size, unsplit_size, bucket, in_cache);
+			DTO_COLLECT_ALG_STATS(collect_alg_stats, avg_num_waits, avg_wait_time, avg_cpu_time, avg_total_time, ut, auto_tune_states[bucket].cpu_size_fraction[in_cache], dsa_min_size, unsplit_size, bucket, collect_in_cache);
 #endif
 		}
 	}
@@ -913,10 +913,10 @@ static __always_inline void dsa_wait_and_adjust(const volatile uint8_t *comp, si
 }   
 
 static __always_inline int dsa_wait(struct dto_wq *wq,
-	struct dsa_hw_desc *hw, size_t unsplit_size, volatile uint8_t *comp, uint8_t op, uint64_t start, uint16_t in_cache)
+	struct dsa_hw_desc *hw, size_t unsplit_size, volatile uint8_t *comp, uint8_t op, uint64_t start, uint16_t in_cache, uint16_t collect_in_cache)
 {
 	if (auto_adjust_knobs)
-		dsa_wait_and_adjust(comp, hw->xfer_size, unsplit_size, op, start, in_cache);
+		dsa_wait_and_adjust(comp, hw->xfer_size, unsplit_size, op, start, in_cache, collect_in_cache);
 	else
 		dsa_wait_no_adjust(comp);
 
@@ -2888,7 +2888,8 @@ static void dto_memset(void *s, int c, size_t n, int *result)
 	//LOG_TRACE("dto_memset size %d value %x pointer %x descriptor %x\n",n,c,s,&thr_desc);
 	
 	uint64_t memset_pattern, start, end;
-	uint16_t in_cache = false;
+	uint16_t in_cache = 0;
+	uint16_t collect_in_cache;
 	size_t cpu_size, dsa_size, unsplit_size;
 	struct dto_wq *wq = get_wq(s, n);
 
@@ -2902,12 +2903,16 @@ static void dto_memset(void *s, int c, size_t n, int *result)
 	thr_desc.completion_addr = (uint64_t)&thr_comp;
 	thr_desc.pattern = memset_pattern;
 
-	if (use_split_algorithm) {
+	if (use_split_algorithm || collect_alg_stats_raw_values) {
 		volatile uint32_t *test_p = (uint32_t *) s;
 		start = rdtsc();
 		uint32_t test = *test_p;
 		end = rdtsc();
-		in_cache = (end - start) < 200;
+		collect_in_cache = (end - start) < 200;
+	}
+
+	if (use_split_algorithm) {
+		in_cache = collect_in_cache;
 	}
 
 	if (collect_alg_stats_access_times) {
@@ -2947,7 +2952,7 @@ static void dto_memset(void *s, int c, size_t n, int *result)
 				thr_bytes_completed_cpu = cpu_size;
 #endif
 			}
-			*result = dsa_wait(wq, &thr_desc, unsplit_size, &thr_comp.status, MEMSET, start, in_cache);
+			*result = dsa_wait(wq, &thr_desc, unsplit_size, &thr_comp.status, MEMSET, start, in_cache, collect_in_cache);
 		}
 	} else {
 		uint32_t threshold;
@@ -2980,7 +2985,7 @@ static void dto_memset(void *s, int c, size_t n, int *result)
 					thr_bytes_completed_cpu += cpu_size;
 #endif
 				}
-				*result = dsa_wait(wq, &thr_desc, unsplit_size, &thr_comp.status, MEMSET,start, in_cache);
+				*result = dsa_wait(wq, &thr_desc, unsplit_size, &thr_comp.status, MEMSET,start, in_cache, collect_in_cache);
 			}
 
 			if (*result != SUCCESS)
@@ -3009,6 +3014,7 @@ static uint8_t dto_memcpymove(void *dest, const void *src, size_t n, bool is_mem
 {
 	uint64_t start, end;
 	uint16_t in_cache = 0;
+	uint16_t collect_in_cache;
 	struct dto_wq *wq = get_wq(dest, n);
 	size_t cpu_size, dsa_size, unsplit_size;
 	char is_overlapping = 0;
@@ -3027,12 +3033,16 @@ static uint8_t dto_memcpymove(void *dest, const void *src, size_t n, bool is_mem
 	else
 		op = MEMMOVE;
 
-	if (use_split_algorithm) {
+	if (use_split_algorithm || collect_alg_stats_raw_values) {
 		volatile uint32_t *test_p = (uint32_t *) src;
 		start = rdtsc();
 		uint32_t test = *test_p;
 		end = rdtsc();
-		in_cache = (end - start) < 200;
+		collect_in_cache = (end - start) < 200;
+	}
+
+	if (use_split_algorithm) {
+		in_cache = collect_in_cache;
 	}
 
 	size_t cpu_size_fraction = auto_tune_states[get_algorithm_instance(n,op)].cpu_size_fraction[in_cache];
@@ -3093,7 +3103,7 @@ static uint8_t dto_memcpymove(void *dest, const void *src, size_t n, bool is_mem
 					thr_bytes_completed_cpu += cpu_size ;
 #endif
 				}
-				*result = dsa_wait(wq, &thr_desc,  unsplit_size, &thr_comp.status,op,start, in_cache);
+				*result = dsa_wait(wq, &thr_desc,  unsplit_size, &thr_comp.status,op,start, in_cache, collect_in_cache);
 			}
 		}
 	} else {
@@ -3143,7 +3153,7 @@ static uint8_t dto_memcpymove(void *dest, const void *src, size_t n, bool is_mem
 						thr_bytes_completed_cpu += cpu_size ;
 #endif
 					}
-					*result = dsa_wait(wq, &thr_desc,  unsplit_size, &thr_comp.status, op, start, in_cache);
+					*result = dsa_wait(wq, &thr_desc,  unsplit_size, &thr_comp.status, op, start, in_cache, collect_in_cache);
 				}
 			}
 
