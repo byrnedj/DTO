@@ -518,6 +518,7 @@ struct auto_tune_state {
 	atomic_ullong num_descs[2];
 	atomic_ullong adjust_num_descs[2];
 	atomic_ullong adjust_num_waits[2];
+	atomic_ullong adjust_num_waits_min[2];
 	size_t cpu_size_fraction[2];
 	uint32_t wq_index_offset;
 	uint32_t num_wqs;
@@ -536,6 +537,7 @@ static double min_avg_waits = MIN_AVG_YIELD_WAITS;
 static double max_avg_waits = MAX_AVG_YIELD_WAITS;
 static uint8_t auto_adjust_knobs = 1;
 static uint8_t use_split_algorithm = 1;
+static uint8_t use_min_waits = 0;
 //static __thread uint8_t adjust = 0;
 //static atomic_uchar dto_updating = 0;
 
@@ -854,6 +856,7 @@ static __always_inline void dsa_wait_and_adjust(const volatile uint8_t *comp, si
 
 
 	auto_tune_states[bucket].adjust_num_waits[in_cache] += local_num_waits;
+	auto_tune_states[bucket].adjust_num_waits_min[in_cache] = auto_tune_states[bucket].adjust_num_waits_min[in_cache] < local_num_waits ? auto_tune_states[bucket].adjust_num_waits_min[in_cache] : local_num_waits;
 	auto_tune_states[bucket].adjust_num_descs[in_cache]++;
 	
 	auto_tune_states[bucket].adjust_wait_time += cycles;
@@ -872,9 +875,15 @@ static __always_inline void dsa_wait_and_adjust(const volatile uint8_t *comp, si
 
 		if (temp && atomic_compare_exchange_strong(&auto_tune_states[bucket].adjust_num_descs[in_cache], &temp, 0)) {
 			//printf("Algorithm iteration num descs %llu\n",auto_tune_states[bucket].num_descs);
-			double avg_num_waits = (double)auto_tune_states[bucket].adjust_num_waits[in_cache] / temp;
+			double avg_num_waits;
+			if (use_min_waits) {                                                               //JJS - min waits
+				avg_num_waits = auto_tune_states[bucket].adjust_num_waits_min[in_cache]; 
+			} else {
+				avg_num_waits = (double)auto_tune_states[bucket].adjust_num_waits[in_cache] / temp;
+			}
 			
 			auto_tune_states[bucket].adjust_num_waits[in_cache] = 0;
+			auto_tune_states[bucket].adjust_num_waits_min[in_cache] = 100000;
 
 			int ut = NO_CHANGE;
 
@@ -2712,6 +2721,16 @@ static int init_dto(void)
 				use_split_algorithm = !!use_split_algorithm;
 			}
 
+			env_str = getenv("DTO_AUTO_ADJUST_USE_MIN");
+			if (env_str != NULL) {
+				errno = 0;
+				use_min_waits = strtoul(env_str, NULL, 10);
+				if (errno)
+					use_min_waits = 1;
+
+				use_min_waits = !!use_min_waits;
+			}
+
 			if (numa_available() != -1) {
 				env_str = getenv("DTO_IS_NUMA_AWARE");
 				if (env_str != NULL) {
@@ -2811,6 +2830,8 @@ static int init_dto(void)
 					auto_tune_states[i+(j*MAX_AUTOTUNE_INSTANCES)].wq_index_offset = i*num_wqs_per_bucket;
 					auto_tune_states[i+(j*MAX_AUTOTUNE_INSTANCES)].num_wqs = num_wqs_per_bucket;
 					auto_tune_states[i+(j*MAX_AUTOTUNE_INSTANCES)].next_wq = 0;
+					auto_tune_states[i+(j*MAX_AUTOTUNE_INSTANCES)].adjust_num_waits_min[0] = 100000;
+					auto_tune_states[i+(j*MAX_AUTOTUNE_INSTANCES)].adjust_num_waits_min[1] = 100000;
 				}
 			}
 
