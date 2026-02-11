@@ -41,7 +41,7 @@
 #define C01_STATE 1
 #define C02_STATE 0
 
-#define USE_ORIG_FUNC(n, use_dsa) (use_std_lib_calls == 1 || !use_dsa || (n*(100-cpu_size_fraction)/100) < dsa_min_size)
+#define USE_ORIG_FUNC(n, use_dsa) (use_std_lib_calls == 1 || !use_dsa)
 #define TS_NS(s, e) (((e.tv_sec*1000000000) + e.tv_nsec) - ((s.tv_sec*1000000000) + s.tv_nsec))
 
 /* Maximum WQs that DTO will use. It is rather an arbitrary limit
@@ -267,6 +267,7 @@ struct thread_stats {
 	unsigned long long bytes_counter[HIST_NO_BUCKETS][MAX_STAT_GROUP];
 	unsigned long long lat_counter[HIST_NO_BUCKETS][MAX_STAT_GROUP][MAX_MEMOP];
 	int fail_counter[HIST_NO_BUCKETS][MAX_FAILURES];
+        int tl_cpu_size_fraction;   // range of values is 0 to 99
 };
 
 /* Thread-local pointer to heap-allocated stats */
@@ -315,7 +316,7 @@ static unsigned int log_level = LOG_LEVEL_FATAL;
 /* Auto tune v2 */
 #define KP 0.5
 #define KI 0.1
-#define SAMPLE_INTERVAL 10000
+#define SAMPLE_INTERVAL 10
 #define AUTO_ADJUST_KNOBS 1
 #define AUTO_ADJUST_KNOBS_V2 2
 
@@ -617,9 +618,6 @@ static __always_inline int dsa_wait(struct dto_wq *wq,
             case AUTO_ADJUST_KNOBS:
                 dsa_wait_and_adjust(comp);
                 break;
-            case AUTO_ADJUST_KNOBS_V2:
-                dsa_wait_and_adjust_v2(comp);
-                break;
             default:
                 dsa_wait_no_adjust(comp);
         }
@@ -733,6 +731,7 @@ static void update_stats(int op, size_t n, size_t bytes_completed,
 	tl_stats->lat_counter[bucket][group][op] += elapsed_ns;
 	if (group == DSA_CALL_FAILED)
 		++tl_stats->fail_counter[bucket][error_code];
+        tl_stats->tl_cpu_size_fraction = tl_cpu_size_fraction;
 }
 
 static void print_stats(void)
@@ -756,6 +755,7 @@ static void print_stats(void)
 	num_threads = atomic_load(&global_stats_count);
 	for (int tid = 0; tid < num_threads && tid < MAX_STAT_THREADS; ++tid) {
 		struct thread_stats *ts = global_stats_registry[tid];
+	        LOG_TRACE("DTO CPU Fraction tid %d: %.2f\n", ts->tl_cpu_size_fraction/100.0);
 		if (ts == NULL)
 			continue;
 
@@ -1566,6 +1566,7 @@ static int init_dto(void)
 				cpu_size_fraction = cpu_size_fraction_float * 100;
                                 tl_cpu_size_fraction = cpu_size_fraction;
 			}
+                        tl_next_sample = rand() % (SAMPLE_INTERVAL*2) + 1;
 
 			env_str = getenv("DTO_AUTO_ADJUST_KNOBS");
 
@@ -1578,6 +1579,7 @@ static int init_dto(void)
                                     tl_next_sample = rand() % (SAMPLE_INTERVAL*2) + 1;
                                 }
 			}
+                        srand(1020);
 
                         // Only use c02 if we are offloading a significant chunk to
                         // DSA so we amortize the exit latency of C02 state
@@ -1639,9 +1641,9 @@ static int init_dto(void)
 
 			// display configuration
 			LOG_TRACE("log_level: %d, collect_stats: %d, use_std_lib_calls: %d, dsa_min_size: %lu, "
-				"cpu_size_fraction: %.2f, wait_method: %s, auto_adjust_knobs: %d, numa_awareness: %s, dto_dsa_cc: %d, dto_dsa_bof: %d, dto_use_c02: %d, max_wqs_supported: %d\n",
+				"cpu_size_fraction: %.2f, wait_method: %s, auto_adjust_knobs: %d, numa_awareness: %s, dto_dsa_cc: %d, dto_dsa_bof: %d, dto_use_c02: %d, max_wqs_supported: %d, memcmp: %d, memcpy: %d, memset: %d\n",
 				log_level, collect_stats, use_std_lib_calls, dsa_min_size,
-				cpu_size_fraction_float, wait_names[wait_method], auto_adjust_knobs, numa_aware_names[is_numa_aware], dto_dsa_cc, dto_dsa_bof, dto_use_c02, max_wqs_supported);
+				cpu_size_fraction_float, wait_names[wait_method], auto_adjust_knobs, numa_aware_names[is_numa_aware], dto_dsa_cc, dto_dsa_bof, dto_use_c02, max_wqs_supported, dto_dsa_memcmp, dto_dsa_memcpy, dto_dsa_memset);
 			for (int i = 0; i < num_wqs; i++)
 				LOG_TRACE("[%d] wq_path: %s, wq_size: %d, dsa_cap: %lx\n", i,
 					wqs[i].wq_path, wqs[i].wq_size, wqs[i].dsa_gencap);
@@ -1728,6 +1730,9 @@ static __always_inline  struct dto_wq *get_wq(void* buf)
                 num_threads++;
                 wq_index = num_threads % num_wqs;
     		LOG_TRACE("Thread id %lu (tn: %d) assigned wq: %d\n", pthread_self(), num_threads, wq_index);
+                tl_cpu_size_fraction = (cpu_size_fraction);
+                tl_next_sample = rand() % (SAMPLE_INTERVAL*2) + 1;
+    		LOG_TRACE("Thread id %lu (tn: %d) assigned cpu_fraction %d, next sample %d\n", pthread_self(), num_threads, tl_cpu_size_fraction, tl_next_sample);
 		wq = &wqs[wq_index];
 	}
 
@@ -2155,6 +2160,98 @@ __attribute__((visibility("default"))) void dto_memcpy_async(void *dest, const v
 	}
 }
 
+static void dto_memcpymove_autov2(void *dest, const void *src, size_t n, bool is_memcpy, int *result)
+{
+	struct dto_wq *wq = get_wq(dest);
+	size_t cpu_size, dsa_size;
+
+	thr_desc.opcode = DSA_OPCODE_MEMMOVE;
+	thr_desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
+	if (dto_dsa_cc && (wq->dsa_gencap & GENCAP_CC_MEMORY))
+		thr_desc.flags |= IDXD_OP_FLAG_CC;
+        if (dto_dsa_bof)
+            thr_desc.flags |= IDXD_OP_FLAG_BOF;
+	thr_desc.completion_addr = (uint64_t)&thr_comp;
+
+        uint64_t cpu_frac = tl_cpu_size_fraction;
+
+	/* cpu_size_fraction guaranteed to be >= 0 and < 1 */
+	if (!is_memcpy && is_overlapping_buffers(dest, src, n))
+		cpu_size = 0;
+	else
+		cpu_size = n * cpu_frac / 100;
+
+	dsa_size = n - cpu_size;
+
+	thr_bytes_completed = 0;
+
+	thr_desc.src_addr = (uint64_t) src + cpu_size;
+	thr_desc.dst_addr = (uint64_t) dest + cpu_size;
+	thr_desc.xfer_size = (uint32_t) dsa_size;
+	thr_comp.status = 0;
+	*result = dsa_submit(wq, &thr_desc);
+	if (*result == SUCCESS) {
+                if (tl_num_descs == tl_next_sample) {
+                    int cpu_size_1 = cpu_size / 2;
+                    orig_memcpy(dest, src, cpu_size_1);
+                    int dsa_done = 0;
+                    if (thr_comp.status != 0) {
+                        dsa_done = 1;
+                        orig_memcpy(dest + cpu_size_1, src + cpu_size_1, cpu_size - cpu_size_1);
+                        // if DSA finished its portion before CPU copy is done, we can increase the amount of work to the DSA, this means the DSA is faster. 
+                        //unfortunately here we still need to do the remainder of the job so submit a memcpy
+		        if (tl_cpu_size_fraction > 0) {
+		            tl_cpu_size_fraction -= CSF_STEP_INCREMENT;
+                        }
+
+                    } else {
+                        dsa_done = 0;
+                        orig_memcpy(dest + cpu_size_1, src + cpu_size_1, cpu_size - cpu_size_1);
+                        //dsa is still working
+                        int wait_count = 0;
+                        while (thr_comp.status == 0) {
+                            _mm_pause();
+                            wait_count++;
+                        }
+                        // if DSA finished its portion after CPU copy is done, we can decrease the amount of work to the DSA, this means the CPU is faster.
+		        if (wait_count < 10 && (tl_cpu_size_fraction < MAX_CPU_SIZE_FRACTION)) {
+		            tl_cpu_size_fraction += CSF_STEP_INCREMENT;
+                        }
+                    }
+		    thr_bytes_completed += cpu_size;
+
+                    //this is the number of bytes copied by CPU before DSA completed the job. We can use this info to adjust the cpu_size_fraction in auto tune algorithm
+	            if (likely(thr_comp.status == DSA_COMP_SUCCESS)) {
+	            	thr_bytes_completed += dsa_size;
+	            	*result = SUCCESS;
+	            } else if ((thr_comp.status & DSA_COMP_STATUS_MASK) == DSA_COMP_PAGE_FAULT_NOBOF) {
+	            	thr_bytes_completed += thr_comp.bytes_completed;
+	            	*result = PAGE_FAULT;
+	            } else {
+                        if (thr_comp.status == DSA_COMP_SUCCESS) {
+	            	    thr_bytes_completed += dsa_size;
+	            	    *result = SUCCESS;
+                        } else {
+	                    LOG_ERROR("failed status %x xfersz %x\n", thr_comp.status, dsa_size);
+	                    *result = FAIL_OTHERS;
+                        }
+                    }
+                    tl_next_sample += rand() % (SAMPLE_INTERVAL*2) + 1;
+                } else {
+		    if (cpu_size) {
+		    	if (is_memcpy)
+		    		orig_memcpy(dest, src, cpu_size);
+		    	else
+		    		orig_memmove(dest, src, cpu_size);
+		    	thr_bytes_completed += cpu_size;
+		    }
+		    *result = dsa_wait(wq, &thr_desc, &thr_comp.status);
+                }
+                tl_num_descs++;
+	}
+        
+}
+
 static void dto_memcpymove(void *dest, const void *src, size_t n, bool is_memcpy, int *result)
 {
         
@@ -2519,7 +2616,11 @@ void *memcpy(void *dest, const void *src, size_t n)
 #ifdef DTO_STATS_SUPPORT
 		DTO_COLLECT_STATS_START(collect_stats, st);
 #endif
-		dto_memcpymove(dest, src, n, 1, &result);
+                if (auto_adjust_knobs == AUTO_ADJUST_KNOBS_V2) {
+                    dto_memcpymove_autov2(dest, src, n, 1, &result);
+                } else {
+		    dto_memcpymove(dest, src, n, 1, &result);
+                }
 
 #ifdef DTO_STATS_SUPPORT
 		DTO_COLLECT_STATS_DSA_END(collect_stats, st, et, MEMCOPY, n, thr_bytes_completed, result);
