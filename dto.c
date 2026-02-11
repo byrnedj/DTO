@@ -75,13 +75,16 @@ static __thread int16_t wq_index = -1;
 
 #define BATCH_SIZE 8
 #define BATCH_THRESHOLD (512 * 1024)
+#define MAX_BATCH_DESCS 64
 
 struct batch_comp {
 	struct dsa_completion_record cr;
 } __attribute__((aligned(64)));
 
-static __thread struct dsa_hw_desc thr_batch_descs[BATCH_SIZE] __attribute__((aligned(64)));
+static __thread struct dsa_hw_desc thr_batch_descs[MAX_BATCH_DESCS] __attribute__((aligned(64)));
 static __thread struct batch_comp thr_batch_comp_a[BATCH_SIZE];
+static __thread struct dsa_completion_record thr_batch_comp __attribute__((aligned(32)));
+static __thread struct dsa_completion_record thr_batch_sub_comps[MAX_BATCH_DESCS] __attribute__((aligned(32)));
 
 // original std memory functions
 static void * (*orig_memset)(void *s, int c, size_t n);
@@ -198,6 +201,7 @@ enum memop {
 	MEMCOPY_ASYNC,
 	MEMMOVE,
 	MEMCMP,
+	BATCH_COPY,
 	MAX_MEMOP,
 };
 
@@ -207,7 +211,8 @@ static const char * const memop_names[] = {
 	[MEMCOPY_ASYNC] = "acpy",
 	[MEMMOVE_INTERNAL] = "movi",
 	[MEMMOVE] = "mov",
-	[MEMCMP] = "cmp"
+	[MEMCMP] = "cmp",
+	[BATCH_COPY] = "batch"
 };
 
 // memory stats
@@ -2866,7 +2871,7 @@ __attribute__((visibility("default"))) void dto_memcpy_async(void *dest, const v
 #endif
 
 	thr_desc.opcode = DSA_OPCODE_MEMMOVE;
-	thr_desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
+	thr_desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR | IDXD_OP_FLAG_BOF;
 	if (dto_dsa_cc && (wq->dsa_gencap & GENCAP_CC_MEMORY))
 		thr_desc.flags |= IDXD_OP_FLAG_CC;
 	thr_desc.completion_addr = (uint64_t)&thr_comp;
@@ -3461,4 +3466,127 @@ int memcmp(const void *s1, const void *s2, size_t n)
 #endif
 	}
 	return ret;
+}
+
+/*
+ * dto_batch_copy - Batch copy operation using DSA batch descriptor
+ *
+ * Performs multiple memory copy operations in a single DSA batch submission.
+ * After submitting the batch to DSA, calls the callback function while DSA
+ * is processing. Then waits for completion using the configured wait method.
+ * Falls back to memcpy for any failed operations.
+ */
+__attribute__((visibility("default")))
+void dto_batch_copy(void **dst, void **src, size_t *sizes, int count,
+                    void (*callback)(void *), void *callback_arg)
+{
+#ifdef DTO_STATS_SUPPORT
+	struct timespec st, et;
+	size_t total_bytes = 0;
+	for (int i = 0; i < count; i++) {
+		total_bytes += sizes[i];
+	}
+	DTO_COLLECT_STATS_START(collect_stats, st);
+#endif
+
+	if (unlikely(dto_initialized == 0 || count <= 0)) {
+		/* Not initialized or invalid count - use synchronous memcpy */
+		for (int i = 0; i < count; i++) {
+			if (dst[i] && src[i] && sizes[i] > 0) {
+				orig_memcpy(dst[i], src[i], sizes[i]);
+			}
+		}
+		if (callback) {
+			callback(callback_arg);
+		}
+#ifdef DTO_STATS_SUPPORT
+		DTO_COLLECT_STATS_CPU_END(collect_stats, st, et, BATCH_COPY, total_bytes, total_bytes);
+#endif
+		return;
+	}
+
+	/* Clamp count to maximum batch size */
+	if (count > MAX_BATCH_DESCS) {
+		count = MAX_BATCH_DESCS;
+	}
+
+	struct dto_wq *wq = get_wq(dst[0]);
+	int result;
+
+        orig_memset(&thr_batch_descs[0], 0, sizeof(thr_batch_descs[0]) * count);
+        orig_memset(&thr_desc, 0, sizeof(thr_desc));
+	//memset(&thr_desc, 0, sizeof(thr_desc));
+	/* Prepare individual copy descriptors */
+	for (int i = 0; i < count; i++) {
+		struct dsa_hw_desc *desc = &thr_batch_descs[i];
+		//memset(desc, 0, sizeof(*desc));
+
+		desc->opcode = DSA_OPCODE_MEMMOVE;
+		desc->flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR | IDXD_OP_FLAG_BOF;
+		if (dto_dsa_cc && (wq->dsa_gencap & GENCAP_CC_MEMORY)) {
+			desc->flags |= IDXD_OP_FLAG_CC;
+		}
+		desc->src_addr = (uint64_t)src[i];
+		desc->dst_addr = (uint64_t)dst[i];
+		desc->xfer_size = (uint32_t)sizes[i];
+		desc->completion_addr = (uint64_t)&thr_batch_sub_comps[i];
+		thr_batch_sub_comps[i].status = 0;
+	}
+
+	/* Prepare batch descriptor */
+	thr_desc.opcode = DSA_OPCODE_BATCH;
+	thr_desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
+	thr_desc.desc_list_addr = (uint64_t)thr_batch_descs;
+	thr_desc.desc_count = count;
+	thr_desc.completion_addr = (uint64_t)&thr_batch_comp;
+	thr_batch_comp.status = 0;
+
+	/* Submit batch descriptor */
+	result = dsa_submit(wq, &thr_desc);
+
+	if (result == SUCCESS) {
+		/* DSA job submitted - call callback while DSA is working */
+		if (callback) {
+			callback(callback_arg);
+		}
+
+		/* Wait for batch completion using configured wait method */
+		dsa_wait_no_adjust(&thr_batch_comp.status);
+
+		/* Check for batch-level failures and fallback if needed */
+		if (thr_batch_comp.status != DSA_COMP_SUCCESS) {
+			LOG_ERROR("Batch copy failed with status %x, falling back to memcpy\n",
+			          thr_batch_comp.status);
+			/* Check individual completions and retry failed ones */
+			for (int i = 0; i < count; i++) {
+				if (thr_batch_sub_comps[i].status != DSA_COMP_SUCCESS) {
+					if (dst[i] && src[i] && sizes[i] > 0) {
+						orig_memcpy(dst[i], src[i], sizes[i]);
+					}
+				}
+			}
+#ifdef DTO_STATS_SUPPORT
+			DTO_COLLECT_STATS_DSA_END(collect_stats, st, et, BATCH_COPY, total_bytes, total_bytes, FAIL_OTHERS);
+#endif
+		} else {
+#ifdef DTO_STATS_SUPPORT
+			DTO_COLLECT_STATS_DSA_END(collect_stats, st, et, BATCH_COPY, total_bytes, total_bytes, SUCCESS);
+#endif
+		}
+	} else {
+		/* Batch submission failed - fall back to synchronous memcpy */
+		LOG_ERROR("Batch submit failed, falling back to memcpy\n");
+		for (int i = 0; i < count; i++) {
+			if (dst[i] && src[i] && sizes[i] > 0) {
+				orig_memcpy(dst[i], src[i], sizes[i]);
+			}
+		}
+		/* Still call callback after fallback copies complete */
+		if (callback) {
+			callback(callback_arg);
+		}
+#ifdef DTO_STATS_SUPPORT
+		DTO_COLLECT_STATS_DSA_END(collect_stats, st, et, BATCH_COPY, total_bytes, total_bytes, RETRY);
+#endif
+	}
 }
