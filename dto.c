@@ -285,10 +285,13 @@ static unsigned int log_level = LOG_LEVEL_FATAL;
 static atomic_ullong num_descs[2];
 static atomic_ullong adjust_num_descs[2];
 static atomic_ullong adjust_num_wait[2];
+static atomic_ullong adjust_num_not_wait[2];
 /* default waits are for yield because yield is default waiting method */
 static double min_avg_waits = MIN_AVG_YIELD_WAITS;
 static double max_avg_waits = MAX_AVG_YIELD_WAITS;
 static uint8_t auto_adjust_knobs = 1;
+static uint8_t auto_adjust_knobs_cpu_split = 0;
+static double dto_cpu_split = 0.8;
 static uint8_t use_split_algorithm = 1;
 
 extern char *__progname;
@@ -449,6 +452,27 @@ static __always_inline void dsa_wait_no_adjust(const volatile uint8_t *comp)
     }
 }
 
+static __always_inline void do_cpu_portion(void *dest, const void *src, size_t cpu_size, enum memop op)
+{
+    if (!cpu_size)
+        return;
+
+    switch (op) {
+        case MEMCOPY:
+            orig_memcpy(dest, src, cpu_size);
+            break;
+        case MEMMOVE:
+            orig_memmove(dest, src, cpu_size);
+            break;
+        case MEMSET:
+            orig_memset((void *)src, (int)(intptr_t)dest, cpu_size);
+            break;
+        default:
+            LOG_ERROR("Undefined op %d", op);
+    }
+    thr_bytes_completed += cpu_size;
+}
+
 /* A simple auto-tuning heuristic.
  * Goal of the Heuristic:
  *   - CPU and DSA should complete their fraction of the job roughly simultaneously.
@@ -517,11 +541,86 @@ static __always_inline void dsa_wait_and_adjust(const volatile uint8_t *comp, ui
 	}
 }
 
+static __always_inline void dsa_wait_and_adjust_cpu_split(const volatile uint8_t *comp, uint16_t in_cache, void *dest, const void *src, size_t cpu_size, enum memop op)
+{
+	//printf("transaction: in_cache=%d, cpu_size_fraction=%zu%%, dsa_min_size=%zu\n",
+	//	in_cache, cpu_size_fraction[in_cache], dsa_min_size);
+
+	if ((++num_descs[in_cache] & DESCS_PER_RUN) != DESCS_PER_RUN) {
+                //finish the cpu split
+                do_cpu_portion(dest, src, cpu_size, op);
+		while (*comp == 0) {
+			__dsa_wait(comp);
+                }
+
+		return;
+	}
+	adjust_num_descs[in_cache]++;
+
+        //this means we should collect our sample
+        size_t cpu_size_1 = cpu_size * dto_cpu_split;
+        do_cpu_portion(dest, src, cpu_size_1, op);
+        // for MEMSET, dest holds the fill pattern so don't advance it
+        void *dest2 = (op == MEMSET) ? dest : dest + cpu_size_1;
+        const void *src2 = src + cpu_size_1;
+        if (*comp != 0) {
+            // we still need to complete the remainder memcpy on CPU
+            do_cpu_portion(dest2, src2, cpu_size - cpu_size_1, op);
+	    // operations that have failed (mostly due to page fault) return very quickly and cause the algorithm
+	    // to think that the DSA operation was faster than it really was. We exclude them from the calculation.
+	    if (*comp != DSA_COMP_SUCCESS) {
+		return;
+	    }
+            adjust_num_not_wait[in_cache]++;
+            //this means DSA finished before CPU so DSA can do more work
+        } else {
+            //this means CPU finished before DSA
+            //do the rest of the work
+	    uint64_t local_num_waits = 0;
+            do_cpu_portion(dest2, src2, cpu_size - cpu_size_1, op);
+	    /* Run the heuristics as well as wait for DSA */
+	    while (*comp == 0) {
+		__dsa_wait(comp);
+		local_num_waits = 1;
+	    }
+
+	    adjust_num_wait[in_cache]++;
+        }
+
+
+	if (adjust_num_descs[in_cache] >= NUM_DESCS) {
+		unsigned long long temp = adjust_num_descs[in_cache];
+
+		if (temp && atomic_compare_exchange_strong(&adjust_num_descs[in_cache], &temp, 0)) {
+			double avg_num_waits = (double)adjust_num_wait[in_cache] / temp;
+                        double avg_num_not_waits = (double)adjust_num_not_wait[in_cache] / temp;
+
+			adjust_num_wait[in_cache] = 0;
+			adjust_num_not_wait[in_cache] = 0;
+			if (avg_num_waits > avg_num_not_waits) {
+                                // we ended up waiting for DSA more times than not waiting
+                                // so increase the CPU fraction
+				if (cpu_size_fraction[in_cache] < MAX_CPU_SIZE_FRACTION)
+					cpu_size_fraction[in_cache] += CSF_STEP_INCREMENT;
+			} else if (avg_num_waits < avg_num_not_waits) {
+                                // DSA did not wait for CPU, meaning DSA completed
+                                // before CPU portion meaning that DSA can do more work
+				if (cpu_size_fraction[in_cache] > 0)
+					cpu_size_fraction[in_cache] -= CSF_STEP_DECREMENT;
+			}
+			//printf("Auto-tune: in_cache=%d, avg_waits=%.2f, cpu_size_fraction=%zu%%, dsa_min_size=%zu\n",
+			//	in_cache, avg_num_waits, cpu_size_fraction[in_cache], dsa_min_size);
+		}
+	}
+}
+
 static __always_inline int dsa_wait(struct dto_wq *wq,
-	struct dsa_hw_desc *hw, volatile uint8_t *comp, uint16_t in_cache)
+	struct dsa_hw_desc *hw, volatile uint8_t *comp, uint16_t in_cache, void *dest, const void *src, size_t cpu_size, enum memop op)
 {
 	if (auto_adjust_knobs)
 		dsa_wait_and_adjust(comp, in_cache);
+        else if (auto_adjust_knobs_cpu_split)
+                dsa_wait_and_adjust_cpu_split(comp, in_cache, dest, src, cpu_size, op);
 	else
 		dsa_wait_no_adjust(comp);
 
@@ -1397,6 +1496,34 @@ static int init_dto(void)
 				auto_adjust_knobs = !!auto_adjust_knobs;
 			}
 
+			env_str = getenv("DTO_AUTO_ADJUST_KNOBS_CPU_SPLIT");
+
+			if (env_str != NULL) {
+				errno = 0;
+				auto_adjust_knobs_cpu_split = strtoul(env_str, NULL, 10);
+				if (errno)
+					auto_adjust_knobs_cpu_split = 0;
+
+				auto_adjust_knobs_cpu_split = !!auto_adjust_knobs_cpu_split;
+
+				if (auto_adjust_knobs_cpu_split)
+					auto_adjust_knobs = 0;
+			}
+
+			env_str = getenv("DTO_CPU_SPLIT");
+
+			if (env_str != NULL) {
+				errno = 0;
+				dto_cpu_split = strtod(env_str, NULL);
+
+				if (errno || dto_cpu_split <= 0.0 || dto_cpu_split >= 1.0) {
+					LOG_ERROR("Invalid DTO_CPU_SPLIT %s, "
+						"Must be > 0 and < 1. "
+						"Falling back to default 0.5\n", env_str);
+					dto_cpu_split = 0.5;
+				}
+			}
+
 			env_str = getenv("DTO_AUTO_ADJUST_USE_SPLIT_ALGORITHM");                
 			if (env_str != NULL) {
 				errno = 0;
@@ -1455,9 +1582,9 @@ static int init_dto(void)
     
 			// display configuration
 			LOG_TRACE("log_level: %d, collect_stats: %d, use_std_lib_calls: %d, dsa_min_size: %lu, "
-				"cpu_size_fraction: %.2f, wait_method: %s, auto_adjust_knobs: %d, numa_awareness: %s, dto_dsa_cc: %d\n",
+				"cpu_size_fraction: %.2f, wait_method: %s, auto_adjust_knobs: %d, auto_adjust_knobs_cpu_split: %d, dto_cpu_split: %.2f, numa_awareness: %s, dto_dsa_cc: %d\n",
 				log_level, collect_stats, use_std_lib_calls, dsa_min_size,
-				cpu_size_fraction_float, wait_names[wait_method], auto_adjust_knobs, numa_aware_names[is_numa_aware], dto_dsa_cc);
+				cpu_size_fraction_float, wait_names[wait_method], auto_adjust_knobs, auto_adjust_knobs_cpu_split, dto_cpu_split, numa_aware_names[is_numa_aware], dto_dsa_cc);
 			for (int i = 0; i < num_wqs; i++)
 				LOG_TRACE("[%d] wq_path: %s, wq_size: %d, dsa_cap: %lx\n", i,
 					wqs[i].wq_path, wqs[i].wq_size, wqs[i].dsa_gencap);
@@ -1551,11 +1678,14 @@ static void dto_memset(void *s, int c, size_t n, int *result)
 		thr_comp.status = 0;
 		*result = dsa_submit(wq, &thr_desc);
 		if (likely(*result == SUCCESS)) {
-			if (cpu_size) {
-				orig_memset(s, c, cpu_size);
-				thr_bytes_completed = cpu_size;
+			if (!auto_adjust_knobs_cpu_split) {
+				if (cpu_size) {
+					orig_memset(s, c, cpu_size);
+					thr_bytes_completed = cpu_size;
+				}
 			}
-			*result = dsa_wait(wq, &thr_desc, &thr_comp.status, in_cache);
+			*result = dsa_wait(wq, &thr_desc, &thr_comp.status, in_cache,
+				(void *)(intptr_t)c, (const void *)s, cpu_size, MEMSET);
 		}
 	} else {
 		uint32_t threshold;
@@ -1575,13 +1705,16 @@ static void dto_memset(void *s, int c, size_t n, int *result)
 			thr_comp.status = 0;
 			*result = dsa_submit(wq, &thr_desc);
 			if (*result == SUCCESS) {
-				if (cpu_size) {
-					void *s1 = s + thr_bytes_completed;
+				if (!auto_adjust_knobs_cpu_split) {
+					if (cpu_size) {
+						void *s1 = s + thr_bytes_completed;
 
-					orig_memset(s1, c, cpu_size);
-					thr_bytes_completed += cpu_size;
+						orig_memset(s1, c, cpu_size);
+						thr_bytes_completed += cpu_size;
+					}
 				}
-				*result = dsa_wait(wq, &thr_desc, &thr_comp.status, in_cache);
+				*result = dsa_wait(wq, &thr_desc, &thr_comp.status, in_cache,
+					(void *)(intptr_t)c, (const void *)(s + thr_bytes_completed), cpu_size, MEMSET);
 			}
 
 			if (*result != SUCCESS)
@@ -1613,6 +1746,7 @@ static bool dto_memcpymove(void *dest, const void *src, size_t n, bool is_memcpy
 	bool is_overlapping;
 	uint16_t in_cache = 0;
 	uint64_t start, end;
+        enum memop op = is_memcpy ? MEMCOPY : MEMMOVE; //so we know who to call
 
 	thr_bytes_completed = 0;
 
@@ -1660,19 +1794,15 @@ static bool dto_memcpymove(void *dest, const void *src, size_t n, bool is_memcpy
 		} else {
 			*result = dsa_submit(wq, &thr_desc);
 			if (*result == SUCCESS) {
-				if (cpu_size) {
-					if (is_memcpy)
-						orig_memcpy(dest, src, cpu_size);
-					else
-						orig_memmove(dest, src, cpu_size);
-					thr_bytes_completed += cpu_size;
+				if (!auto_adjust_knobs_cpu_split) {
+                                        do_cpu_portion(dest, src, cpu_size, op);
 				}
-				*result = dsa_wait(wq, &thr_desc, &thr_comp.status, in_cache);
+				*result = dsa_wait(wq, &thr_desc, &thr_comp.status, in_cache, dest, src, cpu_size, op);
 			}
 		}
 	} else {
 		uint32_t threshold;
-		size_t current_cpu_size_fraction = cpu_size_fraction[in_cache];  // the cpu_size_fraction might be changed by the auto tune algorithm 
+		size_t current_cpu_size_fraction = cpu_size_fraction[in_cache];  // the cpu_size_fraction might be changed by the auto tune algorithm
 		if (is_overlapping) {
 			threshold = wq->max_transfer_size;
 		} else {
@@ -1698,17 +1828,12 @@ static bool dto_memcpymove(void *dest, const void *src, size_t n, bool is_memcpy
 			} else {
 				*result = dsa_submit(wq, &thr_desc);
 				if (*result == SUCCESS) {
-					if (cpu_size) {
-						const void *src1 = src + thr_bytes_completed;
-						void *dest1 = dest + thr_bytes_completed;
-
-						if (is_memcpy)
-							orig_memcpy(dest1, src1, cpu_size);
-						else
-							orig_memmove(dest1, src1, cpu_size);
-						thr_bytes_completed += cpu_size;
+					const void *src1 = src + thr_bytes_completed;
+					void *dest1 = dest + thr_bytes_completed;
+					if (!auto_adjust_knobs_cpu_split) {
+                                        	do_cpu_portion(dest1, src1, cpu_size, op);
 					}
-					*result = dsa_wait(wq, &thr_desc, &thr_comp.status, in_cache);
+					*result = dsa_wait(wq, &thr_desc, &thr_comp.status, in_cache, dest1, src1, cpu_size, op);
 				}
 			}
 
