@@ -75,6 +75,16 @@ static __thread struct dsa_hw_desc thr_batch_descs[MAX_BATCH_DESCS] __attribute_
 static __thread struct dsa_completion_record thr_batch_comp __attribute__((aligned(32)));
 static __thread struct dsa_completion_record thr_batch_sub_comps[MAX_BATCH_DESCS] __attribute__((aligned(32)));
 
+#define BATCH_SIZE 16
+#define BATCH_THRESHOLD (512 * 1024)
+
+struct batch_comp {
+	struct dsa_completion_record cr;
+} __attribute__((aligned(64)));
+
+static __thread struct dsa_hw_desc thr_batch_descs[BATCH_SIZE] __attribute__((aligned(64)));
+static __thread struct batch_comp thr_batch_comp[BATCH_SIZE];
+
 // original std memory functions
 static void * (*orig_memset)(void *s, int c, size_t n);
 static void * (*orig_memcpy)(void *dest, const void *src, size_t n);
@@ -702,6 +712,151 @@ static __always_inline int dsa_execute(struct dto_wq *wq,
 		return FAIL_OTHERS;
 	}
 	return RETRY;
+}
+
+static void dto_batch_memset(struct dto_wq *wq, void *s, int c, size_t n,
+	uint64_t pattern, uint32_t sub_flags, int *result)
+{
+	size_t part_size = n / BATCH_SIZE;
+	size_t remainder = n % BATCH_SIZE;
+
+	for (int i = 0; i < BATCH_SIZE; i++) {
+		size_t this_size = part_size + (i == BATCH_SIZE - 1 ? remainder : 0);
+
+		thr_batch_descs[i].opcode = DSA_OPCODE_MEMFILL;
+		thr_batch_descs[i].flags = sub_flags;
+		thr_batch_descs[i].completion_addr = (uint64_t)&thr_batch_comp[i].cr;
+		thr_batch_descs[i].dst_addr = (uint64_t)s + i * part_size;
+		thr_batch_descs[i].xfer_size = (uint32_t)this_size;
+		thr_batch_descs[i].pattern = pattern;
+		thr_batch_comp[i].cr.status = 0;
+	}
+
+	thr_desc.opcode = DSA_OPCODE_BATCH;
+	thr_desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
+	thr_desc.desc_list_addr = (uint64_t)thr_batch_descs;
+	thr_desc.desc_count = BATCH_SIZE;
+	thr_desc.completion_addr = (uint64_t)&thr_comp;
+	thr_comp.status = 0;
+
+	*result = dsa_submit(wq, &thr_desc);
+	if (*result != SUCCESS)
+		return;
+
+	int pending = BATCH_SIZE;
+	uint8_t done[BATCH_SIZE] = {0};
+
+	while (pending > 0) {
+		for (int i = 0; i < BATCH_SIZE; i++) {
+			if (done[i])
+				continue;
+
+			uint8_t status = thr_batch_comp[i].cr.status;
+			if (status == 0)
+				continue;
+
+			size_t this_size = part_size +
+				(i == BATCH_SIZE - 1 ? remainder : 0);
+			size_t offset = (size_t)i * part_size;
+
+			if (status == DSA_COMP_SUCCESS) {
+				thr_bytes_completed += this_size;
+			} else {
+				/* Page fault or error: CPU handles remaining bytes */
+				size_t completed = thr_batch_comp[i].cr.bytes_completed;
+				thr_bytes_completed += completed;
+				size_t remaining = this_size - completed;
+				if (remaining > 0) {
+					orig_memset((char *)s + offset + completed,
+						c, remaining);
+					thr_bytes_completed += remaining;
+				}
+			}
+
+			done[i] = 1;
+			pending--;
+		}
+
+		if (pending > 0)
+			_mm_pause();
+	}
+
+	*result = SUCCESS;
+}
+
+static void dto_batch_memcpymove(struct dto_wq *wq, void *dest, const void *src,
+	size_t n, bool is_memcpy, uint32_t sub_flags, int *result)
+{
+	size_t part_size = n / BATCH_SIZE;
+	size_t remainder = n % BATCH_SIZE;
+
+	for (int i = 0; i < BATCH_SIZE; i++) {
+		size_t this_size = part_size + (i == BATCH_SIZE - 1 ? remainder : 0);
+		size_t offset = (size_t)i * part_size;
+
+		thr_batch_descs[i].opcode = DSA_OPCODE_MEMMOVE;
+		thr_batch_descs[i].flags = sub_flags;
+		thr_batch_descs[i].completion_addr = (uint64_t)&thr_batch_comp[i].cr;
+		thr_batch_descs[i].src_addr = (uint64_t)src + offset;
+		thr_batch_descs[i].dst_addr = (uint64_t)dest + offset;
+		thr_batch_descs[i].xfer_size = (uint32_t)this_size;
+		thr_batch_comp[i].cr.status = 0;
+	}
+
+	thr_desc.opcode = DSA_OPCODE_BATCH;
+	thr_desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
+	thr_desc.desc_list_addr = (uint64_t)thr_batch_descs;
+	thr_desc.desc_count = BATCH_SIZE;
+	thr_desc.completion_addr = (uint64_t)&thr_comp;
+	thr_comp.status = 0;
+
+	*result = dsa_submit(wq, &thr_desc);
+	if (*result != SUCCESS)
+		return;
+
+	int pending = BATCH_SIZE;
+	uint8_t done[BATCH_SIZE] = {0};
+
+	while (pending > 0) {
+		for (int i = 0; i < BATCH_SIZE; i++) {
+			if (done[i])
+				continue;
+
+			uint8_t status = thr_batch_comp[i].cr.status;
+			if (status == 0)
+				continue;
+
+			size_t this_size = part_size +
+				(i == BATCH_SIZE - 1 ? remainder : 0);
+			size_t offset = (size_t)i * part_size;
+
+			if (status == DSA_COMP_SUCCESS) {
+				thr_bytes_completed += this_size;
+			} else {
+				/* Page fault or error: CPU handles remaining bytes */
+				size_t completed = thr_batch_comp[i].cr.bytes_completed;
+				thr_bytes_completed += completed;
+				size_t remaining = this_size - completed;
+				if (remaining > 0) {
+					void *d = (char *)dest + offset + completed;
+					const void *s = (const char *)src + offset + completed;
+					if (is_memcpy)
+						orig_memcpy(d, s, remaining);
+					else
+						orig_memmove(d, s, remaining);
+					thr_bytes_completed += remaining;
+				}
+			}
+
+			done[i] = 1;
+			pending--;
+		}
+
+		if (pending > 0)
+			_mm_pause();
+	}
+
+	*result = SUCCESS;
 }
 
 #ifdef DTO_STATS_SUPPORT
@@ -1762,6 +1917,13 @@ static void dto_memset_api(void *s, int c, size_t n)
 	dsa_size = n - cpu_size;
 
 	thr_bytes_completed = 0;
+
+	/* Use batch descriptor for large transactions to reduce page fault cost */
+	if (n > BATCH_THRESHOLD && (n / BATCH_SIZE) <= wq->max_transfer_size) {
+		dto_batch_memset(wq, s, c, n, memset_pattern, thr_desc.flags, result);
+		return;
+	}
+
 	if (dsa_size <= wq->max_transfer_size) {
 		thr_desc.dst_addr = (uint64_t) s + cpu_size;
 		thr_desc.xfer_size = (uint32_t) dsa_size;
@@ -2168,6 +2330,15 @@ static void dto_memcpymove(void *dest, const void *src, size_t n, bool is_memcpy
         if (dto_dsa_bof)
             thr_desc.flags |= IDXD_OP_FLAG_BOF;
 	thr_desc.completion_addr = (uint64_t)&thr_comp;
+
+	/* Use batch descriptor for large non-overlapping transactions */
+	if (!((!is_memcpy) && is_overlapping_buffers(dest, src, n)) &&
+	    n > BATCH_THRESHOLD &&
+	    (n / BATCH_SIZE) <= wq->max_transfer_size) {
+		dto_batch_memcpymove(wq, dest, src, n, is_memcpy,
+			thr_desc.flags, result);
+		return;
+	}
 
         uint64_t cpu_frac = auto_adjust_knobs == AUTO_ADJUST_KNOBS_V2 ?
             tl_cpu_size_fraction : cpu_size_fraction;
