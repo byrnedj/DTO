@@ -62,6 +62,12 @@
 static __thread struct dsa_hw_desc thr_desc;
 static __thread struct dsa_completion_record thr_comp __attribute__((aligned(32)));
 static __thread uint64_t thr_bytes_completed;
+static __thread size_t thr_cpu_fraction_bytes;
+static __thread uint64_t thr_cpu_fraction_ns;
+static __thread uint64_t thr_submit_ns;
+static __thread uint64_t thr_poll_ns;
+static __thread uint64_t tl_num_descs;
+static __thread uint64_t tl_next_sample;
 
 // original std memory functions
 static void * (*orig_memset)(void *s, int c, size_t n);
@@ -150,6 +156,16 @@ static uint8_t dto_overlapping_memmove_action = OVERLAPPING_CPU;
 
 static uint8_t fork_handler_registered;
 
+static uint8_t dto_profiling;
+#define PROFILING_SAMPLE_INTERVAL_DEFAULT 100
+static unsigned int profiling_sample_interval = PROFILING_SAMPLE_INTERVAL_DEFAULT;
+
+/* Minimum samples needed per bucket before profiling-driven knobs are applied */
+#define PROFILING_MIN_SAMPLES 10
+/* How often (in profiling samples) to recompute knobs */
+#define PROFILING_KNOB_RECOMPUTE_INTERVAL 200
+static __thread uint64_t tl_profiling_knob_counter;
+
 enum memop {
 	MEMSET = 0x0,
 	MEMCOPY,
@@ -169,7 +185,10 @@ static const char * const memop_names[] = {
 #define HIST_BUCKET_SIZE 4096
 #define HIST_NO_BUCKETS 512
 enum stat_group {
-	STDC_CALL = 0x0,
+	STDC_CALL_MIN_SIZE = 0x0,
+	STDC_CALL_SAMPLED,
+	STDC_CALL_DSA_FAILED,
+	STDC_CALL_CPU_FRACTION,
 	DSA_CALL_SUCCESS,
 	DSA_CALL_FAILED,
 	DSA_FAIL_CODES,
@@ -177,7 +196,10 @@ enum stat_group {
 };
 
 static const char * const stat_group_names[] = {
-	[STDC_CALL] = "stdc calls",
+	[STDC_CALL_MIN_SIZE] = "cpu (min_sz)",
+	[STDC_CALL_SAMPLED] = "cpu (sampled)",
+	[STDC_CALL_DSA_FAILED] = "cpu (dsa_fail)",
+	[STDC_CALL_CPU_FRACTION] = "cpu (fraction)",
 	[DSA_CALL_SUCCESS] = "dsa (success)",
 	[DSA_CALL_FAILED] = "dsa (failed)",
 	[DSA_FAIL_CODES] = "failure reason"
@@ -235,20 +257,33 @@ static struct timespec dto_start_time;
 		}									\
 	} while (0)									\
 
-#define DTO_COLLECT_STATS_CPU_END(cs, st, et, op, n, orig_n)			\
+#define DTO_COLLECT_STATS_CPU_END(cs, st, et, op, n, orig_n, grp)		\
 	do {									\
 		if (unlikely(cs)) {						\
 			uint64_t t;						\
 			clock_gettime(CLOCK_BOOTTIME, &et);			\
 			t = (((et.tv_sec*1000000000) + et.tv_nsec) -		\
 				((st.tv_sec*1000000000) + st.tv_nsec));		\
-			update_stats(op, orig_n, false, n, t, STDC_CALL, 0);		\
+			update_stats(op, orig_n, false, n, t, grp, 0);			\
+		}								\
+	} while (0)								\
+
+#define DTO_COLLECT_STATS_SAMPLED_CPU_END(cs, st, et, op, n)			\
+	do {									\
+		if (unlikely(cs)) {						\
+			uint64_t t;						\
+			clock_gettime(CLOCK_BOOTTIME, &et);			\
+			t = (((et.tv_sec*1000000000) + et.tv_nsec) -		\
+				((st.tv_sec*1000000000) + st.tv_nsec));		\
+			update_stats(op, n, false, n, t, STDC_CALL_SAMPLED, 0);	\
 		}								\
 	} while (0)								\
 
 static atomic_int op_counter[HIST_NO_BUCKETS][MAX_STAT_GROUP][MAX_MEMOP];
 static atomic_ullong bytes_counter[HIST_NO_BUCKETS][MAX_STAT_GROUP];
 static atomic_ullong lat_counter[HIST_NO_BUCKETS][MAX_STAT_GROUP][MAX_MEMOP];
+static atomic_ullong submit_lat_counter[HIST_NO_BUCKETS][MAX_MEMOP];
+static atomic_ullong poll_lat_counter[HIST_NO_BUCKETS][MAX_MEMOP];
 static atomic_int fail_counter[HIST_NO_BUCKETS][MAX_FAILURES];
 #endif
 
@@ -406,6 +441,10 @@ static void child (void)
 				lat_counter[i][j][k] = 0;
 			}
 			bytes_counter[i][j] = 0;
+		}
+		for (j = 0; j < MAX_MEMOP; j++) {
+			submit_lat_counter[i][j] = 0;
+			poll_lat_counter[i][j] = 0;
 		}
 		for (j = 0; j < MAX_FAILURES; j++)
 			fail_counter[i][j] = 0;
@@ -578,10 +617,23 @@ static __always_inline void dsa_wait_and_adjust(const volatile uint8_t *comp)
 static __always_inline int dsa_wait(struct dto_wq *wq,
 	struct dsa_hw_desc *hw, volatile uint8_t *comp)
 {
+#ifdef DTO_STATS_SUPPORT
+	struct timespec _pst, _pet;
+	if (unlikely(collect_stats))
+		clock_gettime(CLOCK_BOOTTIME, &_pst);
+#endif
+
 	if (auto_adjust_knobs)
 		dsa_wait_and_adjust(comp);
 	else
 		dsa_wait_no_adjust(comp);
+
+#ifdef DTO_STATS_SUPPORT
+	if (unlikely(collect_stats)) {
+		clock_gettime(CLOCK_BOOTTIME, &_pet);
+		thr_poll_ns += TS_NS(_pst, _pet);
+	}
+#endif
 
 	if (likely(*comp == DSA_COMP_SUCCESS)) {
 		thr_bytes_completed += hw->xfer_size;
@@ -601,12 +653,31 @@ static __always_inline int dsa_submit(struct dto_wq *wq,
 	//LOG_TRACE("desc flags: 0x%x, opcode: 0x%x\n", hw->flags, hw->opcode);
 	__builtin_ia32_sfence();
 
+#ifdef DTO_STATS_SUPPORT
+	struct timespec _sst, _set;
+	if (unlikely(collect_stats))
+		clock_gettime(CLOCK_BOOTTIME, &_sst);
+#endif
+
 	if (wq->wq_mmapped) {
 		ret = enqcmd(hw, wq->wq_portal);
-		if (!ret)
+		if (!ret) {
+#ifdef DTO_STATS_SUPPORT
+			if (unlikely(collect_stats)) {
+				clock_gettime(CLOCK_BOOTTIME, &_set);
+				thr_submit_ns += TS_NS(_sst, _set);
+			}
+#endif
 			return SUCCESS;
+		}
 	} else {
 		ret = write(wq->wq_fd, hw, sizeof(*hw));
+#ifdef DTO_STATS_SUPPORT
+		if (unlikely(collect_stats)) {
+			clock_gettime(CLOCK_BOOTTIME, &_set);
+			thr_submit_ns += TS_NS(_sst, _set);
+		}
+#endif
 		if (ret == sizeof(*hw))
 			return SUCCESS;
 		else
@@ -623,6 +694,12 @@ static __always_inline int dsa_execute(struct dto_wq *wq,
 	//LOG_TRACE("desc flags: 0x%x, opcode: 0x%x\n", hw->flags, hw->opcode);
 	__builtin_ia32_sfence();
 
+#ifdef DTO_STATS_SUPPORT
+	struct timespec _sst, _set;
+	if (unlikely(collect_stats))
+		clock_gettime(CLOCK_BOOTTIME, &_sst);
+#endif
+
 	if (wq->wq_mmapped)
 		ret = enqcmd(hw, wq->wq_portal);
 
@@ -634,7 +711,22 @@ static __always_inline int dsa_execute(struct dto_wq *wq,
 			ret = 0;
 	}
 	if (!ret) {
+#ifdef DTO_STATS_SUPPORT
+		struct timespec _pst, _pet;
+		if (unlikely(collect_stats)) {
+			clock_gettime(CLOCK_BOOTTIME, &_set);
+			thr_submit_ns += TS_NS(_sst, _set);
+			clock_gettime(CLOCK_BOOTTIME, &_pst);
+		}
+#endif
 		dsa_wait_no_adjust(comp);
+
+#ifdef DTO_STATS_SUPPORT
+		if (unlikely(collect_stats)) {
+			clock_gettime(CLOCK_BOOTTIME, &_pet);
+			thr_poll_ns += TS_NS(_pst, _pet);
+		}
+#endif
 
 		if (*comp == DSA_COMP_SUCCESS) {
 			thr_bytes_completed += hw->xfer_size;
@@ -670,6 +762,16 @@ static void update_stats(int op, size_t n, bool overlapping, size_t bytes_comple
 
 }
 
+static void update_submit_poll_stats(int op, size_t n, uint64_t submit_ns, uint64_t poll_ns)
+{
+	int bucket = (n / HIST_BUCKET_SIZE);
+
+	if (bucket >= HIST_NO_BUCKETS)
+		bucket = HIST_NO_BUCKETS-1;
+	submit_lat_counter[bucket][op] += submit_ns;
+	poll_lat_counter[bucket][op] += poll_ns;
+}
+
 static void print_stats(void)
 {
 	struct timespec dto_end_time;
@@ -680,6 +782,7 @@ static void print_stats(void)
 	clock_gettime(CLOCK_BOOTTIME, &dto_end_time);
 
 	dto_stats_log("DTO Run Time: %ld ms\n", TS_NS(dto_start_time, dto_end_time)/1000000);
+	dto_stats_log("DTO CPU Size Fraction: %.2f\n", cpu_size_fraction / 100.0);
 
 	// display stats
 	for (int t = 0; t < 2; ++t) {
@@ -759,6 +862,428 @@ static void print_stats(void)
 			dto_stats_log("\n");
 		}
 	}
+
+	/* Submit and Poll latency breakdown for DSA operations */
+	LOG_TRACE("\n******** Average DSA Submit / Poll Latency (us)  ********\n");
+	LOG_TRACE("%-17s -- ", "Byte Range");
+	for (int o = 0; o < MAX_MEMOP; ++o)
+		LOG_TRACE("%-10s ", memop_names[o]);
+	LOG_TRACE("   ");
+	for (int o = 0; o < MAX_MEMOP; ++o)
+		LOG_TRACE("%-10s ", memop_names[o]);
+	LOG_TRACE("\n");
+
+	LOG_TRACE("%17s    ", "");
+	for (int o = 0; o < MAX_MEMOP; ++o)
+		LOG_TRACE("%-10s ", "submit");
+	LOG_TRACE("   ");
+	for (int o = 0; o < MAX_MEMOP; ++o)
+		LOG_TRACE("%-10s ", "poll");
+	LOG_TRACE("\n");
+
+	for (int b = 0; b < HIST_NO_BUCKETS; ++b) {
+		bool empty = true;
+
+		for (int o = 0; o < MAX_MEMOP; ++o) {
+			if (op_counter[b][DSA_CALL_SUCCESS][o] != 0) {
+				empty = false;
+				break;
+			}
+		}
+		if (empty)
+			continue;
+
+		if (b < (HIST_NO_BUCKETS-1))
+			LOG_TRACE("% 8d-%-8d -- ", b*4096, ((b+1)*4096)-1);
+		else
+			LOG_TRACE("   >=%-12d -- ", b*4096);
+
+		for (int o = 0; o < MAX_MEMOP; ++o) {
+			int count = op_counter[b][DSA_CALL_SUCCESS][o];
+			if (count > 0) {
+				double avg_us = ((double)submit_lat_counter[b][o]) / ((double)count * 1000.0);
+				LOG_TRACE("%-10.2f ", avg_us);
+			} else {
+				LOG_TRACE("%-10d ", 0);
+			}
+		}
+		LOG_TRACE("   ");
+		for (int o = 0; o < MAX_MEMOP; ++o) {
+			int count = op_counter[b][DSA_CALL_SUCCESS][o];
+			if (count > 0) {
+				double avg_us = ((double)poll_lat_counter[b][o]) / ((double)count * 1000.0);
+				LOG_TRACE("%-10.2f ", avg_us);
+			} else {
+				LOG_TRACE("%-10d ", 0);
+			}
+		}
+		LOG_TRACE("\n");
+	}
+}
+
+static void analyze_profiling_stats(void)
+{
+	if (!dto_profiling)
+		return;
+
+	double total_cpu_time_ns = 0;
+	double total_dsa_time_ns = 0;
+	double total_ops_analyzed = 0;
+
+	LOG_TRACE("\n======== Profiling Analysis ========\n");
+
+	for (int o = 0; o < MAX_MEMOP; ++o) {
+		bool has_data = false;
+		int crossover_bucket = -1;
+		double op_cpu_time_ns = 0;
+		double op_dsa_time_ns = 0;
+		double op_total_ops = 0;
+
+		/* Check if there is any sampled or DSA data for this op */
+		for (int b = 0; b < HIST_NO_BUCKETS; ++b) {
+			if (op_counter[b][STDC_CALL_SAMPLED][o] > 0 ||
+			    op_counter[b][DSA_CALL_SUCCESS][o] > 0) {
+				has_data = true;
+				break;
+			}
+		}
+
+		if (!has_data)
+			continue;
+
+		LOG_TRACE("\n--- %s ---\n", memop_names[o]);
+		LOG_TRACE("%-17s    %-12s %-12s %-10s %-8s\n",
+			"Byte Range", "CPU (us)", "DSA (us)", "Winner", "Ops");
+
+		for (int b = 0; b < HIST_NO_BUCKETS; ++b) {
+			int sampled_count = op_counter[b][STDC_CALL_SAMPLED][o];
+			int dsa_count = op_counter[b][DSA_CALL_SUCCESS][o];
+
+			if (sampled_count == 0 && dsa_count == 0)
+				continue;
+
+			double cpu_avg_us = 0;
+			double dsa_avg_us = 0;
+			bool have_cpu = sampled_count > 0;
+			bool have_dsa = dsa_count > 0;
+
+			if (have_cpu)
+				cpu_avg_us = ((double)lat_counter[b][STDC_CALL_SAMPLED][o]) /
+					     ((double)sampled_count * 1000.0);
+			if (have_dsa)
+				dsa_avg_us = ((double)lat_counter[b][DSA_CALL_SUCCESS][o]) /
+					     ((double)dsa_count * 1000.0);
+
+			/* Total DSA-eligible ops in this bucket for this op:
+			 * sampled + DSA success + DSA failed
+			 */
+			int total_ops = sampled_count + dsa_count +
+					op_counter[b][DSA_CALL_FAILED][o];
+
+			const char *winner;
+			if (have_cpu && have_dsa) {
+				winner = (dsa_avg_us < cpu_avg_us) ? "DSA" : "CPU";
+				if (crossover_bucket < 0 && dsa_avg_us < cpu_avg_us)
+					crossover_bucket = b;
+			} else {
+				winner = "N/A";
+			}
+
+			if (b < (HIST_NO_BUCKETS - 1))
+				LOG_TRACE("% 8d-%-8d    ", b * HIST_BUCKET_SIZE,
+					((b + 1) * HIST_BUCKET_SIZE) - 1);
+			else
+				LOG_TRACE("   >=%-12d    ", b * HIST_BUCKET_SIZE);
+
+			if (have_cpu)
+				LOG_TRACE("%-12.2f ", cpu_avg_us);
+			else
+				LOG_TRACE("%-12s ", "---");
+
+			if (have_dsa)
+				LOG_TRACE("%-12.2f ", dsa_avg_us);
+			else
+				LOG_TRACE("%-12s ", "---");
+
+			LOG_TRACE("%-10s %-8d\n", winner, total_ops);
+
+			/* Accumulate time estimates where we have both measurements */
+			if (have_cpu && have_dsa) {
+				double cpu_avg_ns = cpu_avg_us * 1000.0;
+				double dsa_avg_ns = dsa_avg_us * 1000.0;
+				op_cpu_time_ns += (double)total_ops * cpu_avg_ns;
+				op_dsa_time_ns += (double)total_ops * dsa_avg_ns;
+				op_total_ops += total_ops;
+			}
+		}
+
+		if (crossover_bucket >= 0)
+			LOG_TRACE("\nDSA crossover: %d bytes (DSA starts outperforming CPU)\n",
+				crossover_bucket * HIST_BUCKET_SIZE);
+		else if (op_total_ops > 0)
+			LOG_TRACE("\nNo DSA crossover found (CPU faster at all measured sizes)\n");
+
+		if (op_total_ops > 0) {
+			double savings_ns = op_cpu_time_ns - op_dsa_time_ns;
+			double savings_pct = (op_cpu_time_ns > 0) ?
+				(savings_ns / op_cpu_time_ns) * 100.0 : 0;
+
+			LOG_TRACE("Total estimated CPU time:  %10.2f ms\n",
+				op_cpu_time_ns / 1000000.0);
+			LOG_TRACE("Total estimated DSA time:  %10.2f ms\n",
+				op_dsa_time_ns / 1000000.0);
+			if (savings_ns > 0)
+				LOG_TRACE("Estimated DSA savings:    %10.2f ms (%.1f%%)\n",
+					savings_ns / 1000000.0, savings_pct);
+			else
+				LOG_TRACE("Estimated DSA overhead:   %10.2f ms (%.1f%% slower)\n",
+					-savings_ns / 1000000.0, -savings_pct);
+		}
+
+		total_cpu_time_ns += op_cpu_time_ns;
+		total_dsa_time_ns += op_dsa_time_ns;
+		total_ops_analyzed += op_total_ops;
+	}
+
+	if (total_ops_analyzed > 0) {
+		double total_savings_ns = total_cpu_time_ns - total_dsa_time_ns;
+		double total_savings_pct = (total_cpu_time_ns > 0) ?
+			(total_savings_ns / total_cpu_time_ns) * 100.0 : 0;
+
+		LOG_TRACE("\n======== Summary ========\n");
+		LOG_TRACE("Combined CPU time:  %10.2f ms\n",
+			total_cpu_time_ns / 1000000.0);
+		LOG_TRACE("Combined DSA time:  %10.2f ms\n",
+			total_dsa_time_ns / 1000000.0);
+		if (total_savings_ns > 0)
+			LOG_TRACE("Combined savings:   %10.2f ms (%.1f%%)\n",
+				total_savings_ns / 1000000.0, total_savings_pct);
+		else
+			LOG_TRACE("Combined overhead:  %10.2f ms (%.1f%% slower)\n",
+				-total_savings_ns / 1000000.0, -total_savings_pct);
+	}
+
+	/*
+	 * Total expected speedup across ALL memory operations.
+	 *
+	 * cpu_only_time: estimated total time if every operation ran on CPU.
+	 *   - min_size ops: use their actual measured CPU time
+	 *   - DSA-eligible ops: use sampled CPU latency (extrapolated to all ops in bucket)
+	 *
+	 * dsa_projected_time: estimated total time with DSA for eligible ops.
+	 *   - min_size ops: still on CPU (same as cpu_only)
+	 *   - DSA-eligible ops where DSA wins: use DSA latency
+	 *   - DSA-eligible ops where CPU wins: use CPU latency (wouldn't offload these)
+	 */
+	double cpu_only_time_ns = 0;
+	double dsa_projected_time_ns = 0;
+	double total_all_ops = 0;
+	double total_min_size_ops = 0;
+
+	for (int o = 0; o < MAX_MEMOP; ++o) {
+		for (int b = 0; b < HIST_NO_BUCKETS; ++b) {
+			int min_size_count = op_counter[b][STDC_CALL_MIN_SIZE][o];
+			int sampled_count = op_counter[b][STDC_CALL_SAMPLED][o];
+			int dsa_count = op_counter[b][DSA_CALL_SUCCESS][o];
+			int dsa_failed_count = op_counter[b][DSA_CALL_FAILED][o];
+
+			/* min_size ops: always CPU, count towards both baselines */
+			if (min_size_count > 0) {
+				double min_size_time = (double)lat_counter[b][STDC_CALL_MIN_SIZE][o];
+				cpu_only_time_ns += min_size_time;
+				dsa_projected_time_ns += min_size_time;
+				total_min_size_ops += min_size_count;
+				total_all_ops += min_size_count;
+			}
+
+			/* DSA-eligible ops: sampled + dsa_success + dsa_failed */
+			int eligible_count = sampled_count + dsa_count + dsa_failed_count;
+			if (eligible_count == 0)
+				continue;
+
+			total_all_ops += eligible_count;
+
+			double cpu_avg_ns = 0;
+			double dsa_avg_ns = 0;
+			bool have_cpu = sampled_count > 0;
+			bool have_dsa = dsa_count > 0;
+
+			if (have_cpu)
+				cpu_avg_ns = ((double)lat_counter[b][STDC_CALL_SAMPLED][o]) /
+					     (double)sampled_count;
+			if (have_dsa)
+				dsa_avg_ns = ((double)lat_counter[b][DSA_CALL_SUCCESS][o]) /
+					     (double)dsa_count;
+
+			if (have_cpu) {
+				/* CPU baseline: all eligible ops at CPU speed */
+				cpu_only_time_ns += (double)eligible_count * cpu_avg_ns;
+			} else if (have_dsa) {
+				/* No CPU sample; use DSA time as conservative estimate */
+				cpu_only_time_ns += (double)eligible_count * dsa_avg_ns;
+			}
+
+			if (have_cpu && have_dsa) {
+				/* Use whichever is faster (optimal offload decision) */
+				double best_ns = (dsa_avg_ns < cpu_avg_ns) ? dsa_avg_ns : cpu_avg_ns;
+				dsa_projected_time_ns += (double)eligible_count * best_ns;
+			} else if (have_dsa) {
+				dsa_projected_time_ns += (double)eligible_count * dsa_avg_ns;
+			} else if (have_cpu) {
+				/* No DSA measurement, assume stays on CPU */
+				dsa_projected_time_ns += (double)eligible_count * cpu_avg_ns;
+			}
+		}
+	}
+
+	if (total_all_ops > 0 && cpu_only_time_ns > 0) {
+		double speedup = cpu_only_time_ns / dsa_projected_time_ns;
+
+		LOG_TRACE("\n======== Total Expected Speedup ========\n");
+		LOG_TRACE("Total memory ops:       %10.0f\n", total_all_ops);
+		LOG_TRACE("  min_size (CPU-only):  %10.0f\n", total_min_size_ops);
+		LOG_TRACE("  DSA-eligible:         %10.0f\n", total_all_ops - total_min_size_ops);
+		LOG_TRACE("CPU-only total time:    %10.2f ms\n",
+			cpu_only_time_ns / 1000000.0);
+		LOG_TRACE("DSA-projected time:     %10.2f ms\n",
+			dsa_projected_time_ns / 1000000.0);
+		LOG_TRACE("Expected speedup:       %10.2fx\n", speedup);
+
+		double pct_time_min_size = 0;
+		double min_size_total = 0;
+		for (int o = 0; o < MAX_MEMOP; ++o)
+			for (int b = 0; b < HIST_NO_BUCKETS; ++b)
+				if (op_counter[b][STDC_CALL_MIN_SIZE][o] > 0)
+					min_size_total += (double)lat_counter[b][STDC_CALL_MIN_SIZE][o];
+		if (cpu_only_time_ns > 0)
+			pct_time_min_size = (min_size_total / cpu_only_time_ns) * 100.0;
+
+		LOG_TRACE("Time in min_size ops:   %10.2f ms (%.1f%% of CPU-only)\n",
+			min_size_total / 1000000.0, pct_time_min_size);
+	}
+
+	LOG_TRACE("\n");
+}
+
+/*
+ * Compute optimal dsa_min_size and cpu_size_fraction from profiling data.
+ *
+ * dsa_min_size: set to the crossover point — lowest byte range where DSA
+ *   outperforms CPU across the dominant mem ops (memcpy/memset).
+ *
+ * cpu_size_fraction: for sizes above the crossover, compute the ratio that
+ *   keeps CPU and DSA finishing at roughly the same time. If DSA takes D us
+ *   and CPU takes C us for a given size, the CPU should handle C/(C+D) of the
+ *   work so both finish simultaneously.
+ */
+static void apply_profiling_knobs(void)
+{
+	if (!dto_profiling || auto_adjust_knobs)
+		return;
+
+	/*
+	 * Find the global crossover: lowest bucket where DSA wins for any op.
+	 * Use the most conservative (highest) crossover across all ops so we
+	 * don't send small ops to DSA where it's slower.
+	 */
+	int global_crossover = -1;
+
+	for (int o = 0; o < MAX_MEMOP; ++o) {
+		int op_crossover = -1;
+
+		for (int b = 0; b < HIST_NO_BUCKETS; ++b) {
+			int sampled_count = op_counter[b][STDC_CALL_SAMPLED][o];
+			int dsa_count = op_counter[b][DSA_CALL_SUCCESS][o];
+
+			if (sampled_count < PROFILING_MIN_SAMPLES ||
+			    dsa_count < PROFILING_MIN_SAMPLES)
+				continue;
+
+			double cpu_avg_ns = ((double)lat_counter[b][STDC_CALL_SAMPLED][o]) /
+					    (double)sampled_count;
+			double dsa_avg_ns = ((double)lat_counter[b][DSA_CALL_SUCCESS][o]) /
+					    (double)dsa_count;
+
+			if (dsa_avg_ns < cpu_avg_ns) {
+				op_crossover = b;
+				break;
+			}
+		}
+
+		if (op_crossover >= 0) {
+			if (global_crossover < 0 || op_crossover > global_crossover)
+				global_crossover = op_crossover;
+		}
+	}
+
+	/* Apply dsa_min_size from crossover point */
+	if (global_crossover >= 0) {
+		size_t new_min_size = (size_t)global_crossover * HIST_BUCKET_SIZE;
+		if (new_min_size < HIST_BUCKET_SIZE)
+			new_min_size = HIST_BUCKET_SIZE;
+		dsa_min_size = new_min_size;
+	}
+
+	/*
+	 * Compute optimal cpu_size_fraction from buckets above the crossover.
+	 *
+	 * For each bucket where DSA wins, the optimal CPU fraction is the ratio
+	 * that makes the CPU work take the same time as the DSA work:
+	 *   fraction = D / (C + D)
+	 * where C = CPU time per byte, D = DSA time per byte.
+	 *
+	 * This means: if CPU does fraction*N bytes and DSA does (1-fraction)*N
+	 * bytes, the CPU finishes in fraction*N*C_per_byte time and the DSA
+	 * finishes in (1-fraction)*N*D_per_byte time. Setting them equal:
+	 *   fraction * C = (1 - fraction) * D
+	 *   fraction = D / (C + D)
+	 *
+	 * We weight by the number of ops in each bucket so the most common
+	 * sizes dominate the fraction.
+	 */
+	double weighted_fraction_sum = 0;
+	double total_weight = 0;
+
+	for (int o = 0; o < MAX_MEMOP; ++o) {
+		for (int b = (global_crossover >= 0 ? global_crossover : 0);
+		     b < HIST_NO_BUCKETS; ++b) {
+			int sampled_count = op_counter[b][STDC_CALL_SAMPLED][o];
+			int dsa_count = op_counter[b][DSA_CALL_SUCCESS][o];
+
+			if (sampled_count < PROFILING_MIN_SAMPLES ||
+			    dsa_count < PROFILING_MIN_SAMPLES)
+				continue;
+
+			double cpu_avg_ns = ((double)lat_counter[b][STDC_CALL_SAMPLED][o]) /
+					    (double)sampled_count;
+			double dsa_avg_ns = ((double)lat_counter[b][DSA_CALL_SUCCESS][o]) /
+					    (double)dsa_count;
+
+			/* Only compute fraction where DSA wins */
+			if (dsa_avg_ns >= cpu_avg_ns)
+				continue;
+
+			double fraction = dsa_avg_ns / (cpu_avg_ns + dsa_avg_ns);
+			int total_ops = sampled_count + dsa_count +
+					op_counter[b][DSA_CALL_FAILED][o];
+
+			weighted_fraction_sum += fraction * (double)total_ops;
+			total_weight += (double)total_ops;
+		}
+	}
+
+	if (total_weight > 0) {
+		double optimal_fraction = weighted_fraction_sum / total_weight;
+		/* Clamp to valid range: 0 to MAX_CPU_SIZE_FRACTION */
+		size_t new_csf = (size_t)(optimal_fraction * 100.0);
+		if (new_csf > MAX_CPU_SIZE_FRACTION)
+			new_csf = MAX_CPU_SIZE_FRACTION;
+		cpu_size_fraction = new_csf;
+	}
+
+	LOG_TRACE("Profiling knobs applied: dsa_min_size=%lu, "
+		"cpu_size_fraction=%.2f\n",
+		dsa_min_size, cpu_size_fraction / 100.0);
 }
 #endif
 
@@ -1470,6 +1995,23 @@ static int init_dto(void)
 				auto_adjust_knobs = !!auto_adjust_knobs;
 			}
 
+			env_str = getenv("DTO_PROFILING");
+			if (env_str != NULL) {
+				errno = 0;
+				dto_profiling = strtoul(env_str, NULL, 10);
+				if (errno)
+					dto_profiling = 0;
+				dto_profiling = !!dto_profiling;
+			}
+
+			env_str = getenv("DTO_PROFILING_SAMPLE_INTERVAL");
+			if (env_str != NULL) {
+				errno = 0;
+				profiling_sample_interval = strtoul(env_str, NULL, 10);
+				if (errno || profiling_sample_interval == 0)
+					profiling_sample_interval = PROFILING_SAMPLE_INTERVAL_DEFAULT;
+			}
+
 			if (numa_available() != -1) {
 				env_str = getenv("DTO_IS_NUMA_AWARE");
 				if (env_str != NULL) {
@@ -1518,9 +2060,11 @@ static int init_dto(void)
     
 			// display configuration
 			LOG_TRACE("log_level: %d, collect_stats: %d, use_std_lib_calls: %d, dsa_min_size: %lu, "
-				"cpu_size_fraction: %.2f, wait_method: %s, auto_adjust_knobs: %d, numa_awareness: %s, dto_dsa_cc: %d\n",
+				"cpu_size_fraction: %.2f, wait_method: %s, auto_adjust_knobs: %d, numa_awareness: %s, dto_dsa_cc: %d, "
+				"profiling: %d, profiling_sample_interval: %u\n",
 				log_level, collect_stats, use_std_lib_calls, dsa_min_size,
-				cpu_size_fraction_float, wait_names[wait_method], auto_adjust_knobs, numa_aware_names[is_numa_aware], dto_dsa_cc);
+				cpu_size_fraction_float, wait_names[wait_method], auto_adjust_knobs, numa_aware_names[is_numa_aware], dto_dsa_cc,
+				dto_profiling, profiling_sample_interval);
 			for (int i = 0; i < num_wqs; i++)
 				LOG_TRACE("[%d] wq_path: %s, wq_size: %d, dsa_cap: %lx\n", i,
 					wqs[i].wq_path, wqs[i].wq_size, wqs[i].dsa_gencap);
@@ -1544,8 +2088,10 @@ static void cleanup_dto(void)
 		close(wqs[i].wq_fd);
 	}
 #ifdef DTO_STATS_SUPPORT
-        print_stats();
-        restore_sigint_handler();
+	print_stats();
+	analyze_profiling_stats();
+	apply_profiling_knobs();
+	restore_sigint_handler();
 #endif
         if (log_fd != -1)
                 close(log_fd);
@@ -1603,6 +2149,10 @@ static void dto_memset(void *s, int c, size_t n, int *result)
 	dsa_size = n - cpu_size;
 
 	thr_bytes_completed = 0;
+	thr_cpu_fraction_bytes = 0;
+	thr_cpu_fraction_ns = 0;
+	thr_submit_ns = 0;
+	thr_poll_ns = 0;
 	if (dsa_size <= wq->max_transfer_size) {
 		thr_desc.dst_addr = (uint64_t) s + cpu_size;
 		thr_desc.xfer_size = (uint32_t) dsa_size;
@@ -1610,15 +2160,31 @@ static void dto_memset(void *s, int c, size_t n, int *result)
 		*result = dsa_submit(wq, &thr_desc);
 		if (likely(*result == SUCCESS)) {
 			if (cpu_size) {
+#ifdef DTO_STATS_SUPPORT
+				struct timespec _fst, _fet;
+				if (unlikely(collect_stats))
+					clock_gettime(CLOCK_BOOTTIME, &_fst);
+#endif
 				orig_memset(s, c, cpu_size);
+#ifdef DTO_STATS_SUPPORT
+				if (unlikely(collect_stats)) {
+					clock_gettime(CLOCK_BOOTTIME, &_fet);
+					thr_cpu_fraction_ns = ((_fet.tv_sec*1000000000) + _fet.tv_nsec) -
+						((_fst.tv_sec*1000000000) + _fst.tv_nsec);
+				}
+#endif
 				thr_bytes_completed = cpu_size;
+				thr_cpu_fraction_bytes = cpu_size;
 			}
 			*result = dsa_wait(wq, &thr_desc, &thr_comp.status);
 		}
 	} else {
 		uint32_t threshold;
-		size_t current_cpu_size_fraction = cpu_size_fraction;  // the cpu_size_fraction might be changed by the auto tune algorithm 
+		size_t current_cpu_size_fraction = cpu_size_fraction;  // the cpu_size_fraction might be changed by the auto tune algorithm
 		threshold = wq->max_transfer_size * 100 / (100 - current_cpu_size_fraction);
+#ifdef DTO_STATS_SUPPORT
+		struct timespec _fst, _fet;
+#endif
 
 		do {
 			size_t len;
@@ -1636,8 +2202,20 @@ static void dto_memset(void *s, int c, size_t n, int *result)
 				if (cpu_size) {
 					void *s1 = s + thr_bytes_completed;
 
+#ifdef DTO_STATS_SUPPORT
+					if (unlikely(collect_stats))
+						clock_gettime(CLOCK_BOOTTIME, &_fst);
+#endif
 					orig_memset(s1, c, cpu_size);
+#ifdef DTO_STATS_SUPPORT
+					if (unlikely(collect_stats)) {
+						clock_gettime(CLOCK_BOOTTIME, &_fet);
+						thr_cpu_fraction_ns += ((_fet.tv_sec*1000000000) + _fet.tv_nsec) -
+							((_fst.tv_sec*1000000000) + _fst.tv_nsec);
+					}
+#endif
 					thr_bytes_completed += cpu_size;
+					thr_cpu_fraction_bytes += cpu_size;
 				}
 				*result = dsa_wait(wq, &thr_desc, &thr_comp.status);
 			}
@@ -1656,6 +2234,26 @@ static void dto_memset(void *s, int c, size_t n, int *result)
 /* For overlapping src & dest buffers in memmove API, we can't split the memmove
  * job. Otherwise, it may lead to incorrect copy operation.
  */
+static __always_inline bool dto_profiling_is_sample(void)
+{
+	if (unlikely(tl_next_sample == 0))
+		tl_next_sample = rand() % (profiling_sample_interval * 2) + 1;
+	return ++tl_num_descs == tl_next_sample;
+}
+
+static __always_inline void dto_profiling_schedule_next(void)
+{
+	tl_next_sample = tl_num_descs + rand() % (profiling_sample_interval * 2) + 1;
+
+#ifdef DTO_STATS_SUPPORT
+	/* Periodically recompute knobs from profiling data */
+	if (unlikely(++tl_profiling_knob_counter >= PROFILING_KNOB_RECOMPUTE_INTERVAL)) {
+		tl_profiling_knob_counter = 0;
+		apply_profiling_knobs();
+	}
+#endif
+}
+
 static bool is_overlapping_buffers (void *dest, const void *src, size_t n)
 {
 	if ((dest + n) < src || (src + n) < dest)
@@ -1671,6 +2269,10 @@ static bool dto_memcpymove(void *dest, const void *src, size_t n, bool is_memcpy
 	bool is_overlapping;
 
 	thr_bytes_completed = 0;
+	thr_cpu_fraction_bytes = 0;
+	thr_cpu_fraction_ns = 0;
+	thr_submit_ns = 0;
+	thr_poll_ns = 0;
 
 	if (!is_memcpy && is_overlapping_buffers(dest, src, n)) {
 		cpu_size = 0;
@@ -1708,23 +2310,39 @@ static bool dto_memcpymove(void *dest, const void *src, size_t n, bool is_memcpy
 			*result = dsa_submit(wq, &thr_desc);
 			if (*result == SUCCESS) {
 				if (cpu_size) {
+#ifdef DTO_STATS_SUPPORT
+					struct timespec _fst, _fet;
+					if (unlikely(collect_stats))
+						clock_gettime(CLOCK_BOOTTIME, &_fst);
+#endif
 					if (is_memcpy)
 						orig_memcpy(dest, src, cpu_size);
 					else
 						orig_memmove(dest, src, cpu_size);
+#ifdef DTO_STATS_SUPPORT
+					if (unlikely(collect_stats)) {
+						clock_gettime(CLOCK_BOOTTIME, &_fet);
+						thr_cpu_fraction_ns = ((_fet.tv_sec*1000000000) + _fet.tv_nsec) -
+							((_fst.tv_sec*1000000000) + _fst.tv_nsec);
+					}
+#endif
 					thr_bytes_completed += cpu_size;
+					thr_cpu_fraction_bytes += cpu_size;
 				}
 				*result = dsa_wait(wq, &thr_desc, &thr_comp.status);
 			}
 		}
 	} else {
 		uint32_t threshold;
-		size_t current_cpu_size_fraction = cpu_size_fraction;  // the cpu_size_fraction might be changed by the auto tune algorithm 
+		size_t current_cpu_size_fraction = cpu_size_fraction;  // the cpu_size_fraction might be changed by the auto tune algorithm
 		if (is_overlapping) {
 			threshold = wq->max_transfer_size;
 		} else {
 			threshold = wq->max_transfer_size * 100 / (100 - current_cpu_size_fraction);
 		}
+#ifdef DTO_STATS_SUPPORT
+		struct timespec _fst, _fet;
+#endif
 
 		do {
 			size_t len;
@@ -1749,11 +2367,23 @@ static bool dto_memcpymove(void *dest, const void *src, size_t n, bool is_memcpy
 						const void *src1 = src + thr_bytes_completed;
 						void *dest1 = dest + thr_bytes_completed;
 
+#ifdef DTO_STATS_SUPPORT
+						if (unlikely(collect_stats))
+							clock_gettime(CLOCK_BOOTTIME, &_fst);
+#endif
 						if (is_memcpy)
 							orig_memcpy(dest1, src1, cpu_size);
 						else
 							orig_memmove(dest1, src1, cpu_size);
+#ifdef DTO_STATS_SUPPORT
+						if (unlikely(collect_stats)) {
+							clock_gettime(CLOCK_BOOTTIME, &_fet);
+							thr_cpu_fraction_ns += ((_fet.tv_sec*1000000000) + _fet.tv_nsec) -
+								((_fst.tv_sec*1000000000) + _fst.tv_nsec);
+						}
+#endif
 						thr_bytes_completed += cpu_size;
+						thr_cpu_fraction_bytes += cpu_size;
 					}
 					*result = dsa_wait(wq, &thr_desc, &thr_comp.status);
 				}
@@ -1784,6 +2414,8 @@ static int dto_memcmp(const void *s1, const void *s2, size_t n, int *result)
 	thr_comp.result = 0;
 
 	thr_bytes_completed = 0;
+	thr_submit_ns = 0;
+	thr_poll_ns = 0;
 
 	if (n <= wq->max_transfer_size) {
 		thr_desc.src_addr = (uint64_t) s1;
@@ -1881,6 +2513,7 @@ void *memset(void *s1, int c, size_t n)
 #ifdef DTO_STATS_SUPPORT
 	struct timespec st, et;
 	size_t orig_n = n;
+	int cpu_fallback_group = STDC_CALL_MIN_SIZE;
 #endif
 
 	if (unlikely(dto_initialized == 0)) {
@@ -1893,6 +2526,17 @@ void *memset(void *s1, int c, size_t n)
 	}
 
 	if (!use_orig_func) {
+		if (unlikely(dto_profiling) && dto_profiling_is_sample()) {
+			dto_profiling_schedule_next();
+#ifdef DTO_STATS_SUPPORT
+			DTO_COLLECT_STATS_START(collect_stats, st);
+#endif
+			orig_memset(s1, c, n);
+#ifdef DTO_STATS_SUPPORT
+			DTO_COLLECT_STATS_SAMPLED_CPU_END(collect_stats, st, et, MEMSET, n);
+#endif
+			return ret;
+		}
 #ifdef DTO_STATS_SUPPORT
 		DTO_COLLECT_STATS_START(collect_stats, st);
 #endif
@@ -1900,12 +2544,19 @@ void *memset(void *s1, int c, size_t n)
 
 #ifdef DTO_STATS_SUPPORT
 		DTO_COLLECT_STATS_DSA_END(collect_stats, st, et, MEMSET, n, false, thr_bytes_completed, result);
+		if (unlikely(collect_stats))
+			update_submit_poll_stats(MEMSET, orig_n, thr_submit_ns, thr_poll_ns);
+		if (unlikely(collect_stats) && thr_cpu_fraction_bytes > 0)
+			update_stats(MEMSET, orig_n, false, thr_cpu_fraction_bytes, thr_cpu_fraction_ns, STDC_CALL_CPU_FRACTION, 0);
 #endif
 		if (thr_bytes_completed != n) {
 			/* fallback to std call if job is only partially completed */
 			use_orig_func = 1;
 			n -= thr_bytes_completed;
 			s1 = (void *)((uint64_t)s1 + thr_bytes_completed);
+#ifdef DTO_STATS_SUPPORT
+			cpu_fallback_group = STDC_CALL_DSA_FAILED;
+#endif
 		}
 	}
 
@@ -1917,7 +2568,7 @@ void *memset(void *s1, int c, size_t n)
 		orig_memset(s1, c, n);
 
 #ifdef DTO_STATS_SUPPORT
-		DTO_COLLECT_STATS_CPU_END(collect_stats, st, et, MEMSET, n, orig_n);
+		DTO_COLLECT_STATS_CPU_END(collect_stats, st, et, MEMSET, n, orig_n, cpu_fallback_group);
 #endif
 	}
 	return ret;
@@ -1931,6 +2582,7 @@ void *memcpy(void *dest, const void *src, size_t n)
 #ifdef DTO_STATS_SUPPORT
 	struct timespec st, et;
 	size_t orig_n = n;
+	int cpu_fallback_group = STDC_CALL_MIN_SIZE;
 #endif
 
 	if (unlikely(dto_initialized == 0)) {
@@ -1943,6 +2595,17 @@ void *memcpy(void *dest, const void *src, size_t n)
 	}
 
 	if (!use_orig_func) {
+		if (unlikely(dto_profiling) && dto_profiling_is_sample()) {
+			dto_profiling_schedule_next();
+#ifdef DTO_STATS_SUPPORT
+			DTO_COLLECT_STATS_START(collect_stats, st);
+#endif
+			orig_memcpy(dest, src, n);
+#ifdef DTO_STATS_SUPPORT
+			DTO_COLLECT_STATS_SAMPLED_CPU_END(collect_stats, st, et, MEMCOPY, n);
+#endif
+			return ret;
+		}
 #ifdef DTO_STATS_SUPPORT
 		DTO_COLLECT_STATS_START(collect_stats, st);
 #endif
@@ -1950,6 +2613,10 @@ void *memcpy(void *dest, const void *src, size_t n)
 
 #ifdef DTO_STATS_SUPPORT
 		DTO_COLLECT_STATS_DSA_END(collect_stats, st, et, MEMCOPY, n, false, thr_bytes_completed, result);
+		if (unlikely(collect_stats))
+			update_submit_poll_stats(MEMCOPY, orig_n, thr_submit_ns, thr_poll_ns);
+		if (unlikely(collect_stats) && thr_cpu_fraction_bytes > 0)
+			update_stats(MEMCOPY, orig_n, false, thr_cpu_fraction_bytes, thr_cpu_fraction_ns, STDC_CALL_CPU_FRACTION, 0);
 #endif
 		if (thr_bytes_completed != n) {
 			/* fallback to std call if job is only partially completed */
@@ -1959,6 +2626,9 @@ void *memcpy(void *dest, const void *src, size_t n)
 				dest = (void *)((uint64_t)dest + thr_bytes_completed);
 				src = (const void *)((uint64_t)src + thr_bytes_completed);
 			}
+#ifdef DTO_STATS_SUPPORT
+			cpu_fallback_group = STDC_CALL_DSA_FAILED;
+#endif
 		}
 	}
 
@@ -1970,7 +2640,7 @@ void *memcpy(void *dest, const void *src, size_t n)
 		orig_memcpy(dest, src, n);
 
 #ifdef DTO_STATS_SUPPORT
-		DTO_COLLECT_STATS_CPU_END(collect_stats, st, et, MEMCOPY, n, orig_n);
+		DTO_COLLECT_STATS_CPU_END(collect_stats, st, et, MEMCOPY, n, orig_n, cpu_fallback_group);
 #endif
 	}
 	return ret;
@@ -1985,6 +2655,7 @@ void *memmove(void *dest, const void *src, size_t n)
 #ifdef DTO_STATS_SUPPORT
 	struct timespec st, et;
 	size_t orig_n = n;
+	int cpu_fallback_group = STDC_CALL_MIN_SIZE;
 #endif
 
 	if (unlikely(dto_initialized == 0)) {
@@ -1997,6 +2668,17 @@ void *memmove(void *dest, const void *src, size_t n)
 	}
 
 	if (!use_orig_func) {
+		if (unlikely(dto_profiling) && dto_profiling_is_sample()) {
+			dto_profiling_schedule_next();
+#ifdef DTO_STATS_SUPPORT
+			DTO_COLLECT_STATS_START(collect_stats, st);
+#endif
+			orig_memmove(dest, src, n);
+#ifdef DTO_STATS_SUPPORT
+			DTO_COLLECT_STATS_SAMPLED_CPU_END(collect_stats, st, et, MEMMOVE, n);
+#endif
+			return ret;
+		}
 #ifdef DTO_STATS_SUPPORT
 		DTO_COLLECT_STATS_START(collect_stats, st);
 #endif
@@ -2004,6 +2686,10 @@ void *memmove(void *dest, const void *src, size_t n)
 
 #ifdef DTO_STATS_SUPPORT
 		DTO_COLLECT_STATS_DSA_END(collect_stats, st, et, MEMMOVE, n, is_overlapping, thr_bytes_completed, result);
+		if (unlikely(collect_stats))
+			update_submit_poll_stats(MEMMOVE, orig_n, thr_submit_ns, thr_poll_ns);
+		if (unlikely(collect_stats) && thr_cpu_fraction_bytes > 0)
+			update_stats(MEMMOVE, orig_n, false, thr_cpu_fraction_bytes, thr_cpu_fraction_ns, STDC_CALL_CPU_FRACTION, 0);
 #endif
 		if (thr_bytes_completed != n) {
 			/* fallback to std call if job is only partially completed */
@@ -2013,6 +2699,9 @@ void *memmove(void *dest, const void *src, size_t n)
 				dest = (void *)((uint64_t)dest + thr_bytes_completed);
 				src = (const void *)((uint64_t)src + thr_bytes_completed);
 			}
+#ifdef DTO_STATS_SUPPORT
+			cpu_fallback_group = STDC_CALL_DSA_FAILED;
+#endif
 		}
 	}
 
@@ -2024,7 +2713,7 @@ void *memmove(void *dest, const void *src, size_t n)
 		orig_memmove(dest, src, n);
 
 #ifdef DTO_STATS_SUPPORT
-		DTO_COLLECT_STATS_CPU_END(collect_stats, st, et, MEMMOVE, n, orig_n);
+		DTO_COLLECT_STATS_CPU_END(collect_stats, st, et, MEMMOVE, n, orig_n, cpu_fallback_group);
 #endif
 	}
 	return ret;
@@ -2038,6 +2727,7 @@ int memcmp(const void *s1, const void *s2, size_t n)
 #ifdef DTO_STATS_SUPPORT
 	struct timespec st, et;
 	size_t orig_n = n;
+	int cpu_fallback_group = STDC_CALL_MIN_SIZE;
 #endif
 
 	if (unlikely(dto_initialized == 0)) {
@@ -2050,6 +2740,17 @@ int memcmp(const void *s1, const void *s2, size_t n)
 	}
 
 	if (!use_orig_func) {
+		if (unlikely(dto_profiling) && dto_profiling_is_sample()) {
+			dto_profiling_schedule_next();
+#ifdef DTO_STATS_SUPPORT
+			DTO_COLLECT_STATS_START(collect_stats, st);
+#endif
+			ret = orig_memcmp(s1, s2, n);
+#ifdef DTO_STATS_SUPPORT
+			DTO_COLLECT_STATS_SAMPLED_CPU_END(collect_stats, st, et, MEMCMP, n);
+#endif
+			return ret;
+		}
 #ifdef DTO_STATS_SUPPORT
 		DTO_COLLECT_STATS_START(collect_stats, st);
 #endif
@@ -2057,6 +2758,8 @@ int memcmp(const void *s1, const void *s2, size_t n)
 
 #ifdef DTO_STATS_SUPPORT
 		DTO_COLLECT_STATS_DSA_END(collect_stats, st, et, MEMCMP, n, false, thr_bytes_completed, result);
+		if (unlikely(collect_stats))
+			update_submit_poll_stats(MEMCMP, orig_n, thr_submit_ns, thr_poll_ns);
 #endif
 		if (thr_bytes_completed != n) {
 			/* fallback to std call if job is only partially completed */
@@ -2064,6 +2767,9 @@ int memcmp(const void *s1, const void *s2, size_t n)
 			n -= thr_bytes_completed;
 			s1 = (const void *)((uint64_t)s1 + thr_bytes_completed);
 			s2 = (const void *)((uint64_t)s2 + thr_bytes_completed);
+#ifdef DTO_STATS_SUPPORT
+			cpu_fallback_group = STDC_CALL_DSA_FAILED;
+#endif
 		}
 	}
 
@@ -2075,7 +2781,7 @@ int memcmp(const void *s1, const void *s2, size_t n)
 		ret = orig_memcmp(s1, s2, n);
 
 #ifdef DTO_STATS_SUPPORT
-		DTO_COLLECT_STATS_CPU_END(collect_stats, st, et, MEMCMP, n, orig_n);
+		DTO_COLLECT_STATS_CPU_END(collect_stats, st, et, MEMCMP, n, orig_n, cpu_fallback_group);
 #endif
 	}
 	return ret;
