@@ -157,6 +157,12 @@ static uint8_t dto_profiling;
 #define PROFILING_SAMPLE_INTERVAL_DEFAULT 100
 static unsigned int profiling_sample_interval = PROFILING_SAMPLE_INTERVAL_DEFAULT;
 
+/* Minimum samples needed per bucket before profiling-driven knobs are applied */
+#define PROFILING_MIN_SAMPLES 10
+/* How often (in profiling samples) to recompute knobs */
+#define PROFILING_KNOB_RECOMPUTE_INTERVAL 200
+static __thread uint64_t tl_profiling_knob_counter;
+
 enum memop {
 	MEMSET = 0x0,
 	MEMCOPY,
@@ -1076,6 +1082,127 @@ static void analyze_profiling_stats(void)
 
 	LOG_TRACE("\n");
 }
+
+/*
+ * Compute optimal dsa_min_size and cpu_size_fraction from profiling data.
+ *
+ * dsa_min_size: set to the crossover point — lowest byte range where DSA
+ *   outperforms CPU across the dominant mem ops (memcpy/memset).
+ *
+ * cpu_size_fraction: for sizes above the crossover, compute the ratio that
+ *   keeps CPU and DSA finishing at roughly the same time. If DSA takes D us
+ *   and CPU takes C us for a given size, the CPU should handle C/(C+D) of the
+ *   work so both finish simultaneously.
+ */
+static void apply_profiling_knobs(void)
+{
+	if (!dto_profiling || auto_adjust_knobs)
+		return;
+
+	/*
+	 * Find the global crossover: lowest bucket where DSA wins for any op.
+	 * Use the most conservative (highest) crossover across all ops so we
+	 * don't send small ops to DSA where it's slower.
+	 */
+	int global_crossover = -1;
+
+	for (int o = 0; o < MAX_MEMOP; ++o) {
+		int op_crossover = -1;
+
+		for (int b = 0; b < HIST_NO_BUCKETS; ++b) {
+			int sampled_count = op_counter[b][STDC_CALL_SAMPLED][o];
+			int dsa_count = op_counter[b][DSA_CALL_SUCCESS][o];
+
+			if (sampled_count < PROFILING_MIN_SAMPLES ||
+			    dsa_count < PROFILING_MIN_SAMPLES)
+				continue;
+
+			double cpu_avg_ns = ((double)lat_counter[b][STDC_CALL_SAMPLED][o]) /
+					    (double)sampled_count;
+			double dsa_avg_ns = ((double)lat_counter[b][DSA_CALL_SUCCESS][o]) /
+					    (double)dsa_count;
+
+			if (dsa_avg_ns < cpu_avg_ns) {
+				op_crossover = b;
+				break;
+			}
+		}
+
+		if (op_crossover >= 0) {
+			if (global_crossover < 0 || op_crossover > global_crossover)
+				global_crossover = op_crossover;
+		}
+	}
+
+	/* Apply dsa_min_size from crossover point */
+	if (global_crossover >= 0) {
+		size_t new_min_size = (size_t)global_crossover * HIST_BUCKET_SIZE;
+		if (new_min_size < HIST_BUCKET_SIZE)
+			new_min_size = HIST_BUCKET_SIZE;
+		dsa_min_size = new_min_size;
+	}
+
+	/*
+	 * Compute optimal cpu_size_fraction from buckets above the crossover.
+	 *
+	 * For each bucket where DSA wins, the optimal CPU fraction is the ratio
+	 * that makes the CPU work take the same time as the DSA work:
+	 *   fraction = D / (C + D)
+	 * where C = CPU time per byte, D = DSA time per byte.
+	 *
+	 * This means: if CPU does fraction*N bytes and DSA does (1-fraction)*N
+	 * bytes, the CPU finishes in fraction*N*C_per_byte time and the DSA
+	 * finishes in (1-fraction)*N*D_per_byte time. Setting them equal:
+	 *   fraction * C = (1 - fraction) * D
+	 *   fraction = D / (C + D)
+	 *
+	 * We weight by the number of ops in each bucket so the most common
+	 * sizes dominate the fraction.
+	 */
+	double weighted_fraction_sum = 0;
+	double total_weight = 0;
+
+	for (int o = 0; o < MAX_MEMOP; ++o) {
+		for (int b = (global_crossover >= 0 ? global_crossover : 0);
+		     b < HIST_NO_BUCKETS; ++b) {
+			int sampled_count = op_counter[b][STDC_CALL_SAMPLED][o];
+			int dsa_count = op_counter[b][DSA_CALL_SUCCESS][o];
+
+			if (sampled_count < PROFILING_MIN_SAMPLES ||
+			    dsa_count < PROFILING_MIN_SAMPLES)
+				continue;
+
+			double cpu_avg_ns = ((double)lat_counter[b][STDC_CALL_SAMPLED][o]) /
+					    (double)sampled_count;
+			double dsa_avg_ns = ((double)lat_counter[b][DSA_CALL_SUCCESS][o]) /
+					    (double)dsa_count;
+
+			/* Only compute fraction where DSA wins */
+			if (dsa_avg_ns >= cpu_avg_ns)
+				continue;
+
+			double fraction = dsa_avg_ns / (cpu_avg_ns + dsa_avg_ns);
+			int total_ops = sampled_count + dsa_count +
+					op_counter[b][DSA_CALL_FAILED][o];
+
+			weighted_fraction_sum += fraction * (double)total_ops;
+			total_weight += (double)total_ops;
+		}
+	}
+
+	if (total_weight > 0) {
+		double optimal_fraction = weighted_fraction_sum / total_weight;
+		/* Clamp to valid range: 0 to MAX_CPU_SIZE_FRACTION */
+		size_t new_csf = (size_t)(optimal_fraction * 100.0);
+		if (new_csf > MAX_CPU_SIZE_FRACTION)
+			new_csf = MAX_CPU_SIZE_FRACTION;
+		cpu_size_fraction = new_csf;
+	}
+
+	LOG_TRACE("Profiling knobs applied: dsa_min_size=%lu, "
+		"cpu_size_fraction=%.2f\n",
+		dsa_min_size, cpu_size_fraction / 100.0);
+}
 #endif
 
 #define DTO_MAX_PARAM_LEN 16
@@ -1865,6 +1992,7 @@ static void cleanup_dto(void)
 #ifdef DTO_STATS_SUPPORT
 	print_stats();
 	analyze_profiling_stats();
+	apply_profiling_knobs();
 #endif
 	if (log_fd != -1)
 		close(log_fd);
@@ -2013,6 +2141,14 @@ static __always_inline bool dto_profiling_is_sample(void)
 static __always_inline void dto_profiling_schedule_next(void)
 {
 	tl_next_sample = tl_num_descs + rand() % (profiling_sample_interval * 2) + 1;
+
+#ifdef DTO_STATS_SUPPORT
+	/* Periodically recompute knobs from profiling data */
+	if (unlikely(++tl_profiling_knob_counter >= PROFILING_KNOB_RECOMPUTE_INTERVAL)) {
+		tl_profiling_knob_counter = 0;
+		apply_profiling_knobs();
+	}
+#endif
 }
 
 static bool is_overlapping_buffers (void *dest, const void *src, size_t n)
