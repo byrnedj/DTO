@@ -47,6 +47,50 @@
 #define MAX_WQS 32
 #define MAX_NUMA_NODES 32
 #define DTO_DEFAULT_MIN_SIZE 65536
+#define DTO_SMALL_THRESHOLD 1024
+
+static __always_inline void *fast_memcpy(void *dest, const void *src, size_t n)
+{
+	void *ret = dest;
+	__asm__ volatile("rep movsb"
+			 : "+D"(dest), "+S"(src), "+c"(n)
+			 : : "memory");
+	return ret;
+}
+
+static __always_inline void *fast_memset(void *s, int c, size_t n)
+{
+	void *ret = s;
+	__asm__ volatile("rep stosb"
+			 : "+D"(s), "+c"(n)
+			 : "a"((unsigned char)c)
+			 : "memory");
+	return ret;
+}
+
+static __always_inline void *fast_memmove(void *dest, const void *src, size_t n)
+{
+	/*
+	 * For the fast path, we can check overlap direction:
+	 * if dest < src or non-overlapping, forward rep movsb is safe.
+	 * if dest > src (overlapping), copy backwards with std + rep movsb + cld.
+	 */
+	if (dest < src || (char *)dest >= (char *)src + n) {
+		void *ret = dest;
+		__asm__ volatile("rep movsb"
+				 : "+D"(dest), "+S"(src), "+c"(n)
+				 : : "memory");
+		return ret;
+	} else {
+		void *ret = dest;
+		dest = (char *)dest + n - 1;
+		src = (const char *)src + n - 1;
+		__asm__ volatile("std; rep movsb; cld"
+				 : "+D"(dest), "+S"(src), "+c"(n)
+				 : : "memory");
+		return ret;
+	}
+}
 #define DTO_INITIALIZED 0
 #define DTO_INITIALIZING 1
 
@@ -1772,6 +1816,10 @@ static int dto_internal_memcmp(const void *s1, const void *s2, size_t n)
 
 void *memset(void *s1, int c, size_t n)
 {
+	/* Fast path: skip all DTO logic for small operations */
+	if (n < DTO_SMALL_THRESHOLD)
+		return fast_memset(s1, c, n);
+
 	int result = 0;
 	void *ret = s1;
 	int use_orig_func = USE_ORIG_FUNC(n, dto_dsa_memset);
@@ -1822,6 +1870,10 @@ void *memset(void *s1, int c, size_t n)
 
 void *memcpy(void *dest, const void *src, size_t n)
 {
+	/* Fast path: skip all DTO logic for small operations */
+	if (n < DTO_SMALL_THRESHOLD)
+		return fast_memcpy(dest, src, n);
+
 	int result = 0;
 	void *ret = dest;
 	int use_orig_func = USE_ORIG_FUNC(n, dto_dsa_memcpy);
@@ -1875,6 +1927,10 @@ void *memcpy(void *dest, const void *src, size_t n)
 
 void *memmove(void *dest, const void *src, size_t n)
 {
+	/* Fast path: skip all DTO logic for small operations */
+	if (n < DTO_SMALL_THRESHOLD)
+		return fast_memmove(dest, src, n);
+
 	int result = 0;
 	void *ret = dest;
 	int use_orig_func = USE_ORIG_FUNC(n, dto_dsa_memmove);
