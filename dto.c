@@ -732,6 +732,7 @@ static void dto_batch_memset(struct dto_wq *wq, void *s, int c, size_t n,
 		thr_batch_comp[i].cr.status = 0;
 	}
 
+	__builtin_memset(&thr_desc, 0, sizeof(thr_desc));
 	thr_desc.opcode = DSA_OPCODE_BATCH;
 	thr_desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
 	thr_desc.desc_list_addr = (uint64_t)thr_batch_descs;
@@ -747,17 +748,52 @@ static void dto_batch_memset(struct dto_wq *wq, void *s, int c, size_t n,
 	uint8_t done[BATCH_SIZE] = {0};
 
 	while (pending > 0) {
+		/* Check batch-level completion first */
+		uint8_t batch_status = thr_comp.status;
+		if (batch_status != 0 &&
+		    batch_status != DSA_COMP_SUCCESS &&
+		    batch_status != DSA_COMP_BATCH_FAIL &&
+		    batch_status != DSA_COMP_BATCH_PAGE_FAULT) {
+			/* Batch descriptor itself failed — CPU fallback for all pending */
+			LOG_ERROR("batch memset failed: status 0x%x\n", batch_status);
+			for (int i = 0; i < BATCH_SIZE; i++) {
+				if (done[i])
+					continue;
+				size_t this_size = part_size +
+					(i == BATCH_SIZE - 1 ? remainder : 0);
+				size_t offset = (size_t)i * part_size;
+				orig_memset((char *)s + offset, c, this_size);
+				thr_bytes_completed += this_size;
+			}
+			break;
+		}
+
+		/* If batch page-faulted on descriptor list, some sub-descs were not processed */
+		int descs_processed = BATCH_SIZE;
+		if (batch_status == DSA_COMP_BATCH_PAGE_FAULT)
+			descs_processed = thr_comp.descs_completed;
+
 		for (int i = 0; i < BATCH_SIZE; i++) {
 			if (done[i])
-				continue;
-
-			uint8_t status = thr_batch_comp[i].cr.status;
-			if (status == 0)
 				continue;
 
 			size_t this_size = part_size +
 				(i == BATCH_SIZE - 1 ? remainder : 0);
 			size_t offset = (size_t)i * part_size;
+
+			/* Sub-descriptors beyond descs_processed were never submitted */
+			if (batch_status == DSA_COMP_BATCH_PAGE_FAULT &&
+			    i >= descs_processed) {
+				orig_memset((char *)s + offset, c, this_size);
+				thr_bytes_completed += this_size;
+				done[i] = 1;
+				pending--;
+				continue;
+			}
+
+			uint8_t status = thr_batch_comp[i].cr.status;
+			if (status == 0)
+				continue;
 
 			if (status == DSA_COMP_SUCCESS) {
 				thr_bytes_completed += this_size;
@@ -803,6 +839,7 @@ static void dto_batch_memcpymove(struct dto_wq *wq, void *dest, const void *src,
 		thr_batch_comp[i].cr.status = 0;
 	}
 
+	__builtin_memset(&thr_desc, 0, sizeof(thr_desc));
 	thr_desc.opcode = DSA_OPCODE_BATCH;
 	thr_desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
 	thr_desc.desc_list_addr = (uint64_t)thr_batch_descs;
@@ -818,17 +855,62 @@ static void dto_batch_memcpymove(struct dto_wq *wq, void *dest, const void *src,
 	uint8_t done[BATCH_SIZE] = {0};
 
 	while (pending > 0) {
+		/* Check batch-level completion first */
+		uint8_t batch_status = thr_comp.status;
+		if (batch_status != 0 &&
+		    batch_status != DSA_COMP_SUCCESS &&
+		    batch_status != DSA_COMP_BATCH_FAIL &&
+		    batch_status != DSA_COMP_BATCH_PAGE_FAULT) {
+			/* Batch descriptor itself failed — CPU fallback for all pending */
+			LOG_ERROR("batch memcpymove failed: status 0x%x\n", batch_status);
+			for (int i = 0; i < BATCH_SIZE; i++) {
+				if (done[i])
+					continue;
+				size_t this_size = part_size +
+					(i == BATCH_SIZE - 1 ? remainder : 0);
+				size_t offset = (size_t)i * part_size;
+				void *d = (char *)dest + offset;
+				const void *s_ptr = (const char *)src + offset;
+				if (is_memcpy)
+					orig_memcpy(d, s_ptr, this_size);
+				else
+					orig_memmove(d, s_ptr, this_size);
+				thr_bytes_completed += this_size;
+			}
+			break;
+		}
+
+		/* If batch page-faulted on descriptor list, some sub-descs were not processed */
+		int descs_processed = BATCH_SIZE;
+		if (batch_status == DSA_COMP_BATCH_PAGE_FAULT)
+			descs_processed = thr_comp.descs_completed;
+
 		for (int i = 0; i < BATCH_SIZE; i++) {
 			if (done[i])
-				continue;
-
-			uint8_t status = thr_batch_comp[i].cr.status;
-			if (status == 0)
 				continue;
 
 			size_t this_size = part_size +
 				(i == BATCH_SIZE - 1 ? remainder : 0);
 			size_t offset = (size_t)i * part_size;
+
+			/* Sub-descriptors beyond descs_processed were never submitted */
+			if (batch_status == DSA_COMP_BATCH_PAGE_FAULT &&
+			    i >= descs_processed) {
+				void *d = (char *)dest + offset;
+				const void *s_ptr = (const char *)src + offset;
+				if (is_memcpy)
+					orig_memcpy(d, s_ptr, this_size);
+				else
+					orig_memmove(d, s_ptr, this_size);
+				thr_bytes_completed += this_size;
+				done[i] = 1;
+				pending--;
+				continue;
+			}
+
+			uint8_t status = thr_batch_comp[i].cr.status;
+			if (status == 0)
+				continue;
 
 			if (status == DSA_COMP_SUCCESS) {
 				thr_bytes_completed += this_size;
@@ -839,11 +921,11 @@ static void dto_batch_memcpymove(struct dto_wq *wq, void *dest, const void *src,
 				size_t remaining = this_size - completed;
 				if (remaining > 0) {
 					void *d = (char *)dest + offset + completed;
-					const void *s = (const char *)src + offset + completed;
+					const void *s_ptr = (const char *)src + offset + completed;
 					if (is_memcpy)
-						orig_memcpy(d, s, remaining);
+						orig_memcpy(d, s_ptr, remaining);
 					else
-						orig_memmove(d, s, remaining);
+						orig_memmove(d, s_ptr, remaining);
 					thr_bytes_completed += remaining;
 				}
 			}
