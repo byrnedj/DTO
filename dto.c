@@ -82,8 +82,8 @@ struct batch_comp {
 	struct dsa_completion_record cr;
 } __attribute__((aligned(64)));
 
-static __thread struct dsa_hw_desc thr_batch_descs[BATCH_SIZE] __attribute__((aligned(64)));
-static __thread struct batch_comp thr_batch_comp[BATCH_SIZE];
+//static __thread struct dsa_hw_desc thr_batch_descs[BATCH_SIZE] __attribute__((aligned(64)));
+//static __thread struct batch_comp thr_batch_comp[BATCH_SIZE];
 
 // original std memory functions
 static void * (*orig_memset)(void *s, int c, size_t n);
