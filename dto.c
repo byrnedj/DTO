@@ -72,10 +72,10 @@ static __thread int16_t wq_index = -1;
 // batch operation variables (thread-local for concurrent batch operations)
 #define MAX_BATCH_DESCS 64
 static __thread struct dsa_hw_desc thr_batch_descs[MAX_BATCH_DESCS] __attribute__((aligned(64)));
-static __thread struct dsa_completion_record thr_batch_comp __attribute__((aligned(32)));
+static __thread struct dsa_completion_record thr_batch_comp[MAX_BATCH_DESCS] __attribute__((aligned(32)));
 static __thread struct dsa_completion_record thr_batch_sub_comps[MAX_BATCH_DESCS] __attribute__((aligned(32)));
 
-#define BATCH_SIZE 16
+#define BATCH_SIZE 8
 #define BATCH_THRESHOLD (512 * 1024)
 
 struct batch_comp {
@@ -83,7 +83,7 @@ struct batch_comp {
 } __attribute__((aligned(64)));
 
 //static __thread struct dsa_hw_desc thr_batch_descs[BATCH_SIZE] __attribute__((aligned(64)));
-//static __thread struct batch_comp thr_batch_comp[BATCH_SIZE];
+static __thread struct batch_comp thr_batch_comp_a[BATCH_SIZE];
 
 // original std memory functions
 static void * (*orig_memset)(void *s, int c, size_t n);
@@ -152,6 +152,7 @@ static uint8_t dto_dsa_memcmp = 1;
 
 static uint8_t dto_dsa_cc = 1;
 static uint8_t dto_dsa_bof = 1;
+static uint8_t dto_dsa_batch = 1;
 static bool dto_use_c02 = true; //C02 state is default -
                             //C02 avg exit latency is ~500 ns
                             //and C01 is about ~240 ns on SPR
@@ -725,11 +726,11 @@ static void dto_batch_memset(struct dto_wq *wq, void *s, int c, size_t n,
 
 		thr_batch_descs[i].opcode = DSA_OPCODE_MEMFILL;
 		thr_batch_descs[i].flags = sub_flags;
-		thr_batch_descs[i].completion_addr = (uint64_t)&thr_batch_comp[i].cr;
+		thr_batch_descs[i].completion_addr = (uint64_t)&thr_batch_comp_a[i].cr;
 		thr_batch_descs[i].dst_addr = (uint64_t)s + i * part_size;
 		thr_batch_descs[i].xfer_size = (uint32_t)this_size;
 		thr_batch_descs[i].pattern = pattern;
-		thr_batch_comp[i].cr.status = 0;
+		thr_batch_comp_a[i].cr.status = 0;
 	}
 
 	__builtin_memset(&thr_desc, 0, sizeof(thr_desc));
@@ -791,7 +792,7 @@ static void dto_batch_memset(struct dto_wq *wq, void *s, int c, size_t n,
 				continue;
 			}
 
-			uint8_t status = thr_batch_comp[i].cr.status;
+			uint8_t status = thr_batch_comp_a[i].cr.status;
 			if (status == 0)
 				continue;
 
@@ -799,7 +800,7 @@ static void dto_batch_memset(struct dto_wq *wq, void *s, int c, size_t n,
 				thr_bytes_completed += this_size;
 			} else {
 				/* Page fault or error: CPU handles remaining bytes */
-				size_t completed = thr_batch_comp[i].cr.bytes_completed;
+				size_t completed = thr_batch_comp_a[i].cr.bytes_completed;
 				thr_bytes_completed += completed;
 				size_t remaining = this_size - completed;
 				if (remaining > 0) {
@@ -832,11 +833,11 @@ static void dto_batch_memcpymove(struct dto_wq *wq, void *dest, const void *src,
 
 		thr_batch_descs[i].opcode = DSA_OPCODE_MEMMOVE;
 		thr_batch_descs[i].flags = sub_flags;
-		thr_batch_descs[i].completion_addr = (uint64_t)&thr_batch_comp[i].cr;
+		thr_batch_descs[i].completion_addr = (uint64_t)&thr_batch_comp_a[i].cr;
 		thr_batch_descs[i].src_addr = (uint64_t)src + offset;
 		thr_batch_descs[i].dst_addr = (uint64_t)dest + offset;
 		thr_batch_descs[i].xfer_size = (uint32_t)this_size;
-		thr_batch_comp[i].cr.status = 0;
+		thr_batch_comp_a[i].cr.status = 0;
 	}
 
 	__builtin_memset(&thr_desc, 0, sizeof(thr_desc));
@@ -908,7 +909,7 @@ static void dto_batch_memcpymove(struct dto_wq *wq, void *dest, const void *src,
 				continue;
 			}
 
-			uint8_t status = thr_batch_comp[i].cr.status;
+			uint8_t status = thr_batch_comp_a[i].cr.status;
 			if (status == 0)
 				continue;
 
@@ -916,7 +917,7 @@ static void dto_batch_memcpymove(struct dto_wq *wq, void *dest, const void *src,
 				thr_bytes_completed += this_size;
 			} else {
 				/* Page fault or error: CPU handles remaining bytes */
-				size_t completed = thr_batch_comp[i].cr.bytes_completed;
+				size_t completed = thr_batch_comp_a[i].cr.bytes_completed;
 				thr_bytes_completed += completed;
 				size_t remaining = this_size - completed;
 				if (remaining > 0) {
@@ -1715,6 +1716,16 @@ static int init_dto(void)
 			dto_dsa_bof = !!dto_dsa_bof;
 		}
 
+		env_str = getenv("DTO_DSA_BATCH");
+		if (env_str != NULL) {
+			errno = 0;
+			dto_dsa_batch = strtoul(env_str, NULL, 10);
+			if (errno)
+				dto_dsa_batch = 0;
+
+			dto_dsa_batch = !!dto_dsa_batch;
+		}
+
 		env_str = getenv("DTO_DSA_MEMMOVE");
 		if (env_str != NULL) {
 			errno = 0;
@@ -1883,9 +1894,9 @@ static int init_dto(void)
 
 			// display configuration
 			LOG_TRACE("log_level: %d, collect_stats: %d, use_std_lib_calls: %d, dsa_min_size: %lu, "
-				"cpu_size_fraction: %.2f, wait_method: %s, auto_adjust_knobs: %d, numa_awareness: %s, dto_dsa_cc: %d, dto_dsa_bof: %d, dto_use_c02: %d, max_wqs_supported: %d\n",
+				"cpu_size_fraction: %.2f, wait_method: %s, auto_adjust_knobs: %d, numa_awareness: %s, dto_dsa_cc: %d, dto_dsa_bof: %d, dto_dsa_batch: %d, dto_use_c02: %d, max_wqs_supported: %d\n",
 				log_level, collect_stats, use_std_lib_calls, dsa_min_size,
-				cpu_size_fraction_float, wait_names[wait_method], auto_adjust_knobs, numa_aware_names[is_numa_aware], dto_dsa_cc, dto_dsa_bof, dto_use_c02, max_wqs_supported);
+				cpu_size_fraction_float, wait_names[wait_method], auto_adjust_knobs, numa_aware_names[is_numa_aware], dto_dsa_cc, dto_dsa_bof, dto_dsa_batch, dto_use_c02, max_wqs_supported);
 			for (int i = 0; i < num_wqs; i++)
 				LOG_TRACE("[%d] wq_path: %s, wq_size: %d, dsa_cap: %lx\n", i,
 					wqs[i].wq_path, wqs[i].wq_size, wqs[i].dsa_gencap);
@@ -2008,7 +2019,8 @@ static void dto_memset_api(void *s, int c, size_t n)
 	thr_bytes_completed = 0;
 
 	/* Use batch descriptor for large transactions to reduce page fault cost */
-	if (n > BATCH_THRESHOLD && (n / BATCH_SIZE) <= wq->max_transfer_size) {
+	if (dto_dsa_batch &&
+	    n > BATCH_THRESHOLD && (n / BATCH_SIZE) <= wq->max_transfer_size) {
 		dto_batch_memset(wq, s, c, n, memset_pattern, thr_desc.flags, result);
 		return;
 	}
@@ -2420,8 +2432,11 @@ static void dto_memcpymove(void *dest, const void *src, size_t n, bool is_memcpy
             thr_desc.flags |= IDXD_OP_FLAG_BOF;
 	thr_desc.completion_addr = (uint64_t)&thr_comp;
 
+	thr_bytes_completed = 0;
+
 	/* Use batch descriptor for large non-overlapping transactions */
-	if (!((!is_memcpy) && is_overlapping_buffers(dest, src, n)) &&
+	if (dto_dsa_batch &&
+	    !((!is_memcpy) && is_overlapping_buffers(dest, src, n)) &&
 	    n > BATCH_THRESHOLD &&
 	    (n / BATCH_SIZE) <= wq->max_transfer_size) {
 		dto_batch_memcpymove(wq, dest, src, n, is_memcpy,
@@ -2439,8 +2454,6 @@ static void dto_memcpymove(void *dest, const void *src, size_t n, bool is_memcpy
 		cpu_size = n * cpu_frac / 100;
 
 	dsa_size = n - cpu_size;
-
-	thr_bytes_completed = 0;
 
 	if (dsa_size <= wq->max_transfer_size) {
 		thr_desc.src_addr = (uint64_t) src + cpu_size;
@@ -2989,8 +3002,8 @@ void dto_batch_copy(void **dst, void **src, size_t *sizes, int count,
 	thr_desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
 	thr_desc.desc_list_addr = (uint64_t)thr_batch_descs;
 	thr_desc.desc_count = count;
-	thr_desc.completion_addr = (uint64_t)&thr_batch_comp;
-	thr_batch_comp.status = 0;
+	thr_desc.completion_addr = (uint64_t)&thr_batch_comp[0];
+	thr_batch_comp[0].status = 0;
 
 	/* Submit batch descriptor */
 	result = dsa_submit(wq, &thr_desc);
@@ -3002,12 +3015,12 @@ void dto_batch_copy(void **dst, void **src, size_t *sizes, int count,
 		}
 
 		/* Wait for batch completion using configured wait method */
-		dsa_wait_no_adjust(&thr_batch_comp.status);
+		dsa_wait_no_adjust(&thr_batch_comp[0].status);
 
 		/* Check for batch-level failures and fallback if needed */
-		if (thr_batch_comp.status != DSA_COMP_SUCCESS) {
+		if (thr_batch_comp[0].status != DSA_COMP_SUCCESS) {
 			LOG_ERROR("Batch copy failed with status %x, falling back to memcpy\n",
-			          thr_batch_comp.status);
+			          thr_batch_comp[0].status);
 			/* Check individual completions and retry failed ones */
 			for (int i = 0; i < count; i++) {
 				if (thr_batch_sub_comps[i].status != DSA_COMP_SUCCESS) {
