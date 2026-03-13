@@ -2513,6 +2513,14 @@ static void dto_memset_api(void *s, int c, size_t n)
 	dsa_size = n - cpu_size;
 
 	thr_bytes_completed = 0;
+
+	/* Use batch descriptor for large transactions to reduce page fault cost */
+	if (dto_dsa_batch &&
+	    n > BATCH_THRESHOLD && (n / BATCH_SIZE) <= wq->max_transfer_size) {
+		dto_batch_memset(wq, s, c, n, memset_pattern, thr_desc.flags, result);
+		return;
+	}
+
 	if (dsa_size <= wq->max_transfer_size) {
 		thr_desc.dst_addr = (uint64_t) s + cpu_size;
 		thr_desc.xfer_size = (uint32_t) dsa_size;
@@ -3545,8 +3553,8 @@ void dto_batch_copy(void **dst, void **src, size_t *sizes, int count,
 	thr_desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
 	thr_desc.desc_list_addr = (uint64_t)thr_batch_descs;
 	thr_desc.desc_count = count;
-	thr_desc.completion_addr = (uint64_t)&thr_batch_comp;
-	thr_batch_comp.status = 0;
+	thr_desc.completion_addr = (uint64_t)&thr_batch_comp[0];
+	thr_batch_comp[0].status = 0;
 
 	/* Submit batch descriptor */
 	result = dsa_submit(wq, &thr_desc);
@@ -3558,12 +3566,12 @@ void dto_batch_copy(void **dst, void **src, size_t *sizes, int count,
 		}
 
 		/* Wait for batch completion using configured wait method */
-		dsa_wait_no_adjust(&thr_batch_comp.status);
+		dsa_wait_no_adjust(&thr_batch_comp[0].status);
 
 		/* Check for batch-level failures and fallback if needed */
-		if (thr_batch_comp.status != DSA_COMP_SUCCESS) {
+		if (thr_batch_comp[0].status != DSA_COMP_SUCCESS) {
 			LOG_ERROR("Batch copy failed with status %x, falling back to memcpy\n",
-			          thr_batch_comp.status);
+			          thr_batch_comp[0].status);
 			/* Check individual completions and retry failed ones */
 			for (int i = 0; i < count; i++) {
 				if (thr_batch_sub_comps[i].status != DSA_COMP_SUCCESS) {
