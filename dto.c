@@ -1839,7 +1839,7 @@ static int dto_memcmp(const void *s1, const void *s2, size_t n, int *result)
  */
 static void *dto_internal_memset(void *s1, int c, size_t n)
 {
-	char *dest = s1;
+	volatile char *dest = s1;
 	size_t i;
 
 	for (i = 0; i < n; i++)
@@ -1850,8 +1850,8 @@ static void *dto_internal_memset(void *s1, int c, size_t n)
 
 static void *dto_internal_memcpymove(void *dest, const void *src, size_t n)
 {
-	char *d = dest;
-	const char *s = (const char *)src;
+	volatile char *d = dest;
+	const volatile char *s = (const volatile char *)src;
 	ssize_t i;
 
 	if (s >= d) {
@@ -1869,8 +1869,8 @@ static void *dto_internal_memcpymove(void *dest, const void *src, size_t n)
 
 static int dto_internal_memcmp(const void *s1, const void *s2, size_t n)
 {
-	const unsigned char *src1 = (const unsigned char *)s1;
-	const unsigned char *src2 = (const unsigned char *)s2;
+	const volatile unsigned char *src1 = (const volatile unsigned char *)s1;
+	const volatile unsigned char *src2 = (const volatile unsigned char *)s2;
 	size_t i;
 
 	for (i = 0; i < n; i++) {

@@ -87,6 +87,12 @@ if (HAS_WAITPKG)
   target_compile_options(dto PRIVATE -mwaitpkg -march=native)
 endif()
 
+# Prevent the compiler from optimizing internal fallback loops (dto_internal_memset,
+# dto_internal_memcpymove, etc.) back into libc mem* calls, which would cause
+# infinite recursion when DTO intercepts those symbols.
+target_compile_options(dto PRIVATE
+  -fno-builtin-memset -fno-builtin-memcpy -fno-builtin-memmove -fno-builtin-memcmp)
+
 # Build dto-test and dto-test-wodto
 add_executable(dto-test dto-test.c)
 target_link_libraries(dto-test PRIVATE DTO::dto pthread)
