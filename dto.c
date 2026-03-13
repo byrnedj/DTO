@@ -1325,11 +1325,18 @@ static void update_stats(int op, size_t n, bool overlapping, size_t bytes_comple
 
 	int bucket = (n / HIST_BUCKET_SIZE);
 
-	/* Allocate and register this thread's stats on first use */
+	/* Allocate and register this thread's stats on first use.
+	 * Use mmap instead of calloc to avoid re-entering the allocator
+	 * (which deadlocks when tcmalloc calls memset while holding its
+	 * PageHeap spinlock). mmap returns zeroed memory. */
 	if (unlikely(tl_stats == NULL)) {
-		tl_stats = calloc(1, sizeof(struct thread_stats));
-		if (tl_stats == NULL)
+		tl_stats = mmap(NULL, sizeof(struct thread_stats),
+				PROT_READ | PROT_WRITE,
+				MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if (tl_stats == MAP_FAILED) {
+			tl_stats = NULL;
 			return;  /* Out of memory, skip stats */
+		}
 
 		pthread_mutex_lock(&stats_registry_lock);
 		int idx = atomic_fetch_add(&global_stats_count, 1);
