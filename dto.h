@@ -29,6 +29,23 @@ void dto_memset_pages(void *start_addr, void *end_addr, size_t page_size);
 void dto_batch_copy(void **dst, void **src, size_t *sizes, int count,
                     void (*callback)(void *), void *callback_arg);
 
+/* Gather copy using DSA scatter-gather descriptor.
+ * Gathers data from multiple non-contiguous source buffers into a single
+ * contiguous destination buffer using DSA's gather copy operation.
+ * After submitting the DSA descriptor, calls callback(callback_arg) while
+ * DSA is working. Then waits for completion using the configured wait method.
+ * Falls back to memcpy for failed operations.
+ *
+ * @dst: Destination buffer (must be at least num_srcs * src_size bytes)
+ * @srcs: Array of source buffer pointers
+ * @num_srcs: Number of source buffers (max 64)
+ * @src_size: Size of each source buffer in bytes
+ * @callback: Function to call after DSA submission (while DSA is working)
+ * @callback_arg: Argument to pass to callback function
+ */
+void dto_gather_copy(void *dst, void **srcs, int num_srcs, size_t src_size,
+                     void (*callback)(void *), void *callback_arg);
+
 #ifdef __cplusplus
 }
 #endif
