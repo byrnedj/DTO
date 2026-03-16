@@ -36,6 +36,14 @@
 // DSA capabilities
 #define GENCAP_CC_MEMORY  0x4
 
+// DSA Gen3 opcodes not yet in system header
+#ifndef DSA_OPCODE_GATHER_COPY
+#define DSA_OPCODE_GATHER_COPY 0x1c
+#endif
+
+// SGL format for scatter-gather operations
+#define DSA_SGL_FORMAT1 1
+
 #define UMWAIT_DELAY_DEFAULT 100000
 
 #define C01_STATE 1
@@ -78,12 +86,18 @@ static __thread struct dsa_completion_record thr_batch_sub_comps[MAX_BATCH_DESCS
 #define BATCH_SIZE 8
 #define BATCH_THRESHOLD (512 * 1024)
 
+// gather copy SGL (scatter-gather list) storage
+#define MAX_GATHER_SRCS 64
+
 struct batch_comp {
 	struct dsa_completion_record cr;
 } __attribute__((aligned(64)));
 
 //static __thread struct dsa_hw_desc thr_batch_descs[BATCH_SIZE] __attribute__((aligned(64)));
 static __thread struct batch_comp thr_batch_comp_a[BATCH_SIZE];
+
+// thread-local SGL for gather copy (array of 64-bit byte offsets)
+static __thread uint64_t thr_gather_sgl[MAX_GATHER_SRCS] __attribute__((aligned(64)));
 
 // original std memory functions
 static void * (*orig_memset)(void *s, int c, size_t n);
@@ -178,6 +192,7 @@ enum memop {
 	MEMMOVE,
 	MEMCMP,
 	BATCH_COPY,
+	GATHER_COPY,
 	MAX_MEMOP,
 };
 
@@ -188,7 +203,8 @@ static const char * const memop_names[] = {
 	[MEMMOVE_INTERNAL] = "movi",
 	[MEMMOVE] = "mov",
 	[MEMCMP] = "cmp",
-	[BATCH_COPY] = "batch"
+	[BATCH_COPY] = "batch",
+	[GATHER_COPY] = "gather"
 };
 
 // memory stats
@@ -3053,4 +3069,131 @@ void dto_batch_copy(void **dst, void **src, size_t *sizes, int count,
 		DTO_COLLECT_STATS_DSA_END(collect_stats, st, et, BATCH_COPY, total_bytes, total_bytes, RETRY);
 #endif
 	}
+}
+
+/*
+ * dto_gather_copy - Gather copy operation using DSA scatter-gather descriptor
+ *
+ * Gathers data from multiple non-contiguous source buffers into a single
+ * contiguous destination buffer using DSA's gather copy operation (opcode 0x1c).
+ * The SGL (Scatter-Gather List) uses format 1 (64-bit byte offsets from base).
+ * After submitting to DSA, calls the callback function while DSA is processing.
+ * Falls back to memcpy for failed operations.
+ */
+__attribute__((visibility("default")))
+void dto_gather_copy(void *dst, void **srcs, int num_srcs, size_t src_size,
+                     void (*callback)(void *), void *callback_arg)
+{
+	size_t total_bytes = (size_t)num_srcs * src_size;
+
+#ifdef DTO_STATS_SUPPORT
+	struct timespec st, et;
+	DTO_COLLECT_STATS_START(collect_stats, st);
+#endif
+
+	if (unlikely(dto_initialized == 0 || num_srcs <= 0 || src_size == 0 ||
+		     !dst || !srcs)) {
+		/* Not initialized or invalid args - use synchronous memcpy */
+		for (int i = 0; i < num_srcs; i++) {
+			if (srcs[i])
+				orig_memcpy((char *)dst + i * src_size,
+					    srcs[i], src_size);
+		}
+		if (callback)
+			callback(callback_arg);
+#ifdef DTO_STATS_SUPPORT
+		DTO_COLLECT_STATS_CPU_END(collect_stats, st, et, GATHER_COPY,
+					  total_bytes, total_bytes);
+#endif
+		return;
+	}
+
+	/* Clamp to maximum SGL entries */
+	if (num_srcs > MAX_GATHER_SRCS)
+		num_srcs = MAX_GATHER_SRCS;
+
+	struct dto_wq *wq = get_wq(dst);
+	int result;
+
+	/* Build SGL: format 1 uses 64-bit byte offsets from base address */
+	uint64_t base_addr = (uint64_t)srcs[0];
+	thr_gather_sgl[0] = 0;
+	for (int i = 1; i < num_srcs; i++)
+		thr_gather_sgl[i] = (uint64_t)srcs[i] - base_addr;
+
+	/* Prepare gather copy descriptor */
+	orig_memset(&thr_desc, 0, sizeof(thr_desc));
+	thr_desc.opcode = DSA_OPCODE_GATHER_COPY;
+	thr_desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
+	if (dto_dsa_cc && (wq->dsa_gencap & GENCAP_CC_MEMORY))
+		thr_desc.flags |= IDXD_OP_FLAG_CC;
+	thr_desc.completion_addr = (uint64_t)&thr_comp;
+	thr_desc.src_addr = (uint64_t)thr_gather_sgl;  /* SGL address */
+	thr_desc.dst_addr = (uint64_t)dst;
+	thr_desc.xfer_size = (uint32_t)total_bytes;
+
+	/* Set scatter-gather op-specific fields in op_specific[0..23]
+	 * Layout (bytes 40-63 of descriptor):
+	 *   [0-3]   scatter_gather_elem_count (uint32_t)
+	 *   [4-5]   scatter_gather_sgl_size (uint16_t)
+	 *   [6-7]   reserved
+	 *   [8-15]  scatter_gather_base_addr (uint64_t)
+	 *   [16]    scatter_gather_data_type:4 (low nibble)
+	 *   [17-18] reserved
+	 *   [19]    scatter_gather_sgl_format:4 (high nibble)
+	 *   [20-23] reserved / idpt handles
+	 */
+	uint32_t elem_count = (uint32_t)src_size;
+	uint16_t sgl_size = (uint16_t)num_srcs;
+
+	memcpy(&thr_desc.op_specific[0], &elem_count, sizeof(elem_count));
+	memcpy(&thr_desc.op_specific[4], &sgl_size, sizeof(sgl_size));
+	memcpy(&thr_desc.op_specific[8], &base_addr, sizeof(base_addr));
+	thr_desc.op_specific[16] = 0;                   /* data_type = UINT8 */
+	thr_desc.op_specific[19] = DSA_SGL_FORMAT1 << 4; /* sgl_format in high nibble */
+
+	thr_comp.status = 0;
+	thr_bytes_completed = 0;
+
+	/* Submit descriptor */
+	result = dsa_submit(wq, &thr_desc);
+
+	if (result == SUCCESS) {
+		/* DSA job submitted - call callback while DSA is working */
+		if (callback)
+			callback(callback_arg);
+
+		/* Wait for completion */
+		dsa_wait_no_adjust(&thr_comp.status);
+
+		if (thr_comp.status == DSA_COMP_SUCCESS) {
+#ifdef DTO_STATS_SUPPORT
+			DTO_COLLECT_STATS_DSA_END(collect_stats, st, et,
+						  GATHER_COPY, total_bytes,
+						  total_bytes, SUCCESS);
+#endif
+			return;
+		}
+
+		/* DSA failed - fall back to memcpy */
+		LOG_ERROR("Gather copy failed with status 0x%x, "
+			  "falling back to memcpy\n", thr_comp.status);
+	} else {
+		LOG_ERROR("Gather copy submit failed, falling back to memcpy\n");
+	}
+
+	/* CPU fallback: copy each source buffer into destination */
+	for (int i = 0; i < num_srcs; i++) {
+		if (srcs[i])
+			orig_memcpy((char *)dst + i * src_size, srcs[i],
+				    src_size);
+	}
+	if (callback && result != SUCCESS)
+		callback(callback_arg);
+
+#ifdef DTO_STATS_SUPPORT
+	DTO_COLLECT_STATS_DSA_END(collect_stats, st, et, GATHER_COPY,
+				  total_bytes, total_bytes,
+				  result == SUCCESS ? FAIL_OTHERS : RETRY);
+#endif
 }
