@@ -3665,11 +3665,23 @@ void dto_gather_copy(void *dst, void **srcs, int num_srcs, size_t src_size,
 
 	struct dto_wq *wq = get_wq(dst);
 	int result;
+	int dsa_srcs = num_srcs;
+
+	/* Clamp num sources so total transfer fits within WQ max_transfer_size */
+	if (src_size > 0 && wq->max_transfer_size > 0) {
+		int max_fit = (int)(wq->max_transfer_size / src_size);
+		if (max_fit < 1)
+			max_fit = 1;
+		if (dsa_srcs > max_fit)
+			dsa_srcs = max_fit;
+	}
+
+	size_t dsa_total = (size_t)dsa_srcs * src_size;
 
 	/* Build SGL: format 1 uses 64-bit byte offsets from base address */
 	uint64_t base_addr = (uint64_t)srcs[0];
 	thr_gather_sgl[0] = 0;
-	for (int i = 1; i < num_srcs; i++)
+	for (int i = 1; i < dsa_srcs; i++)
 		thr_gather_sgl[i] = (uint64_t)srcs[i] - base_addr;
 
 	/* Prepare gather copy descriptor */
@@ -3681,7 +3693,7 @@ void dto_gather_copy(void *dst, void **srcs, int num_srcs, size_t src_size,
 	thr_desc.completion_addr = (uint64_t)&thr_comp;
 	thr_desc.src_addr = (uint64_t)thr_gather_sgl;  /* SGL address */
 	thr_desc.dst_addr = (uint64_t)dst;
-	thr_desc.xfer_size = (uint32_t)total_bytes;
+	thr_desc.xfer_size = (uint32_t)dsa_total;
 
 	/* Set scatter-gather op-specific fields in op_specific[0..23]
 	 * Layout (bytes 40-63 of descriptor):
@@ -3695,7 +3707,7 @@ void dto_gather_copy(void *dst, void **srcs, int num_srcs, size_t src_size,
 	 *   [20-23] reserved / idpt handles
 	 */
 	uint32_t elem_count = (uint32_t)src_size;
-	uint16_t sgl_size = (uint16_t)num_srcs;
+	uint16_t sgl_size = (uint16_t)dsa_srcs;
 
 	memcpy(&thr_desc.op_specific[0], &elem_count, sizeof(elem_count));
 	memcpy(&thr_desc.op_specific[4], &sgl_size, sizeof(sgl_size));
@@ -3718,22 +3730,28 @@ void dto_gather_copy(void *dst, void **srcs, int num_srcs, size_t src_size,
 		dsa_wait_no_adjust(&thr_comp.status);
 
 		if (thr_comp.status == DSA_COMP_SUCCESS) {
+			/* DSA handled dsa_srcs; memcpy the remainder */
+			for (int i = dsa_srcs; i < num_srcs; i++) {
+				if (srcs[i])
+					orig_memcpy((char *)dst + i * src_size,
+						    srcs[i], src_size);
+			}
 #ifdef DTO_STATS_SUPPORT
 			DTO_COLLECT_STATS_DSA_END(collect_stats, st, et,
 						  GATHER_COPY, total_bytes,
-						  total_bytes, SUCCESS);
+						  dsa_total, SUCCESS);
 #endif
 			return;
 		}
 
-		/* DSA failed - fall back to memcpy */
+		/* DSA failed - fall back to memcpy for all */
 		LOG_ERROR("Gather copy failed with status 0x%x, "
 			  "falling back to memcpy\n", thr_comp.status);
 	} else {
 		LOG_ERROR("Gather copy submit failed, falling back to memcpy\n");
 	}
 
-	/* CPU fallback: copy each source buffer into destination */
+	/* CPU fallback: copy all source buffers into destination */
 	for (int i = 0; i < num_srcs; i++) {
 		if (srcs[i])
 			orig_memcpy((char *)dst + i * src_size, srcs[i],
