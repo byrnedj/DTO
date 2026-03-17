@@ -41,7 +41,7 @@
 #define C01_STATE 1
 #define C02_STATE 0
 
-#define USE_ORIG_FUNC(n, use_dsa) (use_std_lib_calls == 1 || !use_dsa || (n*(100-cpu_size_fraction)/100) < dsa_min_size)
+#define USE_ORIG_FUNC(n, use_dsa) (use_std_lib_calls == 1 || !use_dsa || thr_dsa_disabled || (n*(100-cpu_size_fraction)/100) < dsa_min_size)
 #define TS_NS(s, e) (((e.tv_sec*1000000000) + e.tv_nsec) - ((s.tv_sec*1000000000) + s.tv_nsec))
 
 /* Maximum WQs that DTO will use. It is rather an arbitrary limit
@@ -68,6 +68,7 @@ static __thread struct dsa_hw_desc thr_desc;
 static __thread struct dsa_completion_record thr_comp __attribute__((aligned(32)));
 static __thread uint64_t thr_bytes_completed;
 static __thread int16_t wq_index = -1;
+static __thread uint8_t thr_dsa_disabled;  /* 1 = thread exceeded max threads limit */
 
 // batch operation variables (thread-local for concurrent batch operations)
 #define MAX_BATCH_DESCS 64
@@ -130,6 +131,7 @@ static atomic_uchar memset_pages_rr;
 static atomic_uchar dto_initialized;
 static atomic_uchar dto_initializing;
 static uint8_t use_std_lib_calls;
+static int dsa_max_threads;  /* 0 = no limit */
 static enum numa_aware is_numa_aware;
 static size_t dsa_min_size = DTO_DEFAULT_MIN_SIZE;
 static int wait_method = WAIT_BUSYPOLL;
@@ -1615,6 +1617,15 @@ static int init_dto(void)
                                         max_wqs_supported = 100;
                         }
 
+                        env_str = getenv("DTO_DSA_MAX_THREADS");
+                        if (env_str != NULL) {
+                                errno = 0;
+                                dsa_max_threads = strtoul(env_str, NULL, 10);
+                                if (errno || dsa_max_threads < 0)
+                                        dsa_max_threads = 0;
+                                LOG_TRACE("dsa_max_threads: %d\n", dsa_max_threads);
+                        }
+
 			if (dsa_init()) {
 				LOG_ERROR("Didn't find any usable DSAs. Falling back to using CPUs.\n");
 				use_std_lib_calls = 1;
@@ -1639,9 +1650,9 @@ static int init_dto(void)
 
 			// display configuration
 			LOG_TRACE("log_level: %d, collect_stats: %d, use_std_lib_calls: %d, dsa_min_size: %lu, "
-				"cpu_size_fraction: %.2f, wait_method: %s, auto_adjust_knobs: %d, numa_awareness: %s, dto_dsa_cc: %d, dto_dsa_bof: %d, dto_use_c02: %d, max_wqs_supported: %d\n",
+				"cpu_size_fraction: %.2f, wait_method: %s, auto_adjust_knobs: %d, numa_awareness: %s, dto_dsa_cc: %d, dto_dsa_bof: %d, dto_use_c02: %d, max_wqs_supported: %d, dsa_max_threads: %d\n",
 				log_level, collect_stats, use_std_lib_calls, dsa_min_size,
-				cpu_size_fraction_float, wait_names[wait_method], auto_adjust_knobs, numa_aware_names[is_numa_aware], dto_dsa_cc, dto_dsa_bof, dto_use_c02, max_wqs_supported);
+				cpu_size_fraction_float, wait_names[wait_method], auto_adjust_knobs, numa_aware_names[is_numa_aware], dto_dsa_cc, dto_dsa_bof, dto_use_c02, max_wqs_supported, dsa_max_threads);
 			for (int i = 0; i < num_wqs; i++)
 				LOG_TRACE("[%d] wq_path: %s, wq_size: %d, dsa_cap: %lx\n", i,
 					wqs[i].wq_path, wqs[i].wq_size, wqs[i].dsa_gencap);
@@ -1704,11 +1715,13 @@ static void cleanup_dto(void)
 static __always_inline  struct dto_wq *get_wq(void* buf)
 {
 	struct dto_wq* wq = NULL;
-        if (wq_index != -1) {
+        if (wq_index >= 0) {
             wq = &wqs[wq_index];
             __builtin_prefetch(wq, 0, 3);
             return wq;
         }
+        if (wq_index == -2)
+            return NULL;  /* thread exceeded max threads limit */
 
 	if (is_numa_aware) {
 		int status[1] = {-1};
@@ -1725,9 +1738,16 @@ static __always_inline  struct dto_wq *get_wq(void* buf)
 	}
 
 	if (wq == NULL) {
-                num_threads++;
-                wq_index = num_threads % num_wqs;
-    		LOG_TRACE("Thread id %lu (tn: %d) assigned wq: %d\n", pthread_self(), num_threads, wq_index);
+		int my_thread_num = atomic_fetch_add(&num_threads, 1) + 1;
+		if (dsa_max_threads > 0 && my_thread_num > dsa_max_threads) {
+			thr_dsa_disabled = 1;
+			wq_index = -2;  /* sentinel: this thread uses CPU only */
+			LOG_TRACE("Thread id %lu (tn: %d) exceeded max threads (%d), using CPU\n",
+				pthread_self(), my_thread_num, dsa_max_threads);
+			return NULL;
+		}
+                wq_index = my_thread_num % num_wqs;
+    		LOG_TRACE("Thread id %lu (tn: %d) assigned wq: %d\n", pthread_self(), my_thread_num, wq_index);
 		wq = &wqs[wq_index];
 	}
 
@@ -1817,6 +1837,12 @@ static void dto_memset(void *s, int c, size_t n, int *result)
 	uint64_t memset_pattern;
 	size_t cpu_size, dsa_size;
 	struct dto_wq *wq = get_wq(s);
+
+	if (unlikely(wq == NULL)) {
+		*result = -1;
+		thr_bytes_completed = 0;
+		return;
+	}
 
 	for (int i = 0; i < 8; ++i)
 		((uint8_t *) &memset_pattern)[i] = (uint8_t) c;
@@ -1919,8 +1945,8 @@ __attribute__((visibility("default"))) void dto_memset_pages(void *start_addr, v
 	if (num_pages == 0)
 		return;
 
-	/* Fall back to CPU if no work queues available */
-	if (num_wqs == 0 || !dto_dsa_memset) {
+	/* Fall back to CPU if no work queues available or thread limit exceeded */
+	if (num_wqs == 0 || !dto_dsa_memset || thr_dsa_disabled) {
 		orig_memset(start_addr, 0, total_size);
 		return;
 	}
@@ -2014,7 +2040,7 @@ static bool is_overlapping_buffers (void *dest, const void *src, size_t n)
 
 __attribute__((visibility("default"))) uint64_t dto_crc(const void *src, size_t n, callback_t cb, void* args) {
 	//submit dsa work if successful, call the callback
-        if (use_std_lib_calls || n < dsa_min_size) {
+        if (use_std_lib_calls || thr_dsa_disabled || n < dsa_min_size) {
                 if (cb) {
 		    cb(args);
                 }
@@ -2022,6 +2048,10 @@ __attribute__((visibility("default"))) uint64_t dto_crc(const void *src, size_t 
         }
 	int result = 0;
 	struct dto_wq *wq = get_wq(src);
+	if (unlikely(wq == NULL)) {
+		if (cb) cb(args);
+		return crc32c_hw(src, n);
+	}
 	size_t dsa_size = n;
 #ifdef DTO_STATS_SUPPORT
 	struct timespec st, et;
@@ -2060,7 +2090,7 @@ __attribute__((visibility("default"))) uint64_t dto_crc(const void *src, size_t 
 
 __attribute__((visibility("default"))) uint64_t dto_memcpy_crc_async(void *dest, const void *src, size_t n, callback_t cb, void* args) {
 	//submit dsa work if successful, call the callback
-        if (use_std_lib_calls || n < dsa_min_size) {
+        if (use_std_lib_calls || thr_dsa_disabled || n < dsa_min_size) {
                 if (cb) {
 		    cb(args);
                 }
@@ -2069,6 +2099,11 @@ __attribute__((visibility("default"))) uint64_t dto_memcpy_crc_async(void *dest,
         }
 	int result = 0;
 	struct dto_wq *wq = get_wq(dest);
+	if (unlikely(wq == NULL)) {
+		if (cb) cb(args);
+		orig_memcpy(dest, src, n);
+		return crc32c_hw(src, n);
+	}
 	size_t dsa_size = n;
 #ifdef DTO_STATS_SUPPORT
 	struct timespec st, et;
@@ -2107,8 +2142,18 @@ __attribute__((visibility("default"))) uint64_t dto_memcpy_crc_async(void *dest,
 
 __attribute__((visibility("default"))) void dto_memcpy_async(void *dest, const void *src, size_t n, callback_t cb, void* args) {
 	//submit dsa work if successful, call the callback
+	if (thr_dsa_disabled || use_std_lib_calls) {
+		if (cb) cb(args);
+		orig_memcpy(dest, src, n);
+		return;
+	}
 	int result = 0;
 	struct dto_wq *wq = get_wq(dest);
+	if (unlikely(wq == NULL)) {
+		if (cb) cb(args);
+		orig_memcpy(dest, src, n);
+		return;
+	}
 	size_t dsa_size = n;
 #ifdef DTO_STATS_SUPPORT
 	struct timespec st, et;
@@ -2157,9 +2202,15 @@ __attribute__((visibility("default"))) void dto_memcpy_async(void *dest, const v
 
 static void dto_memcpymove(void *dest, const void *src, size_t n, bool is_memcpy, int *result)
 {
-        
+
 	struct dto_wq *wq = get_wq(dest);
 	size_t cpu_size, dsa_size;
+
+	if (unlikely(wq == NULL)) {
+		*result = -1;
+		thr_bytes_completed = 0;
+		return;
+	}
 
 	thr_desc.opcode = DSA_OPCODE_MEMMOVE;
 	thr_desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
@@ -2249,6 +2300,12 @@ static int dto_memcmp(const void *s1, const void *s2, size_t n, int *result)
 	struct dto_wq *wq = get_wq((void*)s2);
 	int cmp_result = 0;
 	size_t orig_n = n;
+
+	if (unlikely(wq == NULL)) {
+		*result = -1;
+		thr_bytes_completed = 0;
+		return 0;
+	}
 
 	thr_desc.opcode = DSA_OPCODE_COMPARE;
 	thr_desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
@@ -2680,8 +2737,8 @@ void dto_batch_copy(void **dst, void **src, size_t *sizes, int count,
 	DTO_COLLECT_STATS_START(collect_stats, st);
 #endif
 
-	if (unlikely(dto_initialized == 0 || count <= 0)) {
-		/* Not initialized or invalid count - use synchronous memcpy */
+	if (unlikely(dto_initialized == 0 || count <= 0 || thr_dsa_disabled)) {
+		/* Not initialized, invalid count, or thread limit exceeded - use synchronous memcpy */
 		for (int i = 0; i < count; i++) {
 			if (dst[i] && src[i] && sizes[i] > 0) {
 				orig_memcpy(dst[i], src[i], sizes[i]);
@@ -2702,6 +2759,14 @@ void dto_batch_copy(void **dst, void **src, size_t *sizes, int count,
 	}
 
 	struct dto_wq *wq = get_wq(dst[0]);
+	if (unlikely(wq == NULL)) {
+		for (int i = 0; i < count; i++) {
+			if (dst[i] && src[i] && sizes[i] > 0)
+				orig_memcpy(dst[i], src[i], sizes[i]);
+		}
+		if (callback) callback(callback_arg);
+		return;
+	}
 	int result;
 
         orig_memset(&thr_batch_descs[0], 0, sizeof(thr_batch_descs[0]) * count);
