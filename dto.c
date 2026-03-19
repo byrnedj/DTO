@@ -53,7 +53,7 @@
 #define C01_STATE 1
 #define C02_STATE 0
 
-#define USE_ORIG_FUNC(n, use_dsa) (use_std_lib_calls == 1 || !use_dsa || (n*(100-cpu_size_fraction)/100) < dsa_min_size)
+#define USE_ORIG_FUNC(n, use_dsa) (use_std_lib_calls == 1 || !use_dsa || (n*(100-cpu_size_fraction[TUNE_CTX(SIZE_CLASS(n), CACHE_OUT)])/100) < dsa_min_size)
 #define TS_NS(s, e) (((e.tv_sec*1000000000) + e.tv_nsec) - ((s.tv_sec*1000000000) + s.tv_nsec))
 
 /* Maximum WQs that DTO will use. It is rather an arbitrary limit
@@ -84,6 +84,17 @@ static __thread int16_t wq_index = -1;
 #define BATCH_SIZE 8
 #define BATCH_THRESHOLD (512 * 1024)
 #define MAX_BATCH_DESCS 64
+
+// Size class definitions for per-class autotuning
+#define SIZE_CLASS_THRESHOLD (512 * 1024)
+enum size_class { SIZE_CLASS_SMALL = 0, SIZE_CLASS_LARGE = 1, NUM_SIZE_CLASSES = 2 };
+#define SIZE_CLASS(n) ((n) >= SIZE_CLASS_THRESHOLD ? SIZE_CLASS_LARGE : SIZE_CLASS_SMALL)
+
+// Cache residency class for autotuning
+enum cache_class { CACHE_IN = 0, CACHE_OUT = 1, NUM_CACHE_CLASSES = 2 };
+#define NUM_TUNE_CONTEXTS (NUM_SIZE_CLASSES * NUM_CACHE_CLASSES)
+#define TUNE_CTX(sc, cc) ((sc) * NUM_CACHE_CLASSES + (cc))
+#define CACHE_LATENCY_THRESHOLD 80  // cycles
 
 // gather copy SGL (scatter-gather list) storage
 #define MAX_GATHER_SRCS 64
@@ -167,7 +178,7 @@ static uint8_t use_std_lib_calls;
 static enum numa_aware is_numa_aware;
 static size_t dsa_min_size = DTO_DEFAULT_MIN_SIZE;
 static int wait_method = WAIT_BUSYPOLL;
-static size_t cpu_size_fraction;   // range of values is 0 to 99
+static size_t cpu_size_fraction[NUM_TUNE_CONTEXTS];   // range of values is 0 to 99
 
 static uint8_t dto_dsa_memcpy = 1;
 static uint8_t dto_dsa_memmove = 1;
@@ -451,15 +462,15 @@ static void install_sigint_handler(void)
 
 #define AUTO_TUNE_V2_TARGET 1
 
-static __thread uint64_t tl_num_descs = 0;
-static __thread uint64_t tl_next_sample = 0;
-static __thread uint64_t tl_integral = 0;
-static __thread uint64_t tl_cpu_size_fraction = 0;
+static __thread uint64_t tl_num_descs[NUM_TUNE_CONTEXTS] = {0};
+static __thread uint64_t tl_next_sample[NUM_TUNE_CONTEXTS] = {0};
+static __thread uint64_t tl_integral[NUM_TUNE_CONTEXTS] = {0};
+static __thread uint64_t tl_cpu_size_fraction[NUM_TUNE_CONTEXTS] = {0};
 
-/* Auto tuning variables */
-static atomic_ullong num_descs;
-static atomic_ullong adjust_num_descs;
-static atomic_ullong adjust_num_waits;
+/* Auto tuning variables (per tune context: size class x cache class) */
+static atomic_ullong num_descs[NUM_TUNE_CONTEXTS];
+static atomic_ullong adjust_num_descs[NUM_TUNE_CONTEXTS];
+static atomic_ullong adjust_num_waits[NUM_TUNE_CONTEXTS];
 /* default waits are for poll because poll is default waiting method */
 static double min_avg_waits = MIN_AVG_POLL_WAITS;
 static double max_avg_waits = MAX_AVG_POLL_WAITS;
@@ -632,6 +643,36 @@ static __always_inline void dsa_wait_no_adjust(const volatile uint8_t *comp)
 }
 
 
+/* Probe whether buffer data is in CPU cache by timing accesses.
+ * Tests src[0] and src[cpu_size] (the boundary of the CPU portion).
+ * Returns CACHE_IN if both accesses complete in < CACHE_LATENCY_THRESHOLD cycles.
+ */
+static __always_inline enum cache_class probe_cache_class(const volatile void *buf, size_t cpu_size)
+{
+	unsigned int aux;
+	uint64_t start, end, latency;
+
+	/* Probe first byte */
+	start = __rdtscp(&aux);
+	(void)*(const volatile char *)buf;
+	end = __rdtscp(&aux);
+	latency = end - start;
+	if (latency >= CACHE_LATENCY_THRESHOLD)
+		return CACHE_OUT;
+
+	/* Probe byte at cpu_size boundary */
+	if (cpu_size > 0) {
+		start = __rdtscp(&aux);
+		(void)*((const volatile char *)buf + cpu_size);
+		end = __rdtscp(&aux);
+		latency = end - start;
+		if (latency >= CACHE_LATENCY_THRESHOLD)
+			return CACHE_OUT;
+	}
+
+	return CACHE_IN;
+}
+
 /* A simple auto-tuning heuristic.
  * Goal of the Heuristic:
  *   - CPU and DSA should complete their fraction of the job roughly simultaneously.
@@ -650,11 +691,11 @@ static __always_inline void dsa_wait_no_adjust(const volatile uint8_t *comp)
  *      - If cpu_size_fraction not too low, decrease it by CSF_STEP_DECREMENT
  *      - else if dsa_min_size not too low, decrease it by DMS_STEP_DECREMENT
  */
-static __always_inline void dsa_wait_and_adjust(const volatile uint8_t *comp)
+static __always_inline void dsa_wait_and_adjust(const volatile uint8_t *comp, int ctx)
 {
 	uint64_t local_num_waits = 0;
 
-	if ((++num_descs & DESCS_PER_RUN) != DESCS_PER_RUN) {
+	if ((++num_descs[ctx] & DESCS_PER_RUN) != DESCS_PER_RUN) {
 		while (*comp == 0) {
 			__dsa_wait(comp);
                 }
@@ -674,24 +715,24 @@ static __always_inline void dsa_wait_and_adjust(const volatile uint8_t *comp)
 		return;
 	}
 
-	adjust_num_descs++;
-	adjust_num_waits += local_num_waits;
+	adjust_num_descs[ctx]++;
+	adjust_num_waits[ctx] += local_num_waits;
 
-	if (adjust_num_descs >= NUM_DESCS) {
-		unsigned long long temp = adjust_num_descs;
+	if (adjust_num_descs[ctx] >= NUM_DESCS) {
+		unsigned long long temp = adjust_num_descs[ctx];
 
-		if (temp && atomic_compare_exchange_strong(&adjust_num_descs, &temp, 0)) {
-			double avg_num_waits = (double)adjust_num_waits / temp;
+		if (temp && atomic_compare_exchange_strong(&adjust_num_descs[ctx], &temp, 0)) {
+			double avg_num_waits = (double)adjust_num_waits[ctx] / temp;
 
-			adjust_num_waits = 0;
+			adjust_num_waits[ctx] = 0;
 			if (avg_num_waits > max_avg_waits) {
-				if (cpu_size_fraction < MAX_CPU_SIZE_FRACTION)
-					cpu_size_fraction += CSF_STEP_INCREMENT;
+				if (cpu_size_fraction[ctx] < MAX_CPU_SIZE_FRACTION)
+					cpu_size_fraction[ctx] += CSF_STEP_INCREMENT;
 				else if (dsa_min_size < MAX_DSA_MIN_SIZE)
 					dsa_min_size += DMS_STEP_INCREMENT;
 			} else if (avg_num_waits < min_avg_waits) {
-				if (cpu_size_fraction >= CSF_STEP_DECREMENT)
-					cpu_size_fraction -= CSF_STEP_DECREMENT;
+				if (cpu_size_fraction[ctx] >= CSF_STEP_DECREMENT)
+					cpu_size_fraction[ctx] -= CSF_STEP_DECREMENT;
 				else if (dsa_min_size > MIN_DSA_MIN_SIZE)
 					dsa_min_size -= DMS_STEP_DECREMENT;
 			}
@@ -699,22 +740,22 @@ static __always_inline void dsa_wait_and_adjust(const volatile uint8_t *comp)
 	}
 }
 
-static __always_inline void dsa_wait_and_adjust_v2(const volatile uint8_t *comp)
+static __always_inline void dsa_wait_and_adjust_v2(const volatile uint8_t *comp, int ctx)
 {
 
-    if (++tl_num_descs == tl_next_sample) {
+    if (++tl_num_descs[ctx] == tl_next_sample[ctx]) {
 	uint64_t local_num_waits = 0;
         while (*comp == 0) {
             __dsa_wait(comp);
             local_num_waits++;
         }
         int64_t error = local_num_waits - AUTO_TUNE_V2_TARGET;
-        tl_integral += error;
-        uint64_t new_frac = tl_cpu_size_fraction - KP * error + KI * tl_integral;
+        tl_integral[ctx] += error;
+        uint64_t new_frac = tl_cpu_size_fraction[ctx] - KP * error + KI * tl_integral[ctx];
 
         // Clamp within valid range
-        tl_cpu_size_fraction = MAX(1, MIN(MAX_CPU_SIZE_FRACTION, new_frac));
-        tl_next_sample += rand() % SAMPLE_INTERVAL*2 + 1;
+        tl_cpu_size_fraction[ctx] = MAX(1, MIN(MAX_CPU_SIZE_FRACTION, new_frac));
+        tl_next_sample[ctx] += rand() % SAMPLE_INTERVAL*2 + 1;
     } else {
 	while (*comp == 0) {
 	    __dsa_wait(comp);
@@ -723,14 +764,14 @@ static __always_inline void dsa_wait_and_adjust_v2(const volatile uint8_t *comp)
 }
 
 static __always_inline int dsa_wait(struct dto_wq *wq,
-	struct dsa_hw_desc *hw, volatile uint8_t *comp)
+	struct dsa_hw_desc *hw, volatile uint8_t *comp, int ctx)
 {
 	switch (auto_adjust_knobs) {
             case AUTO_ADJUST_KNOBS:
-                dsa_wait_and_adjust(comp);
+                dsa_wait_and_adjust(comp, ctx);
                 break;
             case AUTO_ADJUST_KNOBS_V2:
-                dsa_wait_and_adjust_v2(comp);
+                dsa_wait_and_adjust_v2(comp, ctx);
                 break;
             default:
                 dsa_wait_no_adjust(comp);
@@ -769,7 +810,7 @@ static __always_inline int dsa_submit(struct dto_wq *wq,
 }
 
 static __always_inline int dsa_execute(struct dto_wq *wq,
-	struct dsa_hw_desc *hw, volatile uint8_t *comp)
+	struct dsa_hw_desc *hw, volatile uint8_t *comp, int ctx)
 {
 	int ret;
 	*comp = 0;
@@ -794,10 +835,10 @@ static __always_inline int dsa_execute(struct dto_wq *wq,
 	if (!ret) {
 	        switch (auto_adjust_knobs) {
                     case AUTO_ADJUST_KNOBS:
-                        dsa_wait_and_adjust(comp);
+                        dsa_wait_and_adjust(comp, ctx);
                         break;
                     case AUTO_ADJUST_KNOBS_V2:
-                        dsa_wait_and_adjust_v2(comp);
+                        dsa_wait_and_adjust_v2(comp, ctx);
                         break;
                     default:
                         dsa_wait_no_adjust(comp);
@@ -1385,6 +1426,10 @@ static void print_stats(void)
 	clock_gettime(CLOCK_BOOTTIME, &dto_end_time);
 
 	dto_stats_log("DTO Run Time: %ld ms\n", TS_NS(dto_start_time, dto_end_time)/1000000);
+	dto_stats_log("DTO CPU Fraction (small/in_cache):  %.2f\n", cpu_size_fraction[TUNE_CTX(SIZE_CLASS_SMALL, CACHE_IN)]/100.0);
+	dto_stats_log("DTO CPU Fraction (small/out_cache): %.2f\n", cpu_size_fraction[TUNE_CTX(SIZE_CLASS_SMALL, CACHE_OUT)]/100.0);
+	dto_stats_log("DTO CPU Fraction (large/in_cache):  %.2f\n", cpu_size_fraction[TUNE_CTX(SIZE_CLASS_LARGE, CACHE_IN)]/100.0);
+	dto_stats_log("DTO CPU Fraction (large/out_cache): %.2f\n", cpu_size_fraction[TUNE_CTX(SIZE_CLASS_LARGE, CACHE_OUT)]/100.0);
 
 	/* Aggregate all thread-local stats */
 	memset(&aggregated_stats, 0, sizeof(aggregated_stats));
@@ -2257,8 +2302,11 @@ static int init_dto(void)
 					cpu_size_fraction_float = 0.0;
 				}
 				/* Use only 2 digits after decimal point */
-				cpu_size_fraction = cpu_size_fraction_float * 100;
-                                tl_cpu_size_fraction = cpu_size_fraction;
+				size_t init_frac = cpu_size_fraction_float * 100;
+				for (int i = 0; i < NUM_TUNE_CONTEXTS; i++) {
+					cpu_size_fraction[i] = init_frac;
+					tl_cpu_size_fraction[i] = init_frac;
+				}
 			}
 
 			env_str = getenv("DTO_AUTO_ADJUST_KNOBS");
@@ -2269,13 +2317,14 @@ static int init_dto(void)
 				if (errno)
 					auto_adjust_knobs = 1;
                                 if (auto_adjust_knobs == AUTO_ADJUST_KNOBS_V2) {
-                                    tl_next_sample = rand() % (SAMPLE_INTERVAL*2) + 1;
+                                    for (int i = 0; i < NUM_TUNE_CONTEXTS; i++)
+                                        tl_next_sample[i] = rand() % (SAMPLE_INTERVAL*2) + 1;
                                 }
 			}
 
                         // Only use c02 if we are offloading a significant chunk to
                         // DSA so we amortize the exit latency of C02 state
-                        if (cpu_size_fraction <= 20 && auto_adjust_knobs == 0) {
+                        if (cpu_size_fraction[TUNE_CTX(SIZE_CLASS_SMALL, CACHE_OUT)] <= 20 && auto_adjust_knobs == 0) {
                             dto_use_c02 = true;
                         } else {
                             dto_use_c02 = false;
@@ -2337,10 +2386,15 @@ static int init_dto(void)
     
 			// display configuration
 			LOG_TRACE("log_level: %d, collect_stats: %d, use_std_lib_calls: %d, dsa_min_size: %lu, "
-				"cpu_size_fraction: %.2f, wait_method: %s, auto_adjust_knobs: %d, numa_awareness: %s, dto_dsa_cc: %d, dto_dsa_batch: %d, dto_dsa_bof: %d, "
+				"cpu_frac(small/in): %.2f, cpu_frac(small/out): %.2f, cpu_frac(large/in): %.2f, cpu_frac(large/out): %.2f, "
+				"wait_method: %s, auto_adjust_knobs: %d, numa_awareness: %s, dto_dsa_cc: %d, dto_dsa_batch: %d, dto_dsa_bof: %d, "
 				"dto_hugepages: %d, dto_page_size: %zu, dto_use_c02: %d, max_wqs_supported: %d\n",
 				log_level, collect_stats, use_std_lib_calls, dsa_min_size,
-				cpu_size_fraction_float, wait_names[wait_method], auto_adjust_knobs, numa_aware_names[is_numa_aware], dto_dsa_cc, dto_dsa_batch, dto_dsa_bof,
+				cpu_size_fraction[TUNE_CTX(SIZE_CLASS_SMALL, CACHE_IN)]/100.0,
+				cpu_size_fraction[TUNE_CTX(SIZE_CLASS_SMALL, CACHE_OUT)]/100.0,
+				cpu_size_fraction[TUNE_CTX(SIZE_CLASS_LARGE, CACHE_IN)]/100.0,
+				cpu_size_fraction[TUNE_CTX(SIZE_CLASS_LARGE, CACHE_OUT)]/100.0,
+				wait_names[wait_method], auto_adjust_knobs, numa_aware_names[is_numa_aware], dto_dsa_cc, dto_dsa_batch, dto_dsa_bof,
 				dto_hugepages, dto_page_size, dto_use_c02, max_wqs_supported);
 			for (int i = 0; i < num_wqs; i++)
 				LOG_TRACE("[%d] wq_path: %s, wq_size: %d, dsa_cap: %lx\n", i,
@@ -2523,8 +2577,18 @@ static void dto_memset_api(void *s, int c, size_t n)
 	thr_desc.pattern = memset_pattern;
 
 	/* cpu_size_fraction guaranteed to be >= 0 and < 100 */
+	enum size_class sc = SIZE_CLASS(n);
+	/* Use out-of-cache fraction for preliminary cpu_size to probe cache */
+	int probe_ctx = TUNE_CTX(sc, CACHE_OUT);
         uint64_t cpu_frac = auto_adjust_knobs == AUTO_ADJUST_KNOBS_V2 ?
-            tl_cpu_size_fraction : cpu_size_fraction;
+            tl_cpu_size_fraction[probe_ctx] : cpu_size_fraction[probe_ctx];
+	cpu_size = n * cpu_frac / 100;
+
+	/* Probe cache residency on dest buffer and select final tune context */
+	enum cache_class cc = probe_cache_class(s, cpu_size);
+	int ctx = TUNE_CTX(sc, cc);
+	cpu_frac = auto_adjust_knobs == AUTO_ADJUST_KNOBS_V2 ?
+	    tl_cpu_size_fraction[ctx] : cpu_size_fraction[ctx];
 	cpu_size = n * cpu_frac / 100;
 	dsa_size = n - cpu_size;
 
@@ -2547,7 +2611,7 @@ static void dto_memset_api(void *s, int c, size_t n)
 				orig_memset(s, c, cpu_size);
 				thr_bytes_completed = cpu_size;
 			}
-			*result = dsa_wait(wq, &thr_desc, &thr_comp.status);
+			*result = dsa_wait(wq, &thr_desc, &thr_comp.status, ctx);
 		}
 	} else {
 		uint32_t threshold;
@@ -2573,7 +2637,7 @@ static void dto_memset_api(void *s, int c, size_t n)
 					orig_memset(s1, c, cpu_size);
 					thr_bytes_completed += cpu_size;
 				}
-				*result = dsa_wait(wq, &thr_desc, &thr_comp.status);
+				*result = dsa_wait(wq, &thr_desc, &thr_comp.status, ctx);
 			}
 
 			if (*result != SUCCESS)
@@ -2604,8 +2668,16 @@ static void dto_memset(void *s, int c, size_t n, int *result)
 	thr_desc.pattern = memset_pattern;
 
 	/* cpu_size_fraction guaranteed to be >= 0 and < 100 */
+	enum size_class sc = SIZE_CLASS(n);
+	int probe_ctx = TUNE_CTX(sc, CACHE_OUT);
         uint64_t cpu_frac = auto_adjust_knobs == AUTO_ADJUST_KNOBS_V2 ?
-            tl_cpu_size_fraction : cpu_size_fraction;
+            tl_cpu_size_fraction[probe_ctx] : cpu_size_fraction[probe_ctx];
+	cpu_size = n * cpu_frac / 100;
+
+	enum cache_class cc = probe_cache_class(s, cpu_size);
+	int ctx = TUNE_CTX(sc, cc);
+	cpu_frac = auto_adjust_knobs == AUTO_ADJUST_KNOBS_V2 ?
+	    tl_cpu_size_fraction[ctx] : cpu_size_fraction[ctx];
 	cpu_size = n * cpu_frac / 100;
 	dsa_size = n - cpu_size;
 
@@ -2630,7 +2702,7 @@ static void dto_memset(void *s, int c, size_t n, int *result)
 				orig_memset(s, c, cpu_size);
 				thr_bytes_completed = cpu_size;
 			}
-			*result = dsa_wait(wq, &thr_desc, &thr_comp.status);
+			*result = dsa_wait(wq, &thr_desc, &thr_comp.status, ctx);
 		}
 	} else {
 		uint32_t threshold;
@@ -2656,7 +2728,7 @@ static void dto_memset(void *s, int c, size_t n, int *result)
 					orig_memset(s1, c, cpu_size);
 					thr_bytes_completed += cpu_size;
 				}
-				*result = dsa_wait(wq, &thr_desc, &thr_comp.status);
+				*result = dsa_wait(wq, &thr_desc, &thr_comp.status, ctx);
 			}
 
 			if (*result != SUCCESS)
@@ -2770,7 +2842,7 @@ __attribute__((visibility("default"))) void dto_memset_pages(void *start_addr, v
 				struct dto_wq *wq = &wqs[wq_indices[i]];
 				void *page_addr = (char *)current_addr + (i * page_size);
 
-				int ret = dsa_wait(wq, &descs[i], &comps[i].status);
+				int ret = dsa_wait(wq, &descs[i], &comps[i].status, TUNE_CTX(SIZE_CLASS(page_size), CACHE_OUT));
 
 				/* On error, fall back to CPU */
 				if (ret != SUCCESS) {
@@ -2827,12 +2899,14 @@ __attribute__((visibility("default"))) uint64_t dto_crc(const void *src, size_t 
         thr_desc.crc_seed = 0; // default seed valuie
         thr_desc.rsvd = 0;
 	thr_comp.status = 0;
+	enum cache_class crc_cc = probe_cache_class(src, 0);
+	int crc_ctx = TUNE_CTX(SIZE_CLASS(n), crc_cc);
 	result = dsa_submit(wq, &thr_desc);
 	if (result == SUCCESS) {
                 if (cb) {
 		    cb(args);
                 }
-		result = dsa_wait(wq, &thr_desc, &thr_comp.status);
+		result = dsa_wait(wq, &thr_desc, &thr_comp.status, crc_ctx);
 	}
 #ifdef DTO_STATS_SUPPORT
 	DTO_COLLECT_STATS_DSA_END(collect_stats, st, et, MEMCOPY_ASYNC, n, thr_bytes_completed, result);
@@ -2874,12 +2948,14 @@ __attribute__((visibility("default"))) uint64_t dto_memcpy_crc_async(void *dest,
         thr_desc.crc_seed = 0; // default seed valuie
         thr_desc.rsvd = 0;
 	thr_comp.status = 0;
+	enum cache_class mcrc_cc = probe_cache_class(src, 0);
+	int mcrc_ctx = TUNE_CTX(SIZE_CLASS(n), mcrc_cc);
 	result = dsa_submit(wq, &thr_desc);
 	if (result == SUCCESS) {
                 if (cb) {
 		    cb(args);
                 }
-		result = dsa_wait(wq, &thr_desc, &thr_comp.status);
+		result = dsa_wait(wq, &thr_desc, &thr_comp.status, mcrc_ctx);
 	}
 #ifdef DTO_STATS_SUPPORT
 	DTO_COLLECT_STATS_DSA_END(collect_stats, st, et, MEMCOPY_ASYNC, n, thr_bytes_completed, result);
@@ -2913,10 +2989,12 @@ __attribute__((visibility("default"))) void dto_memcpy_async(void *dest, const v
 	thr_desc.dst_addr = (uint64_t) dest;
 	thr_desc.xfer_size = (uint32_t) dsa_size;
 	thr_comp.status = 0;
+	enum cache_class async_cc = probe_cache_class(src, 0);
+	int async_ctx = TUNE_CTX(SIZE_CLASS(n), async_cc);
 	result = dsa_submit(wq, &thr_desc);
 	if (result == SUCCESS) {
 		cb(args);
-		result = dsa_wait(wq, &thr_desc, &thr_comp.status);
+		result = dsa_wait(wq, &thr_desc, &thr_comp.status, async_ctx);
 	}
 #ifdef DTO_STATS_SUPPORT
 	DTO_COLLECT_STATS_DSA_END(collect_stats, st, et, MEMCOPY_ASYNC, n, thr_bytes_completed, result);
@@ -2975,10 +3053,23 @@ static bool dto_memcpymove(void *dest, const void *src, size_t n, bool is_memcpy
             thr_desc.flags |= IDXD_OP_FLAG_BOF;
 	thr_desc.completion_addr = (uint64_t)&thr_comp;
 
+	enum size_class sc = SIZE_CLASS(n);
+	/* Use out-of-cache fraction for preliminary cpu_size to probe cache */
+	int probe_ctx = TUNE_CTX(sc, CACHE_OUT);
         uint64_t cpu_frac = auto_adjust_knobs == AUTO_ADJUST_KNOBS_V2 ?
-            tl_cpu_size_fraction : cpu_size_fraction;
+            tl_cpu_size_fraction[probe_ctx] : cpu_size_fraction[probe_ctx];
 
 	/* cpu_size_fraction guaranteed to be >= 0 and < 1 */
+	if (!is_memcpy && is_overlapping_buffers(dest, src, n))
+		cpu_size = 0;
+	else
+		cpu_size = n * cpu_frac / 100;
+
+	/* Probe cache residency on src buffer and select final tune context */
+	enum cache_class cc = probe_cache_class(src, cpu_size);
+	int ctx = TUNE_CTX(sc, cc);
+	cpu_frac = auto_adjust_knobs == AUTO_ADJUST_KNOBS_V2 ?
+	    tl_cpu_size_fraction[ctx] : cpu_size_fraction[ctx];
 	if (!is_memcpy && is_overlapping_buffers(dest, src, n))
 		cpu_size = 0;
 	else
@@ -3007,7 +3098,7 @@ static bool dto_memcpymove(void *dest, const void *src, size_t n, bool is_memcpy
 		thr_desc.xfer_size = (uint32_t) dsa_size;
 		thr_comp.status = 0;
 		if (is_overlapping) {
-			*result = dsa_execute(wq, &thr_desc, &thr_comp.status);
+			*result = dsa_execute(wq, &thr_desc, &thr_comp.status, ctx);
 		} else {
 			*result = dsa_submit(wq, &thr_desc);
 			if (*result == SUCCESS) {
@@ -3018,7 +3109,7 @@ static bool dto_memcpymove(void *dest, const void *src, size_t n, bool is_memcpy
 						orig_memmove(dest, src, cpu_size);
 					thr_bytes_completed += cpu_size;
 				}
-				*result = dsa_wait(wq, &thr_desc, &thr_comp.status);
+				*result = dsa_wait(wq, &thr_desc, &thr_comp.status, ctx);
 			}
 		}
 	} else {
@@ -3045,7 +3136,7 @@ static bool dto_memcpymove(void *dest, const void *src, size_t n, bool is_memcpy
 			thr_desc.xfer_size = (uint32_t) dsa_size;
 			thr_comp.status = 0;
 			if (is_overlapping){
-				*result = dsa_execute(wq, &thr_desc, &thr_comp.status);
+				*result = dsa_execute(wq, &thr_desc, &thr_comp.status, ctx);
 			} else {
 				*result = dsa_submit(wq, &thr_desc);
 				if (*result == SUCCESS) {
@@ -3059,7 +3150,7 @@ static bool dto_memcpymove(void *dest, const void *src, size_t n, bool is_memcpy
 							orig_memmove(dest1, src1, cpu_size);
 						thr_bytes_completed += cpu_size;
 					}
-					*result = dsa_wait(wq, &thr_desc, &thr_comp.status);
+					*result = dsa_wait(wq, &thr_desc, &thr_comp.status, ctx);
 				}
 			}
 
@@ -3088,12 +3179,14 @@ static int dto_memcmp(const void *s1, const void *s2, size_t n, int *result)
 	thr_comp.result = 0;
 
 	thr_bytes_completed = 0;
+	enum cache_class cmp_cc = probe_cache_class(s1, 0);
+	int cmp_ctx = TUNE_CTX(SIZE_CLASS(n), cmp_cc);
 
 	if (n <= wq->max_transfer_size) {
 		thr_desc.src_addr = (uint64_t) s1;
 		thr_desc.src2_addr = (uint64_t) s2;
 		thr_desc.xfer_size = (uint32_t) n;
-		*result = dsa_execute(wq, &thr_desc, &thr_comp.status);
+		*result = dsa_execute(wq, &thr_desc, &thr_comp.status, cmp_ctx);
 	} else {
 		do {
 			size_t len;
@@ -3103,7 +3196,7 @@ static int dto_memcmp(const void *s1, const void *s2, size_t n, int *result)
 			thr_desc.src_addr = (uint64_t) s1 + thr_bytes_completed;
 			thr_desc.src2_addr = (uint64_t) s2 + thr_bytes_completed;
 			thr_desc.xfer_size = (uint32_t) len;
-			*result = dsa_execute(wq, &thr_desc, &thr_comp.status);
+			*result = dsa_execute(wq, &thr_desc, &thr_comp.status, cmp_ctx);
 
 			if (*result != SUCCESS || thr_comp.result)
 				break;
