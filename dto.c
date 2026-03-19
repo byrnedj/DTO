@@ -12,6 +12,7 @@
 #include <errno.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <cpuid.h>
 #include <linux/idxd.h>
 #include <x86intrin.h>
@@ -115,6 +116,9 @@ static void * (*orig_memset)(void *s, int c, size_t n);
 static void * (*orig_memcpy)(void *dest, const void *src, size_t n);
 static void * (*orig_memmove)(void *dest, const void *src, size_t n);
 static int (*orig_memcmp)(const void *s1, const void *s2, size_t n);
+static void * (*orig_mmap)(void *addr, size_t length, int prot, int flags,
+			   int fd, off_t offset);
+static int (*orig_munmap)(void *addr, size_t length);
 
 struct dto_wq {
 	int wq_fd;
@@ -178,6 +182,18 @@ static uint8_t dto_dsa_memcmp = 1;
 static uint8_t dto_dsa_cc = 1;
 static uint8_t dto_dsa_bof = 1;
 static uint8_t dto_dsa_batch = 1;
+static size_t dto_page_size = 4096;
+static uint8_t dto_hugepages;	/* global override: env var says all allocs are huge */
+
+/* Per-region hugepage tracking for mmap interception.
+ * Fixed-size array to avoid dynamic allocation (same rationale as MAX_WQS). */
+#define MAX_HUGE_REGIONS 64
+struct huge_region {
+	uintptr_t start;
+	uintptr_t end;
+};
+static struct huge_region huge_regions[MAX_HUGE_REGIONS];
+static atomic_int num_huge_regions;
 static bool dto_use_c02 = true; //C02 state is default -
                             //C02 avg exit latency is ~500 ns
                             //and C01 is about ~240 ns on SPR
@@ -772,6 +788,22 @@ static __always_inline int dsa_execute(struct dto_wq *wq,
 	return RETRY;
 }
 
+/* Check if an address falls in a hugepage-backed region.
+ * Returns 1 if global override is set or if address is in a tracked region. */
+static __always_inline int is_hugepage(const void *addr)
+{
+	if (dto_hugepages)
+		return 1;
+
+	uintptr_t a = (uintptr_t)addr;
+	int n = atomic_load_explicit(&num_huge_regions, memory_order_acquire);
+	for (int i = 0; i < n; i++) {
+		if (a >= huge_regions[i].start && a < huge_regions[i].end)
+			return 1;
+	}
+	return 0;
+}
+
 static void dto_batch_memset(struct dto_wq *wq, void *s, int c, size_t n,
 	uint64_t pattern, uint32_t sub_flags, int *result)
 {
@@ -897,33 +929,148 @@ static void dto_batch_memcpymove(struct dto_wq *wq, void *dest, const void *src,
 		thr_batch_comp_a[i].cr.status = 0;
 	}
 
-	__builtin_memset(&thr_desc, 0, sizeof(thr_desc));
-	thr_desc.opcode = DSA_OPCODE_BATCH;
-	thr_desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
-	thr_desc.desc_list_addr = (uint64_t)thr_batch_descs;
-	thr_desc.desc_count = BATCH_SIZE;
-	thr_desc.completion_addr = (uint64_t)&thr_comp;
-	thr_comp.status = 0;
+	if (dto_dsa_batch == 2) {
+		__builtin_memset(&thr_desc, 0, sizeof(thr_desc));
+		thr_desc.opcode = DSA_OPCODE_BATCH;
+		thr_desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
+		thr_desc.desc_list_addr = (uint64_t)thr_batch_descs;
+		thr_desc.desc_count = BATCH_SIZE;
+		thr_desc.completion_addr = (uint64_t)&thr_comp;
+		thr_comp.status = 0;
 
-	*result = dsa_submit(wq, &thr_desc);
-	if (*result != SUCCESS)
-		return;
+		*result = dsa_submit(wq, &thr_desc);
+		if (*result != SUCCESS)
+			return;
 
-	int pending = BATCH_SIZE;
-	uint8_t done[BATCH_SIZE] = {0};
+		int pending = BATCH_SIZE;
+		uint8_t done[BATCH_SIZE] = {0};
 
-	while (pending > 0) {
-		/* Check batch-level completion first */
-		uint8_t batch_status = thr_comp.status;
-		if (batch_status != 0 &&
-		    batch_status != DSA_COMP_SUCCESS &&
-		    batch_status != DSA_COMP_BATCH_FAIL &&
-		    batch_status != DSA_COMP_BATCH_PAGE_FAULT) {
-			/* Batch descriptor itself failed — CPU fallback for all pending */
-			LOG_ERROR("batch memcpymove failed: status 0x%x\n", batch_status);
+		while (pending > 0) {
+			/* Check batch-level completion first */
+			uint8_t batch_status = thr_comp.status;
+			if (batch_status != 0 &&
+			    batch_status != DSA_COMP_SUCCESS &&
+			    batch_status != DSA_COMP_BATCH_FAIL &&
+			    batch_status != DSA_COMP_BATCH_PAGE_FAULT) {
+				/* Batch descriptor itself failed — CPU fallback for all pending */
+				LOG_ERROR("batch memcpymove failed: status 0x%x\n", batch_status);
+				for (int i = 0; i < BATCH_SIZE; i++) {
+					if (done[i])
+						continue;
+					size_t this_size = part_size +
+						(i == BATCH_SIZE - 1 ? remainder : 0);
+					size_t offset = (size_t)i * part_size;
+					void *d = (char *)dest + offset;
+					const void *s_ptr = (const char *)src + offset;
+					if (is_memcpy)
+						orig_memcpy(d, s_ptr, this_size);
+					else
+						orig_memmove(d, s_ptr, this_size);
+					thr_bytes_completed += this_size;
+				}
+				break;
+			}
+
+			/* If batch page-faulted on descriptor list, some sub-descs were not processed */
+			int descs_processed = BATCH_SIZE;
+			if (batch_status == DSA_COMP_BATCH_PAGE_FAULT)
+				descs_processed = thr_comp.descs_completed;
+
 			for (int i = 0; i < BATCH_SIZE; i++) {
 				if (done[i])
 					continue;
+
+				size_t this_size = part_size +
+					(i == BATCH_SIZE - 1 ? remainder : 0);
+				size_t offset = (size_t)i * part_size;
+
+				/* Sub-descriptors beyond descs_processed were never submitted */
+				if (batch_status == DSA_COMP_BATCH_PAGE_FAULT &&
+				    i >= descs_processed) {
+					void *d = (char *)dest + offset;
+					const void *s_ptr = (const char *)src + offset;
+					if (is_memcpy)
+						orig_memcpy(d, s_ptr, this_size);
+					else
+						orig_memmove(d, s_ptr, this_size);
+					thr_bytes_completed += this_size;
+					done[i] = 1;
+					pending--;
+					continue;
+				}
+
+				uint8_t status = thr_batch_comp_a[i].cr.status;
+				if (status == 0)
+					continue;
+
+				if (status == DSA_COMP_SUCCESS) {
+					thr_bytes_completed += this_size;
+				} else {
+					/* Page fault or error: CPU handles remaining bytes */
+					size_t completed = thr_batch_comp_a[i].cr.bytes_completed;
+					thr_bytes_completed += completed;
+					size_t remaining = this_size - completed;
+					if (remaining > 0) {
+						void *d = (char *)dest + offset + completed;
+						const void *s_ptr = (const char *)src + offset + completed;
+						if (is_memcpy)
+							orig_memcpy(d, s_ptr, remaining);
+						else
+							orig_memmove(d, s_ptr, remaining);
+						thr_bytes_completed += remaining;
+					}
+				}
+
+				done[i] = 1;
+				pending--;
+			}
+
+			if (pending > 0)
+				_mm_pause();
+		}
+	} else if (part_size <= dto_page_size) {
+		/* Each sub-descriptor fits within a single page, so a fault
+		 * on one means all others sharing that page will also fault.
+		 * Use first descriptor as a probe: if it faults, fall back
+		 * to CPU for the rest rather than generating N faults. */
+		int pending = BATCH_SIZE;
+		uint8_t done[BATCH_SIZE] = {0};
+		int probe_faulted = 0;
+
+		__builtin_ia32_sfence();
+
+		*result = dsa_submit(wq, &thr_batch_descs[0]);
+		if (*result != SUCCESS) {
+			probe_faulted = 1;
+		} else {
+			while (thr_batch_comp_a[0].cr.status == 0)
+				_mm_pause();
+
+			uint8_t status = thr_batch_comp_a[0].cr.status;
+			if (status == DSA_COMP_SUCCESS) {
+				thr_bytes_completed += part_size;
+			} else {
+				size_t completed = thr_batch_comp_a[0].cr.bytes_completed;
+				thr_bytes_completed += completed;
+				size_t remaining = part_size - completed;
+				if (remaining > 0) {
+					void *d = (char *)dest + completed;
+					const void *s_ptr = (const char *)src + completed;
+					if (is_memcpy)
+						orig_memcpy(d, s_ptr, remaining);
+					else
+						orig_memmove(d, s_ptr, remaining);
+					thr_bytes_completed += remaining;
+				}
+				probe_faulted = 1;
+			}
+			done[0] = 1;
+			pending--;
+		}
+
+		if (probe_faulted) {
+			/* Probe faulted — CPU fallback for all remaining */
+			for (int i = (done[0] ? 1 : 0); i < BATCH_SIZE; i++) {
 				size_t this_size = part_size +
 					(i == BATCH_SIZE - 1 ? remainder : 0);
 				size_t offset = (size_t)i * part_size;
@@ -935,65 +1082,136 @@ static void dto_batch_memcpymove(struct dto_wq *wq, void *dest, const void *src,
 					orig_memmove(d, s_ptr, this_size);
 				thr_bytes_completed += this_size;
 			}
-			break;
-		}
-
-		/* If batch page-faulted on descriptor list, some sub-descs were not processed */
-		int descs_processed = BATCH_SIZE;
-		if (batch_status == DSA_COMP_BATCH_PAGE_FAULT)
-			descs_processed = thr_comp.descs_completed;
-
-		for (int i = 0; i < BATCH_SIZE; i++) {
-			if (done[i])
-				continue;
-
-			size_t this_size = part_size +
-				(i == BATCH_SIZE - 1 ? remainder : 0);
-			size_t offset = (size_t)i * part_size;
-
-			/* Sub-descriptors beyond descs_processed were never submitted */
-			if (batch_status == DSA_COMP_BATCH_PAGE_FAULT &&
-			    i >= descs_processed) {
-				void *d = (char *)dest + offset;
-				const void *s_ptr = (const char *)src + offset;
-				if (is_memcpy)
-					orig_memcpy(d, s_ptr, this_size);
-				else
-					orig_memmove(d, s_ptr, this_size);
-				thr_bytes_completed += this_size;
-				done[i] = 1;
-				pending--;
-				continue;
-			}
-
-			uint8_t status = thr_batch_comp_a[i].cr.status;
-			if (status == 0)
-				continue;
-
-			if (status == DSA_COMP_SUCCESS) {
-				thr_bytes_completed += this_size;
-			} else {
-				/* Page fault or error: CPU handles remaining bytes */
-				size_t completed = thr_batch_comp_a[i].cr.bytes_completed;
-				thr_bytes_completed += completed;
-				size_t remaining = this_size - completed;
-				if (remaining > 0) {
-					void *d = (char *)dest + offset + completed;
-					const void *s_ptr = (const char *)src + offset + completed;
-					if (is_memcpy)
-						orig_memcpy(d, s_ptr, remaining);
-					else
-						orig_memmove(d, s_ptr, remaining);
-					thr_bytes_completed += remaining;
+			pending = 0;
+		} else {
+			/* Probe succeeded — submit remaining in parallel */
+			for (int i = 1; i < BATCH_SIZE; i++) {
+				*result = dsa_submit(wq, &thr_batch_descs[i]);
+				if (*result != SUCCESS) {
+					for (int j = i; j < BATCH_SIZE; j++) {
+						size_t this_size = part_size +
+							(j == BATCH_SIZE - 1 ? remainder : 0);
+						size_t offset = (size_t)j * part_size;
+						void *d = (char *)dest + offset;
+						const void *s_ptr = (const char *)src + offset;
+						if (is_memcpy)
+							orig_memcpy(d, s_ptr, this_size);
+						else
+							orig_memmove(d, s_ptr, this_size);
+						thr_bytes_completed += this_size;
+						done[j] = 1;
+						pending--;
+					}
+					break;
 				}
 			}
 
-			done[i] = 1;
-			pending--;
+			/* Wait for remaining in-flight descriptors */
+			while (pending > 0) {
+				for (int i = 1; i < BATCH_SIZE; i++) {
+					if (done[i])
+						continue;
+
+					uint8_t status = thr_batch_comp_a[i].cr.status;
+					if (status == 0)
+						continue;
+
+					size_t this_size = part_size +
+						(i == BATCH_SIZE - 1 ? remainder : 0);
+					size_t offset = (size_t)i * part_size;
+
+					if (status == DSA_COMP_SUCCESS) {
+						thr_bytes_completed += this_size;
+					} else {
+						size_t completed = thr_batch_comp_a[i].cr.bytes_completed;
+						thr_bytes_completed += completed;
+						size_t remaining = this_size - completed;
+						if (remaining > 0) {
+							void *d = (char *)dest + offset + completed;
+							const void *s_ptr = (const char *)src + offset + completed;
+							if (is_memcpy)
+								orig_memcpy(d, s_ptr, remaining);
+							else
+								orig_memmove(d, s_ptr, remaining);
+							thr_bytes_completed += remaining;
+						}
+					}
+
+					done[i] = 1;
+					pending--;
+				}
+
+				if (pending > 0)
+					_mm_pause();
+			}
+		}
+	} else {
+		/* Small pages: submit all in parallel and handle faults
+		 * individually — faults are sparse across pages so other
+		 * sub-descriptors can still succeed on DSA. */
+		int pending = BATCH_SIZE;
+		uint8_t done[BATCH_SIZE] = {0};
+
+		__builtin_ia32_sfence();
+		for (int i = 0; i < BATCH_SIZE; i++) {
+			*result = dsa_submit(wq, &thr_batch_descs[i]);
+			if (*result != SUCCESS) {
+				/* CPU fallback for this and remaining descriptors */
+				for (int j = i; j < BATCH_SIZE; j++) {
+					size_t this_size = part_size +
+						(j == BATCH_SIZE - 1 ? remainder : 0);
+					size_t offset = (size_t)j * part_size;
+					void *d = (char *)dest + offset;
+					const void *s_ptr = (const char *)src + offset;
+					if (is_memcpy)
+						orig_memcpy(d, s_ptr, this_size);
+					else
+						orig_memmove(d, s_ptr, this_size);
+					thr_bytes_completed += this_size;
+					done[j] = 1;
+					pending--;
+				}
+				break;
+			}
 		}
 
-		if (pending > 0)
-			_mm_pause();
+		while (pending > 0) {
+			for (int i = 0; i < BATCH_SIZE; i++) {
+				if (done[i])
+					continue;
+
+				uint8_t status = thr_batch_comp_a[i].cr.status;
+				if (status == 0)
+					continue;
+
+				size_t this_size = part_size +
+					(i == BATCH_SIZE - 1 ? remainder : 0);
+				size_t offset = (size_t)i * part_size;
+
+				if (status == DSA_COMP_SUCCESS) {
+					thr_bytes_completed += this_size;
+				} else {
+					size_t completed = thr_batch_comp_a[i].cr.bytes_completed;
+					thr_bytes_completed += completed;
+					size_t remaining = this_size - completed;
+					if (remaining > 0) {
+						void *d = (char *)dest + offset + completed;
+						const void *s_ptr = (const char *)src + offset + completed;
+						if (is_memcpy)
+							orig_memcpy(d, s_ptr, remaining);
+						else
+							orig_memmove(d, s_ptr, remaining);
+						thr_bytes_completed += remaining;
+					}
+				}
+
+				done[i] = 1;
+				pending--;
+			}
+
+			if (pending > 0)
+				_mm_pause();
+		}
 	}
 
 	*result = SUCCESS;
@@ -1735,6 +1953,8 @@ static int init_dto(void)
 		orig_memcpy = dlsym(RTLD_NEXT, "memcpy");
 		orig_memmove = dlsym(RTLD_NEXT, "memmove");
 		orig_memcmp = dlsym(RTLD_NEXT, "memcmp");
+		orig_mmap = dlsym(RTLD_NEXT, "mmap");
+		orig_munmap = dlsym(RTLD_NEXT, "munmap");
 
 		env_str = getenv("DTO_USESTDC_CALLS");
 		if (env_str != NULL) {
@@ -1780,10 +2000,31 @@ static int init_dto(void)
 		if (env_str != NULL) {
 			errno = 0;
 			dto_dsa_batch = strtoul(env_str, NULL, 10);
-			if (errno)
+			if (errno || dto_dsa_batch > 2)
 				dto_dsa_batch = 0;
+		}
 
-			dto_dsa_batch = !!dto_dsa_batch;
+		/* Hugepage detection: DTO_PAGE_SIZE override */
+		env_str = getenv("DTO_PAGE_SIZE");
+		if (env_str != NULL) {
+			errno = 0;
+			dto_page_size = strtoul(env_str, NULL, 10);
+			if (errno || dto_page_size == 0)
+				dto_page_size = 4096;
+			if (dto_page_size > 4096)
+				dto_hugepages = 1;
+		}
+
+		/* Hugepage detection: tcmalloc hugepage malloc path */
+		if (!dto_hugepages) {
+			env_str = getenv("TCMALLOC_MEMFS_MALLOC_PATH");
+			if (env_str != NULL && strstr(env_str, "hugepage")) {
+				dto_hugepages = 1;
+				if (dto_page_size == 4096)
+					dto_page_size = 2UL * 1024 * 1024;
+				LOG_TRACE("hugepages detected via TCMALLOC_MEMFS_MALLOC_PATH=%s\n",
+					  env_str);
+			}
 		}
 
 		env_str = getenv("DTO_DSA_MEMMOVE");
@@ -1960,12 +2201,14 @@ static int init_dto(void)
 			LOG_TRACE("log_level: %d, collect_stats: %d, use_std_lib_calls: %d, dsa_min_size: %lu, "
 				"cpu_frac(small/in): %.2f, cpu_frac(small/out): %.2f, cpu_frac(large/in): %.2f, cpu_frac(large/out): %.2f, "
 				"wait_method: %s, auto_adjust_knobs: %d, numa_awareness: %s, dto_dsa_cc: %d, dto_dsa_bof: %d, dto_dsa_batch: %d, dto_use_c02: %d, max_wqs_supported: %d, "
+				"dto_hugepages: %d, dto_page_size: %zu\n",
 				log_level, collect_stats, use_std_lib_calls, dsa_min_size,
 				cpu_size_fraction[TUNE_CTX(SIZE_CLASS_SMALL, CACHE_IN)]/100.0,
 				cpu_size_fraction[TUNE_CTX(SIZE_CLASS_SMALL, CACHE_OUT)]/100.0,
 				cpu_size_fraction[TUNE_CTX(SIZE_CLASS_LARGE, CACHE_IN)]/100.0,
 				cpu_size_fraction[TUNE_CTX(SIZE_CLASS_LARGE, CACHE_OUT)]/100.0,
-				wait_names[wait_method], auto_adjust_knobs, numa_aware_names[is_numa_aware], dto_dsa_cc, dto_dsa_bof, dto_dsa_batch, dto_use_c02, max_wqs_supported );
+				wait_names[wait_method], auto_adjust_knobs, numa_aware_names[is_numa_aware], dto_dsa_cc, dto_dsa_bof, dto_dsa_batch, dto_use_c02, max_wqs_supported,
+				dto_hugepages, dto_page_size);
 			for (int i = 0; i < num_wqs; i++)
 				LOG_TRACE("[%d] wq_path: %s, wq_size: %d, dsa_cap: %lx\n", i,
 					wqs[i].wq_path, wqs[i].wq_size, wqs[i].dsa_gencap);
@@ -1995,6 +2238,68 @@ static void cleanup_dto(void)
 		close(log_fd);
 
 	cleanup_devices();
+}
+
+/* mmap/munmap interception: track explicit huge page regions */
+void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
+{
+	void *ret;
+
+	if (orig_mmap)
+		ret = orig_mmap(addr, length, prot, flags, fd, offset);
+	else
+		ret = (void *)syscall(SYS_mmap, addr, length, prot, flags,
+				      fd, offset);
+
+	if (ret != MAP_FAILED && (flags & MAP_HUGETLB)) {
+		int idx = atomic_fetch_add_explicit(&num_huge_regions, 1,
+						    memory_order_acq_rel);
+		if (idx < MAX_HUGE_REGIONS) {
+			huge_regions[idx].start = (uintptr_t)ret;
+			huge_regions[idx].end = (uintptr_t)ret + length;
+		} else {
+			/* Table full — undo the increment */
+			atomic_fetch_sub_explicit(&num_huge_regions, 1,
+						  memory_order_relaxed);
+		}
+	}
+
+	return ret;
+}
+
+void *mmap64(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
+{
+	return mmap(addr, length, prot, flags, fd, offset);
+}
+
+int munmap(void *addr, size_t length)
+{
+	int ret;
+
+	if (orig_munmap)
+		ret = orig_munmap(addr, length);
+	else
+		ret = syscall(SYS_munmap, addr, length);
+
+	if (ret == 0) {
+		uintptr_t a = (uintptr_t)addr;
+		int n = atomic_load_explicit(&num_huge_regions,
+					     memory_order_acquire);
+		for (int i = 0; i < n; i++) {
+			if (huge_regions[i].start == a &&
+			    huge_regions[i].end == a + length) {
+				/* Swap with last entry and shrink */
+				int last = atomic_fetch_sub_explicit(
+					&num_huge_regions, 1,
+					memory_order_acq_rel) - 1;
+				if (i < last)
+					huge_regions[i] = huge_regions[last];
+				break;
+			}
+		}
+	}
+
+	return ret;
 }
 
 //static __always_inline  struct dto_wq *get_wq(void *buf) {
@@ -2097,8 +2402,10 @@ static void dto_memset_api(void *s, int c, size_t n)
 
 	thr_bytes_completed = 0;
 
-	/* Use batch descriptor for large transactions to reduce page fault cost */
-	if (dto_dsa_batch &&
+	/* Use batch descriptor for large transactions to reduce page fault cost.
+	 * Skip batch for huge pages — the coarse page granularity means faults
+	 * hit all sub-descriptors at once, adding overhead with no benefit. */
+	if (dto_dsa_batch && /* !is_hugepage(s) && */
 	    n > BATCH_THRESHOLD && (n / BATCH_SIZE) <= wq->max_transfer_size) {
 		dto_batch_memset(wq, s, c, n, memset_pattern, thr_desc.flags, result);
 		return;
@@ -2527,8 +2834,10 @@ static void dto_memcpymove(void *dest, const void *src, size_t n, bool is_memcpy
 
 	thr_bytes_completed = 0;
 
-	/* Use batch descriptor for large non-overlapping transactions */
-	if (dto_dsa_batch &&
+	/* Use batch descriptor for large non-overlapping transactions.
+	 * Skip batch for huge pages — the coarse page granularity means faults
+	 * hit all sub-descriptors at once, adding overhead with no benefit. */
+	if (dto_dsa_batch && /* !is_hugepage(dest) && */
 	    !((!is_memcpy) && is_overlapping_buffers(dest, src, n)) &&
 	    n > BATCH_THRESHOLD &&
 	    (n / BATCH_SIZE) <= wq->max_transfer_size) {
