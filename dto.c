@@ -3783,6 +3783,8 @@ void dto_gather_copy(void *dst, void **srcs, int num_srcs, size_t src_size,
 	thr_desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
 	if (dto_dsa_cc && (wq->dsa_gencap & GENCAP_CC_MEMORY))
 		thr_desc.flags |= IDXD_OP_FLAG_CC;
+	if (dto_dsa_bof)
+		thr_desc.flags |= IDXD_OP_FLAG_BOF;
 	thr_desc.completion_addr = (uint64_t)&thr_comp;
 	thr_desc.src_addr = (uint64_t)thr_gather_sgl;  /* SGL address */
 	thr_desc.dst_addr = (uint64_t)dst;
