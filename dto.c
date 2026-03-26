@@ -1813,12 +1813,19 @@ static int dto_memcmp(const void *s1, const void *s2, size_t n, int *result)
 	}
 
 	if (thr_comp.result) {
-		/* cmp returned mismatch. determine the return value */
-		uint8_t *t1 = (uint8_t *)s1 + thr_bytes_completed;
-		uint8_t *t2 = (uint8_t *)s2 + thr_bytes_completed;
+		/* cmp returned mismatch. dsa_execute() already added
+		 * xfer_size to thr_bytes_completed, so subtract it back
+		 * to get the base of the last descriptor's range, then
+		 * add thr_comp.bytes_completed (offset of the first
+		 * differing byte within that range).
+		 */
+		uint64_t off = thr_bytes_completed - thr_desc.xfer_size +
+				thr_comp.bytes_completed;
+		uint8_t *t1 = (uint8_t *)s1 + off;
+		uint8_t *t2 = (uint8_t *)s2 + off;
 
 		cmp_result = *t1 - *t2;
-		/* Inform the caller than the job is done even though
+		/* Inform the caller that the job is done even though
 		 * we didn't process all the bytes
 		 */
 		thr_bytes_completed = orig_n;
