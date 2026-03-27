@@ -121,27 +121,28 @@ struct perf_test {
  * Benchmark configurations.
  *
  * Sizes range from 4KB to 1MB covering below and above the DSA offload
- * threshold. 10000 iterations per size balances measurement stability
- * against total test runtime.
+ * threshold. Iterations scale inversely with buffer size: small buffers
+ * (4-8KB) use 100K iterations to compensate for their short per-op time,
+ * while large buffers (256KB+) use 10K.
  */
 static struct perf_test benchmarks[] = {
-	{"memcpy_4k",     OP_MEMCPY,  4096,     10000},
-	{"memcpy_8k",     OP_MEMCPY,  8192,     10000},
-	{"memcpy_16k",    OP_MEMCPY,  16384,    10000},
-	{"memcpy_32k",    OP_MEMCPY,  32768,    10000},
-	{"memcpy_64k",    OP_MEMCPY,  65536,    10000},
-	{"memcpy_128k",   OP_MEMCPY,  131072,   10000},
+	{"memcpy_4k",     OP_MEMCPY,  4096,     100000},
+	{"memcpy_8k",     OP_MEMCPY,  8192,     100000},
+	{"memcpy_16k",    OP_MEMCPY,  16384,    50000},
+	{"memcpy_32k",    OP_MEMCPY,  32768,    50000},
+	{"memcpy_64k",    OP_MEMCPY,  65536,    20000},
+	{"memcpy_128k",   OP_MEMCPY,  131072,   20000},
 	{"memcpy_256k",   OP_MEMCPY,  262144,   10000},
 	{"memcpy_512k",   OP_MEMCPY,  524288,   10000},
 	{"memcpy_1m",     OP_MEMCPY,  1048576,  10000},
 
-	{"memset_64k",    OP_MEMSET,  65536,    10000},
-	{"memset_128k",   OP_MEMSET,  131072,   10000},
+	{"memset_64k",    OP_MEMSET,  65536,    20000},
+	{"memset_128k",   OP_MEMSET,  131072,   20000},
 	{"memset_256k",   OP_MEMSET,  262144,   10000},
 	{"memset_1m",     OP_MEMSET,  1048576,  10000},
 
-	{"memcmp_64k",    OP_MEMCMP,  65536,    10000},
-	{"memcmp_128k",   OP_MEMCMP,  131072,   10000},
+	{"memcmp_64k",    OP_MEMCMP,  65536,    20000},
+	{"memcmp_128k",   OP_MEMCMP,  131072,   20000},
 	{"memcmp_1m",     OP_MEMCMP,  1048576,  10000},
 
 	{NULL, 0, 0, 0}
