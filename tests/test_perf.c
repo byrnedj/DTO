@@ -73,6 +73,49 @@ static volatile int benchmark_sink;
 
 static int use_hugepages;
 
+/* TSC frequency in ticks per nanosecond (GHz), calibrated at startup */
+static double tsc_ghz;
+
+/* ---- rdtsc helpers ---- */
+
+static inline uint64_t rdtsc_start(void)
+{
+	__asm__ volatile("lfence");
+	return __rdtsc();
+}
+
+static inline uint64_t rdtsc_end(void)
+{
+	unsigned int aux;
+
+	return __rdtscp(&aux);
+}
+
+/*
+ * Calibrate TSC frequency by measuring ticks over a known wall-clock
+ * interval.  Busy-waits for ~50ms to get a stable ratio.
+ */
+static double calibrate_tsc(void)
+{
+	struct timespec t0, t1;
+	uint64_t tsc0, tsc1;
+	uint64_t elapsed_ns;
+
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	tsc0 = rdtsc_end();
+
+	/* Busy-wait ~50ms */
+	do {
+		clock_gettime(CLOCK_MONOTONIC, &t1);
+		elapsed_ns = (t1.tv_sec - t0.tv_sec) * 1000000000ULL +
+			     (t1.tv_nsec - t0.tv_nsec);
+	} while (elapsed_ns < 50000000ULL);
+
+	tsc1 = rdtsc_end();
+
+	return (double)(tsc1 - tsc0) / (double)elapsed_ns;
+}
+
 /* ---- CPU pinning ---- */
 
 static int pin_to_cpu(int cpu)
@@ -265,7 +308,7 @@ static double run_benchmark(struct perf_test *test, double *out_avg_ns)
 		flush_buffer(src, test->size);
 		flush_buffer(dst, test->size);
 
-		start = time_ns();
+		start = rdtsc_start();
 
 		switch (test->op) {
 		case OP_MEMSET:
@@ -280,12 +323,12 @@ static double run_benchmark(struct perf_test *test, double *out_avg_ns)
 		}
 		COMPILER_BARRIER();
 
-		end = time_ns();
+		end = rdtsc_end();
 		samples[i] = end - start;
 	}
 
 	qsort(samples, test->iterations, sizeof(uint64_t), cmp_u64);
-	double median_ns = (double)samples[test->iterations / 2];
+	double median_ns = (double)samples[test->iterations / 2] / tsc_ghz;
 	double gbps = (double)test->size / median_ns;
 
 	*out_avg_ns = median_ns;
@@ -397,11 +440,15 @@ int main(void)
 		fprintf(stderr, "WARNING: could not pin to CPU %d, "
 			"results may have higher variance\n", cpu);
 
+	/* Calibrate TSC after pinning so we measure the pinned core's freq */
+	tsc_ghz = calibrate_tsc();
+
 	printf("DTO Performance Tests (cold cache) [%s]\n", label);
 	printf("==========================================\n");
 	printf("Page size:              %s\n",
 	       use_hugepages ? "2MB hugepages" : "4KB");
 	printf("Pinned to CPU:          %d\n", cpu);
+	printf("TSC frequency:          %.3f GHz\n", tsc_ghz);
 	printf("Passes per benchmark:   %d%s\n", passes,
 	       passes > 1 ? " (median-of-medians)" : "");
 	printf("DTO_CPU_SIZE_FRACTION:  %s\n",
