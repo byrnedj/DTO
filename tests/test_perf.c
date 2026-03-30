@@ -39,6 +39,7 @@
  *   PERF_TOLERANCE   - Allowed %% drop below baseline before failing (default: 0)
  *   PERF_CPU         - CPU core to pin benchmark thread to (default: 1)
  *   PERF_PASSES      - Full passes per benchmark; median-of-medians when >1 (default: 1)
+ *   PERF_COLD_CACHE  - Flush caches every iteration (1, default) or once per size (0)
  *   DTO_PERF_HUGE    - If set, allocate with 2MB hugepages
  *   PERF_LABEL       - Label for file prefix (cpu/stdc/dsa/dsa_auto)
  *
@@ -72,6 +73,7 @@
 static volatile int benchmark_sink;
 
 static int use_hugepages;
+static int cold_cache;
 
 /* TSC frequency in ticks per nanosecond (GHz), calibrated at startup */
 static double tsc_ghz;
@@ -298,15 +300,24 @@ static double run_benchmark(struct perf_test *test, double *out_avg_ns)
 	}
 
 	/*
-	 * Timed run - cold cache per iteration.
+	 * Timed run.
 	 *
-	 * Flush both buffers from all cache levels before each operation,
-	 * matching bench_batch_vs_single methodology. Timing includes only
-	 * the memory operation itself, not the flush.
+	 * Cold-cache mode (default): flush both buffers before each
+	 * iteration so every operation measures DRAM latency.
+	 * Warm-cache mode (PERF_COLD_CACHE=0): flush once before the
+	 * loop; subsequent iterations hit L1/L2 — more representative
+	 * for small buffers that stay cache-resident in real workloads.
 	 */
-	for (int i = 0; i < test->iterations; i++) {
+	if (!cold_cache) {
 		flush_buffer(src, test->size);
 		flush_buffer(dst, test->size);
+	}
+
+	for (int i = 0; i < test->iterations; i++) {
+		if (cold_cache) {
+			flush_buffer(src, test->size);
+			flush_buffer(dst, test->size);
+		}
 
 		start = rdtsc_start();
 
@@ -420,6 +431,7 @@ int main(void)
 	int failures = 0;
 
 	use_hugepages = (getenv("DTO_PERF_HUGE") != NULL);
+	cold_cache = getenv("PERF_COLD_CACHE") ? atoi(getenv("PERF_COLD_CACHE")) : 1;
 
 	if (!label)
 		label = "dsa";
@@ -443,12 +455,16 @@ int main(void)
 	/* Calibrate TSC after pinning so we measure the pinned core's freq */
 	tsc_ghz = calibrate_tsc();
 
-	printf("DTO Performance Tests (cold cache) [%s]\n", label);
+	printf("DTO Performance Tests (%s cache) [%s]\n",
+	       cold_cache ? "cold" : "warm", label);
 	printf("==========================================\n");
 	printf("Page size:              %s\n",
 	       use_hugepages ? "2MB hugepages" : "4KB");
 	printf("Pinned to CPU:          %d\n", cpu);
 	printf("TSC frequency:          %.3f GHz\n", tsc_ghz);
+	printf("Cache mode:             %s\n",
+	       cold_cache ? "cold (flush every iteration)" :
+			    "warm (flush once per size)");
 	printf("Passes per benchmark:   %d%s\n", passes,
 	       passes > 1 ? " (median-of-medians)" : "");
 	printf("DTO_CPU_SIZE_FRACTION:  %s\n",
