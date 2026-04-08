@@ -367,9 +367,9 @@ static void install_sigint_handler(void)
 static atomic_ullong num_descs;
 static atomic_ullong adjust_num_descs;
 static atomic_ullong adjust_num_waits;
-/* default waits are for yield because yield is default waiting method */
-static double min_avg_waits = MIN_AVG_YIELD_WAITS;
-static double max_avg_waits = MAX_AVG_YIELD_WAITS;
+/* default waits are for poll because poll is default waiting method */
+static double min_avg_waits = MIN_AVG_POLL_WAITS;
+static double max_avg_waits = MAX_AVG_POLL_WAITS;
 static uint8_t auto_adjust_knobs = 1;
 
 extern char *__progname;
