@@ -21,6 +21,8 @@
  *   PERF_CPU          - CPU core to pin to (default: 1)
  *   PERF_COLD_CACHE   - 1=flush per iteration (default), 0=flush once
  *   PERF_FREQ_MHZ     - Pin core+uncore frequency
+ *   PERF_OP           - Run only this op type: memcpy, memset, or memcmp
+ *   PERF_SIZE         - Run only this size (e.g. 4k, 64k, 128k, 1m)
  ******************************************************************************/
 
 #ifndef _GNU_SOURCE
@@ -292,44 +294,31 @@ struct perf_test {
 	enum perf_op op;
 	size_t size;
 	int ref_only;
+	int pf_pct;	/* page-fault probability: 0=none, 1=1%, etc. */
 };
 
 static struct perf_test benchmarks[] = {
-	{"memcpy_4k",   OP_MEMCPY, 4096,    1},
-	{"memcpy_8k",   OP_MEMCPY, 8192,    1},
-	{"memcpy_16k",  OP_MEMCPY, 16384,   0},
-	{"memcpy_32k",  OP_MEMCPY, 32768,   0},
-	{"memcpy_64k",  OP_MEMCPY, 65536,   0},
-	{"memcpy_128k", OP_MEMCPY, 131072,  0},
-	{"memcpy_256k", OP_MEMCPY, 262144,  0},
-	{"memcpy_512k", OP_MEMCPY, 524288,  0},
-	{"memcpy_1m",   OP_MEMCPY, 1048576, 0},
-	{"memset_64k",  OP_MEMSET, 65536,   0},
-	{"memset_128k", OP_MEMSET, 131072,  0},
-	{"memset_256k", OP_MEMSET, 262144,  0},
-	{"memset_1m",   OP_MEMSET, 1048576, 0},
-	{"memcmp_64k",  OP_MEMCMP, 65536,   0},
-	{"memcmp_128k", OP_MEMCMP, 131072,  0},
-	{"memcmp_1m",   OP_MEMCMP, 1048576, 0},
-	{NULL, 0, 0, 0}
+	{"memcpy_4k",      OP_MEMCPY, 4096,    1, 0},
+	{"memcpy_8k",      OP_MEMCPY, 8192,    1, 0},
+	{"memcpy_16k",     OP_MEMCPY, 16384,   0, 0},
+	{"memcpy_32k",     OP_MEMCPY, 32768,   0, 0},
+	{"memcpy_64k",     OP_MEMCPY, 65536,   0, 0},
+	{"memcpy_128k",    OP_MEMCPY, 131072,  0, 0},
+	{"memcpy_256k",    OP_MEMCPY, 262144,  0, 0},
+	{"memcpy_512k",    OP_MEMCPY, 524288,  0, 0},
+	{"memcpy_1m",      OP_MEMCPY, 1048576, 0, 0},
+	{"memcpy_1m_pf50",  OP_MEMCPY, 1048576, 0, 50},
+	{"memset_64k",     OP_MEMSET, 65536,   0, 0},
+	{"memset_128k",    OP_MEMSET, 131072,  0, 0},
+	{"memset_256k",    OP_MEMSET, 262144,  0, 0},
+	{"memset_1m",      OP_MEMSET, 1048576, 0, 0},
+	{"memcmp_64k",     OP_MEMCMP, 65536,   0, 0},
+	{"memcmp_128k",    OP_MEMCMP, 131072,  0, 0},
+	{"memcmp_1m",      OP_MEMCMP, 1048576, 0, 0},
+	{NULL, 0, 0, 0, 0}
 };
 
-/*
- * Pilot-based iteration sizing.
- *
- * Run a short pilot (PILOT_N iterations), compute the trimmed CV
- * (coefficient of variation in the 10th-90th pctl range), then
- * calculate how many iterations are needed for the standard error
- * of the trimmed mean to be within TARGET_SE_PCT of the mean.
- *
- * N = (CV / TARGET_SE_PCT)^2
- *
- * Clamped to [MIN_ITERS, MAX_ITERS].
- */
-#define PILOT_N        1000
-#define TARGET_SE_PCT  0.5   /* target 0.5% SE of trimmed mean */
-#define MIN_ITERS      2000
-#define MAX_ITERS      50000
+#define DEFAULT_ITERS  10000
 
 /* ---- DTO config sets ---- */
 
@@ -372,7 +361,7 @@ struct shared_result {
 	int requested_iters;  /* parent sets this before fork */
 };
 
-#define MAX_CHILD_SAMPLES MAX_ITERS
+#define MAX_CHILD_SAMPLES DEFAULT_ITERS
 #define SHARED_SLOT_SIZE (sizeof(struct shared_result) + \
 			  2 * MAX_CHILD_SAMPLES * sizeof(uint64_t))
 
@@ -590,6 +579,11 @@ static void child_run_ab(struct perf_test *test,
 		}
 	}
 
+	/* Page fault injection setup */
+	size_t page_size = sysconf(_SC_PAGESIZE);
+	size_t num_pages = test->size / page_size;
+	uintptr_t dst_base = (uintptr_t)dst & ~(page_size - 1);
+
 	/* Randomized interleaved measurement */
 	uint32_t rng = (uint32_t)rdtsc_end() | 1;  /* must be nonzero for xorshift */
 
@@ -603,6 +597,15 @@ static void child_run_ab(struct perf_test *test,
 		if (cold_cache) {
 			flush_buffer(src, test->size);
 			flush_buffer(dst, test->size);
+		}
+		if (test->pf_pct && num_pages > 0) {
+			rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+			if ((rng % 100) < (uint32_t)test->pf_pct) {
+				rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+				size_t pg = rng % num_pages;
+				madvise((void *)(dst_base + pg * page_size),
+					page_size, MADV_DONTNEED);
+			}
 		}
 		start = rdtsc_start();
 		switch (test->op) {
@@ -622,6 +625,15 @@ static void child_run_ab(struct perf_test *test,
 		if (cold_cache) {
 			flush_buffer(src, test->size);
 			flush_buffer(dst, test->size);
+		}
+		if (test->pf_pct && num_pages > 0) {
+			rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+			if ((rng % 100) < (uint32_t)test->pf_pct) {
+				rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+				size_t pg = rng % num_pages;
+				madvise((void *)(dst_base + pg * page_size),
+					page_size, MADV_DONTNEED);
+			}
 		}
 		start = rdtsc_start();
 		switch (test->op) {
@@ -645,7 +657,7 @@ static void child_run_ab(struct perf_test *test,
 	qsort(cur_s, iters, sizeof(uint64_t), cmp_u64);
 	slot->nsamples = iters;
 	slot->ok = 1;
-	_exit(0);
+	exit(0);
 }
 
 static int fork_ab(struct perf_test *test, struct shared_result *slot,
@@ -677,64 +689,6 @@ static int fork_ab(struct perf_test *test, struct shared_result *slot,
 	return slot->ok ? 0 : -1;
 }
 
-/*
- * Run a pilot to determine optimal iteration count.
- * Forks a child with PILOT_N iterations, computes trimmed CV,
- * returns N needed for TARGET_SE_PCT standard error.
- */
-static int pilot_iters(struct perf_test *test, struct dto_config *cfg,
-		       struct page_config *pg, void *shm)
-{
-	struct shared_result *slot = shm;
-
-	uint8_t *src = alloc_shared_buffer(test->size, pg->hugepage);
-	uint8_t *dst = alloc_shared_buffer(test->size, pg->hugepage);
-
-	if (!src || !dst) {
-		if (src) free_shared_buffer(src, test->size, pg->hugepage);
-		if (dst) free_shared_buffer(dst, test->size, pg->hugepage);
-		return MIN_ITERS;
-	}
-
-	memset(slot, 0, SHARED_SLOT_SIZE);
-	if (fork_ab(test, slot, src, dst, cfg, PILOT_N) < 0) {
-		free_shared_buffer(src, test->size, pg->hugepage);
-		free_shared_buffer(dst, test->size, pg->hugepage);
-		return MIN_ITERS;
-	}
-
-	free_shared_buffer(src, test->size, pg->hugepage);
-	free_shared_buffer(dst, test->size, pg->hugepage);
-
-	if (!slot->ok || slot->nsamples < 100)
-		return MIN_ITERS;
-
-	/* Compute trimmed CV from baseline samples */
-	uint64_t *samples = get_bl_samples(slot);
-	int n = slot->nsamples;
-	int lo = n / 10, hi = n * 9 / 10;
-	int trimmed = hi - lo;
-	double sum = 0, sum_sq = 0;
-
-	for (int i = lo; i < hi; i++)
-		sum += (double)samples[i];
-	double mean = sum / trimmed;
-
-	for (int i = lo; i < hi; i++) {
-		double d = (double)samples[i] - mean;
-		sum_sq += d * d;
-	}
-	double stdev = sqrt(sum_sq / (trimmed - 1));
-	double cv = stdev / mean * 100.0;
-
-	int needed = 2 * (int)((cv / TARGET_SE_PCT) * (cv / TARGET_SE_PCT));
-
-	if (needed < MIN_ITERS) needed = MIN_ITERS;
-	if (needed > MAX_ITERS) needed = MAX_ITERS;
-
-	return needed;
-}
-
 static struct cell_result run_cell(struct perf_test *test,
 				   struct dto_config *cfg,
 				   struct page_config *pg,
@@ -748,8 +702,7 @@ static struct cell_result run_cell(struct perf_test *test,
 	uint64_t *all_bl, *all_cur;
 	int n_bl = 0, n_cur = 0;
 
-	/* Pilot phase: determine optimal iteration count */
-	iters = pilot_iters(test, cfg, pg, shm);
+	iters = DEFAULT_ITERS;
 	max_total = ab_rounds * iters;
 
 	uint8_t *src = alloc_shared_buffer(test->size, pg->hugepage);
@@ -864,6 +817,26 @@ int main(void)
 
 	cold_cache = getenv("PERF_COLD_CACHE") ?
 		     atoi(getenv("PERF_COLD_CACHE")) : 1;
+	int filter_op = -1;
+	size_t filter_size = 0;
+	{
+		const char *op_env = getenv("PERF_OP");
+		if (op_env) {
+			if (strcasecmp(op_env, "memcpy") == 0) filter_op = OP_MEMCPY;
+			else if (strcasecmp(op_env, "memset") == 0) filter_op = OP_MEMSET;
+			else if (strcasecmp(op_env, "memcmp") == 0) filter_op = OP_MEMCMP;
+			else fprintf(stderr, "WARNING: unknown PERF_OP=%s, running all\n", op_env);
+		}
+		const char *size_env = getenv("PERF_SIZE");
+		if (size_env) {
+			char *end;
+			filter_size = strtoul(size_env, &end, 10);
+			if (*end == 'k' || *end == 'K')
+				filter_size *= 1024;
+			else if (*end == 'm' || *end == 'M')
+				filter_size *= 1024 * 1024;
+		}
+	}
 	if (ab_rounds < 1) ab_rounds = 1;
 
 	/* Setup */
@@ -936,6 +909,11 @@ int main(void)
 	for (int b = 0; b < num_benchmarks; b++) {
 		struct perf_test *test = &benchmarks[b];
 
+		if (filter_op >= 0 && test->op != filter_op)
+			continue;
+		if (filter_size && test->size != filter_size)
+			continue;
+
 		for (int c = 0; c < (int)NUM_DTO_CONFIGS; c++) {
 			for (int p = 0; p < (int)NUM_PAGE_CONFIGS; p++) {
 				all_results[b][c][p] = run_cell(
@@ -982,6 +960,10 @@ int main(void)
 		       "--------", "-----", "-------",
 		       "--------");
 		for (int b = 0; b < num_benchmarks; b++) {
+			if (filter_op >= 0 && benchmarks[b].op != filter_op)
+				continue;
+			if (filter_size && benchmarks[b].size != filter_size)
+				continue;
 			for (int c = 0; c < (int)NUM_DTO_CONFIGS; c++) {
 				struct cell_result *r =
 					&all_results[b][c][p];
@@ -1043,6 +1025,10 @@ int main(void)
 		printf("\n");
 
 		for (int b = 0; b < num_benchmarks; b++) {
+			if (filter_op >= 0 && benchmarks[b].op != filter_op)
+				continue;
+			if (filter_size && benchmarks[b].size != filter_size)
+				continue;
 			if (benchmarks[b].ref_only)
 				continue;
 

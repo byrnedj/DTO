@@ -83,15 +83,11 @@ ctest -R perf_combined --output-on-failure
    only rebuilt when the remote branch changes.
 
 2. **Measurement** — For each (benchmark × DTO config × page size) cell:
-   - A **pilot** phase runs 1000 iterations to measure the coefficient of
-     variation (CV) in the 10th–90th percentile range.
-   - The pilot CV determines the iteration count needed for the trimmed mean
-     standard error to be within 0.5% of the mean:
-     `N = 2 × (CV / 0.5)²`, clamped to [2000, 50000].
-   - The full measurement runs in `PERF_AB_ROUNDS` (default 3) forked child
-     processes. Each child runs the calculated iterations with **randomized
-     interleaving**: a xorshift32 PRNG decides whether baseline or current
-     runs first on each iteration, eliminating first-mover bias.
+   - Each cell runs `PERF_AB_ROUNDS` (default 3) forked child processes,
+     each executing 10,000 iterations (configurable via `DEFAULT_ITERS`).
+   - Each child runs with **randomized interleaving**: a xorshift32 PRNG
+     decides whether baseline or current runs first on each iteration,
+     eliminating first-mover bias.
 
 3. **Analysis** — Samples from all rounds are pooled, sorted, then:
    - **Trimmed mean** (10th–90th percentile) computes the central tendency,
@@ -121,67 +117,45 @@ results back through shared memory (`MAP_SHARED|MAP_ANONYMOUS`).
 run_cell(benchmark, dto_config, page_config)
 │
 │   ┌─────────────────────────────────────────────────────────┐
-│   │  PILOT PHASE — determine iteration count                │
-│   └─────────────────────────────────────────────────────────┘
-│
-├── alloc shared buffers: src, dst (MAP_SHARED, hugepage if 2m config)
-├── fork_ab(pilot_n = 1000)
-│   │
-│   ├── [parent] setenv(DTO config vars: CSF, AAK, MIN_BYTES, etc.)
-│   ├── [parent] fork() ──────────────────────────────────────────┐
-│   │                                                             │
-│   │   ┌─────────────────────────────────────────────────────────▼──┐
-│   │   │  CHILD PROCESS (pid == 0)                                  │
-│   │   │                                                            │
-│   │   │  1. pthread_atfork child handler fires:                    │
-│   │   │     └── dto.c:child() resets dto_initialized = 0           │
-│   │   │         and calls init_dto() which re-reads env vars,      │
-│   │   │         reopens DSA work queues, resets auto-tune state     │
-│   │   │                                                            │
-│   │   │  2. Resolve function pointers:                             │
-│   │   │     ├── cpu config:  dlopen("libc.so.6") → dlsym           │
-│   │   │     │   a_memcpy = b_memcpy = libc memcpy (A==B)           │
-│   │   │     └── dto configs: a_* = bl_* (baseline static symbols)  │
-│   │   │                      b_* = cur_* (current static symbols)  │
-│   │   │                                                            │
-│   │   │  3. Initialize src[i] = i & 0xFF, dst = src               │
-│   │   │                                                            │
-│   │   │  4. Warmup (100 iters of both a and b)                     │
-│   │   │     └── primes IOTLB entries for DSA                       │
-│   │   │                                                            │
-│   │   │  5. Measurement loop (1000 iters):                         │
-│   │   │     see "Measurement Loop Detail" below                    │
-│   │   │                                                            │
-│   │   │  6. qsort(bl_samples), qsort(cur_samples)                 │
-│   │   │  7. slot->nsamples = 1000, slot->ok = 1                   │
-│   │   │  8. _exit(0)                                               │
-│   │   └────────────────────────────────────────────────────────────┘
-│   │
-│   ├── [parent] waitpid() — blocks until child exits
-│   └── [parent] unsetenv(DTO config vars)
-│
-├── compute trimmed CV (10th–90th pctl) from pilot baseline samples
-├── N = 2 × (CV / 0.5)², clamped to [2000, 50000]
-│
-│   ┌─────────────────────────────────────────────────────────┐
 │   │  MEASUREMENT PHASE — ab_rounds forked children          │
 │   └─────────────────────────────────────────────────────────┘
 │
-├── alloc pooled arrays: all_bl[rounds×N], all_cur[rounds×N]
+├── iters = DEFAULT_ITERS (10,000)
+├── alloc pooled arrays: all_bl[rounds×iters], all_cur[rounds×iters]
 │
 ├── for round = 0 .. ab_rounds-1:
 │   │
-│   ├── fork_ab(iters = N)
+│   ├── fork_ab(iters)
 │   │   │
-│   │   ├── [parent] setenv(DTO config vars)
+│   │   ├── [parent] setenv(DTO config vars: CSF, AAK, MIN_BYTES, etc.)
 │   │   ├── [parent] fork() ─────────────────────────────────────┐
 │   │   │                                                        │
-│   │   │   ┌────────────────────────────────────────────────────▼──┐
-│   │   │   │  CHILD PROCESS — same steps as pilot above,           │
-│   │   │   │  but runs N iterations instead of 1000.               │
-│   │   │   │  Writes bl_samples[] and cur_samples[] to shared mem. │
-│   │   │   │  _exit(0)                                             │
-│   │   │   └───────────────────────────────────────────────────────┘
+│   │   │   ┌────────────────────────────────────────────────────▼───┐
+│   │   │   │  CHILD PROCESS (pid == 0)                              │
+│   │   │   │                                                        │
+│   │   │   │  1. pthread_atfork child handler fires:                │
+│   │   │   │     └── dto.c:child() resets dto_initialized = 0       │
+│   │   │   │         and calls init_dto() which re-reads env vars,  │
+│   │   │   │         reopens DSA work queues, resets auto-tune state│
+│   │   │   │                                                        │
+│   │   │   │  2. Resolve function pointers:                         │
+│   │   │   │     ├── cpu config:  dlopen("libc.so.6") → dlsym       │
+│   │   │   │     │   a_memcpy = b_memcpy = libc memcpy (A==B)       │
+│   │   │   │     └── dto configs: a_* = bl_* (baseline symbols)     │
+│   │   │   │                      b_* = cur_* (current symbols)     │
+│   │   │   │                                                        │
+│   │   │   │  3. Initialize src[i] = i & 0xFF, dst = src            │
+│   │   │   │                                                        │
+│   │   │   │  4. Warmup (100 iters of both a and b)                 │
+│   │   │   │     └── primes IOTLB entries for DSA                   │
+│   │   │   │                                                        │
+│   │   │   │  5. Measurement loop (10,000 iters):                   │
+│   │   │   │     see "Measurement Loop Detail" below                │
+│   │   │   │                                                        │
+│   │   │   │  6. qsort(bl_samples), qsort(cur_samples)              │
+│   │   │   │  7. slot->nsamples, slot->ok = 1                       │
+│   │   │   │  8. exit(0)                                            │
+│   │   │   └────────────────────────────────────────────────────────┘
 │   │   │
 │   │   ├── [parent] waitpid()
 │   │   └── [parent] unsetenv(DTO config vars)
@@ -213,7 +187,7 @@ for i = 0 .. iters-1:
 │
 ├── xorshift32(rng) → bl_first = (rng & 1)
 │
-│   ┌── Measure FIRST ──────────────────────────────┐
+│   ┌── Measure FIRST  ──────────────────────────────┐
 │   │ if cold_cache: clflushopt(src), clflushopt(dst)│
 │   │ lfence                                         │
 │   │ start = rdtsc                                  │
@@ -224,7 +198,7 @@ for i = 0 .. iters-1:
 │
 │   (memcmp: reset dst = src)
 │
-│   ┌── Measure SECOND ─────────────────────────────┐
+│   ┌── Measure SECOND  ─────────────────────────────┐
 │   │ if cold_cache: clflushopt(src), clflushopt(dst)│
 │   │ lfence                                         │
 │   │ start = rdtsc                                  │
@@ -244,27 +218,27 @@ used by all children sequentially. The child writes directly to this
 region; the parent reads it after `waitpid()` returns.
 
 ```
-shm ──►┌──────────────────────────────────────┐
-       │ struct shared_result                  │
-       │   .ok              (child sets to 1)  │
-       │   .nsamples        (actual count)     │
-       │   .requested_iters (parent sets)      │
+shm ── ┌──────────────────────────────────────┐
+       │ struct shared_result                 │
+       │   .ok              (child sets to 1) │
+       │   .nsamples        (actual count)    │
+       │   .requested_iters (parent sets)     │
        ├──────────────────────────────────────┤
-       │ bl_samples[0..MAX_ITERS-1]            │
-       │   (baseline cycle counts, uint64_t)   │
+       │ bl_samples[0..DEFAULT_ITERS-1]       │
+       │   (baseline cycle counts, uint64_t)  │
        ├──────────────────────────────────────┤
-       │ cur_samples[0..MAX_ITERS-1]           │
-       │   (current cycle counts, uint64_t)    │
+       │ cur_samples[0..DEFAULT_ITERS-1]      │
+       │   (current cycle counts, uint64_t)   │
        └──────────────────────────────────────┘
 
-src ──►┌──────────────────────────────────────┐
-       │ Source buffer (MAP_SHARED)             │
-       │ 4KB pages or 2MB hugepages             │
+src ── ┌──────────────────────────────────────┐
+       │ Source buffer (MAP_SHARED)           │
+       │ 4KB pages or 2MB hugepages           │
        └──────────────────────────────────────┘
 
-dst ──►┌──────────────────────────────────────┐
-       │ Destination buffer (MAP_SHARED)       │
-       │ 4KB pages or 2MB hugepages             │
+dst ── ┌──────────────────────────────────────┐
+       │ Destination buffer (MAP_SHARED)      │
+       │ 4KB pages or 2MB hugepages           │
        └──────────────────────────────────────┘
 ```
 
@@ -272,27 +246,11 @@ All buffers use `MAP_SHARED` so the child (a separate process after `fork()`)
 operates on the same physical pages as the parent. This avoids copy-on-write
 faults during measurement that would add noise.
 
-#### Why fork()?
-
-Each A/B round runs in a forked child for two reasons:
-
-1. **DSA reinitialization** — DTO registers a `pthread_atfork` child handler
-   that calls `init_dto()`. This reopens DSA work queues and resets internal
-   state (`cpu_size_fraction`, `dsa_min_size`, auto-tune counters). Without
-   this, the two statically-linked DTO instances (bl_* and cur_*) would share
-   global state and interfere with each other.
-
-2. **Process-level isolation** — Each round starts with a clean slate: no
-   accumulated TLB pollution, no warmed branch predictors from prior rounds,
-   and no auto-tune drift from earlier iterations. This makes rounds
-   independent samples.
-
 ### Noise Reduction
 
 The test applies several techniques for stable, reproducible measurements:
 
 - **CPU pinning** (`sched_setaffinity`) to a single core (default core 1)
-- **SCHED_FIFO** real-time scheduling priority
 - **Core and uncore frequency pinning** via sysfs (requires root)
 - **Cold-cache** benchmarking with `clflushopt` before each iteration (default)
 - **Process isolation** via `fork()` — each A/B round runs in a child process,
@@ -310,8 +268,8 @@ Four DTO configurations isolate different code paths:
 |------------|----------------------------------------------------------|
 | `cpu`      | Raw libc (via `dlsym`), no DTO — reference baseline      |
 | `stdc`     | DTO linked, forced CPU path (`DTO_USESTDC_CALLS=1`)      |
-| `dsa`      | Pure DSA through DTO (`CSF=0`, no auto-tuning)            |
-| `dsa_auto` | DSA with CPU+DSA split (`CSF=0.33`, auto-tuning enabled)  |
+| `dsa`      | Pure DSA through DTO (`CSF=0`, no auto-tuning)           |
+| `dsa_auto` | DSA with CPU+DSA split (`CSF=0.33`, auto-tuning enabled) |
 
 Each config is tested with both **4KB pages** and **2MB hugepages**.
 
@@ -381,12 +339,11 @@ Linking:       static (bl_* / cur_* in same binary)
 ### Plotting Distributions
 
 The test writes raw sample data to `distributions.csv`. Use the R script to
-generate density, violin, and ECDF plots:
+generate density, violin, and ECDF plots for each operation:
 
 ```bash
 cd build
-Rscript ../tests/plot-distributions.R perf_results/distributions.csv 4k
-Rscript ../tests/plot-distributions.R perf_results/distributions.csv 2m
+Rscript ../tests/plot-distributions.R perf_results/distributions.csv [4k|2m] [memcpy|memset|memcmp]
 ```
 
 ### Baseline Management
@@ -406,14 +363,14 @@ rebuild.
 
 ### Environment Variables
 
-| Variable            | Default | Effect                                             |
-|---------------------|---------|----------------------------------------------------|
-| `PERF_CPU`          | `1`     | CPU core to pin the benchmark thread to            |
-| `PERF_FREQ_MHZ`     | `2000`  | Pin core and uncore frequency (MHz); requires root |
-| `PERF_MIN_EFFECT`   | `2`     | Minimum trimmed mean change % to flag a FAIL       |
-| `PERF_AB_ROUNDS`    | `3`     | Number of interleaved A/B fork rounds              |
-| `PERF_COLD_CACHE`   | `1`     | 1 = `clflushopt` per iteration, 0 = flush once     |
-| `RESULTS_DIR`       | —       | Directory for `distributions.csv` output           |
+| Variable            | Default                                | Effect                                             |
+|---------------------|----------------------------------------|----------------------------------------------------|
+| `PERF_CPU`          | `1`                                    | CPU core to pin the benchmark thread to            |
+| `PERF_FREQ_MHZ`     | `2000`                                 | Pin core and uncore frequency (MHz); requires root |
+| `PERF_MIN_EFFECT`   | `2`                                    | Minimum trimmed mean change % to flag a FAIL       |
+| `PERF_AB_ROUNDS`    | `3`                                    | Number of interleaved A/B fork rounds              |
+| `PERF_COLD_CACHE`   | `1`                                    | 1 = `clflushopt` per iteration, 0 = flush once     |
+| `RESULTS_DIR`       |  ${CMAKE_BINARY_DIR}/perf_results      | Directory for `distributions.csv` output           |
 
 CMake sets `RESULTS_DIR` and `PERF_FREQ_MHZ` automatically when running via
 CTest. Override `PERF_FREQ_MHZ` at configure time:
