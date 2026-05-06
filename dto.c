@@ -97,6 +97,9 @@ enum cache_class { CACHE_IN = 0, CACHE_OUT = 1, NUM_CACHE_CLASSES = 2 };
 #define CACHE_LATENCY_THRESHOLD 80  // cycles
 
 // gather copy SGL (scatter-gather list) storage
+// Per /usr/local/include/dto.h the public API advertises a 64-source limit
+// (DSA Gather Copy SGL). Bumped from the original 2 — the smaller value
+// silently truncated num_srcs and memcpy'd the rest, defeating the offload.
 #define MAX_GATHER_SRCS 64
 
 struct batch_comp {
@@ -3804,9 +3807,9 @@ void dto_gather_copy(void *dst, void **srcs, int num_srcs, size_t src_size,
 	uint32_t elem_count = (uint32_t)src_size;
 	uint16_t sgl_size = (uint16_t)dsa_srcs;
 
-	memcpy(&thr_desc.op_specific[0], &elem_count, sizeof(elem_count));
-	memcpy(&thr_desc.op_specific[4], &sgl_size, sizeof(sgl_size));
-	memcpy(&thr_desc.op_specific[8], &base_addr, sizeof(base_addr));
+	orig_memcpy(&thr_desc.op_specific[0], &elem_count, sizeof(elem_count));
+	orig_memcpy(&thr_desc.op_specific[4], &sgl_size, sizeof(sgl_size));
+	orig_memcpy(&thr_desc.op_specific[8], &base_addr, sizeof(base_addr));
 	thr_desc.op_specific[16] = 0;                   /* data_type = UINT8 */
 	thr_desc.op_specific[19] = DSA_SGL_FORMAT1 << 4; /* sgl_format in high nibble */
 
