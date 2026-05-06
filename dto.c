@@ -530,10 +530,16 @@ static void child (void)
 	tl_stats = NULL;
 
 	pthread_mutex_lock(&stats_registry_lock);
-	/* Free old stats structures */
+	/* Release inherited per-thread stats pages. update_stats() allocates
+	 * tl_stats with mmap() (deliberately, to stay out of the allocator);
+	 * calling free() on those pointers corrupts glibc malloc state in the
+	 * child and wedges any later allocator call. Use munmap() to match
+	 * the allocation source. */
 	int count = atomic_load(&global_stats_count);
 	for (int i = 0; i < count && i < MAX_STAT_THREADS; ++i) {
-		free(global_stats_registry[i]);
+		if (global_stats_registry[i])
+			munmap(global_stats_registry[i],
+			       sizeof(struct thread_stats));
 		global_stats_registry[i] = NULL;
 	}
 	global_stats_count = 0;
