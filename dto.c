@@ -275,7 +275,7 @@ struct thread_stats {
 static __thread struct thread_stats *tl_stats = NULL;
 
 /* Global registry of all thread stats for aggregation */
-#define MAX_STAT_THREADS 256
+#define MAX_STAT_THREADS 4096
 static struct thread_stats *global_stats_registry[MAX_STAT_THREADS];
 static atomic_int global_stats_count = 0;
 static pthread_mutex_t stats_registry_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -1341,6 +1341,10 @@ static int dsa_init(void)
 			wait_method = WAIT_BUSYPOLL;
 			min_avg_waits = MIN_AVG_POLL_WAITS;
 			max_avg_waits = MAX_AVG_POLL_WAITS;
+		} else if (!strncmp(env_str, wait_names[WAIT_YIELD], strlen(wait_names[WAIT_YIELD]))) {
+			wait_method = WAIT_YIELD;
+			min_avg_waits = MIN_AVG_YIELD_WAITS;
+			max_avg_waits = MAX_AVG_YIELD_WAITS;
 		} else if (!strncmp(env_str, wait_names[WAIT_UMWAIT], strlen(wait_names[WAIT_UMWAIT]))) {
 			if (umwait_support) {
 				wait_method = WAIT_UMWAIT;
@@ -1730,21 +1734,11 @@ static __always_inline  struct dto_wq *get_wq(void* buf)
         if (wq_index == -2)
             return NULL;  /* thread exceeded max threads limit */
 
-	if (is_numa_aware) {
-		int status[1] = {-1};
-
-		// get the numa node for the target DSA device
-		const int numa_node = get_numa_node(buf);
-		if (numa_node >= 0 && numa_node < MAX_NUMA_NODES) {
-			struct dto_device* dev = devices[numa_node];
-			if (dev != NULL &&
-				dev->num_wqs > 0) {
-				wq = dev->wqs[dev->next_wq++ % dev->num_wqs];
-			}
-		}
-	}
-
-	if (wq == NULL) {
+	/* First DSA use for this thread: assign a thread number and apply the
+	 * DSA thread cap ONCE, independent of NUMA-awareness. Previously the
+	 * is_numa_aware branch selected a WQ before this check, so the cap was
+	 * skipped in buffer-centric mode (all threads used DSA). */
+	if (wq_index == -1) {
 		int my_thread_num = atomic_fetch_add(&num_threads, 1) + 1;
 		if (dsa_max_threads > 0 && my_thread_num > dsa_max_threads) {
 			thr_dsa_disabled = 1;
@@ -1753,10 +1747,26 @@ static __always_inline  struct dto_wq *get_wq(void* buf)
 				pthread_self(), my_thread_num, dsa_max_threads);
 			return NULL;
 		}
-                wq_index = my_thread_num % num_wqs;
-    		LOG_TRACE("Thread id %lu (tn: %d) assigned wq: %d\n", pthread_self(), my_thread_num, wq_index);
-		wq = &wqs[wq_index];
+		if (is_numa_aware) {
+			wq_index = -3;  /* DSA-enabled; pick a node-local WQ per buffer */
+		} else {
+			wq_index = my_thread_num % num_wqs;
+			LOG_TRACE("Thread id %lu (tn: %d) assigned wq: %d\n", pthread_self(), my_thread_num, wq_index);
+			return &wqs[wq_index];
+		}
 	}
+
+	/* wq_index == -3: NUMA-aware buffer-centric selection (per target buffer) */
+	if (is_numa_aware) {
+		const int numa_node = get_numa_node(buf);
+		if (numa_node >= 0 && numa_node < MAX_NUMA_NODES) {
+			struct dto_device* dev = devices[numa_node];
+			if (dev != NULL && dev->num_wqs > 0)
+				wq = dev->wqs[dev->next_wq++ % dev->num_wqs];
+		}
+	}
+	if (wq == NULL)
+		wq = &wqs[0];  /* fallback if NUMA lookup fails */
 
 	return wq;
 }
