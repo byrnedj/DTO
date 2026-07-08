@@ -13,6 +13,7 @@
 #include <stdarg.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <linux/limits.h>
 #include <cpuid.h>
 #include <linux/idxd.h>
 #include <x86intrin.h>
@@ -22,9 +23,13 @@
 #include <stdbool.h>
 #include <pthread.h>
 #include <dlfcn.h>
+#ifdef DTO_ACCEL_CONFIG_SUPPORT
 #include <accel-config/libaccel_config.h>
+#endif
+#ifdef DTO_NUMA_SUPPORT
 #include <numaif.h>
 #include <numa.h>
+#endif
 #include <signal.h>
 
 #define likely(x)       __builtin_expect((x), 1)
@@ -70,7 +75,9 @@ static void * (*orig_memmove)(void *dest, const void *src, size_t n);
 static int (*orig_memcmp)(const void *s1, const void *s2, size_t n);
 
 struct dto_wq {
+#ifdef DTO_ACCEL_CONFIG_SUPPORT
 	struct accfg_wq *acc_wq;
+#endif
 	char wq_path[PATH_MAX];
 	uint64_t dsa_gencap;
 	int wq_size;
@@ -80,11 +87,13 @@ struct dto_wq {
 	bool wq_mmapped;
 };
 
+#ifdef DTO_NUMA_SUPPORT
 struct dto_device {
 	struct dto_wq* wqs[MAX_WQS];
 	uint8_t num_wqs;
 	atomic_uchar next_wq;
 };
+#endif
 
 enum wait_options {
 	WAIT_BUSYPOLL = 0,
@@ -114,7 +123,9 @@ static const char * const numa_aware_names[] = {
 
 // global workqueue variables
 static struct dto_wq wqs[MAX_WQS];
+#ifdef DTO_NUMA_SUPPORT
 static struct dto_device* devices[MAX_NUMA_NODES];
+#endif
 static uint8_t num_wqs;
 static atomic_uchar next_wq;
 static atomic_uchar dto_initialized;
@@ -822,6 +833,7 @@ static unsigned long long dto_get_param_ullong(int dir_fd, char *path, int *err)
 	return val;
 }
 
+#ifdef DTO_NUMA_SUPPORT
 static struct dto_device* get_dto_device(int dev_numa_node) {
 	struct dto_device* dev = NULL;
 
@@ -845,7 +857,9 @@ static void correct_devices_list() {
 		}
 	}
 }
+#endif
 
+#ifdef DTO_NUMA_SUPPORT
 static __always_inline  int get_numa_node(void* buf) {
 	int numa_node = -1;
 
@@ -886,7 +900,9 @@ static __always_inline  int get_numa_node(void* buf) {
 
         return numa_node;
 }
+#endif
 
+#ifdef DTO_NUMA_SUPPORT
 static void cleanup_devices() {
 	struct dto_device* dev = NULL;
 	for (uint i = 0; i < MAX_NUMA_NODES; i++) {
@@ -897,6 +913,7 @@ static void cleanup_devices() {
 		devices[i] = NULL;
 	}
 }
+#endif
 
 static bool test_write_syscall(struct dto_wq *wq)
 {
@@ -956,11 +973,13 @@ static int dsa_init_from_wq_list(char *wq_list)
 			goto fail_wq;
 		}
 
+#ifdef DTO_NUMA_SUPPORT
 		const int dev_numa_node = (int)dto_get_param_ullong(dir_fd, "numa_node", &rc);
 		if (rc) {
 			close(dir_fd);
 			goto fail_wq;
 		}
+#endif
 
 		close(dir_fd);
 
@@ -1029,6 +1048,7 @@ static int dsa_init_from_wq_list(char *wq_list)
 			close(wqs[num_wqs].wq_fd);
 		}
 
+#ifdef DTO_NUMA_SUPPORT
 		if (is_numa_aware) {
 			struct dto_device* dev = get_dto_device(dev_numa_node);
 			if (dev != NULL &&
@@ -1036,6 +1056,7 @@ static int dsa_init_from_wq_list(char *wq_list)
 				dev->wqs[dev->num_wqs++] = &wqs[num_wqs];
 			}
 		}
+#endif
 
 		++num_wqs;
 		if (num_wqs == MAX_WQS)
@@ -1049,9 +1070,11 @@ static int dsa_init_from_wq_list(char *wq_list)
 		goto fail;
 	}
 
+#ifdef DTO_NUMA_SUPPORT
 	if (is_numa_aware) {
 		correct_devices_list();
 	}
+#endif
 
 	return 0;
 
@@ -1060,12 +1083,15 @@ fail_wq:
 		munmap(wqs[j].wq_portal, 0x1000);
 	num_wqs = 0;
 
+#ifdef DTO_NUMA_SUPPORT
 	cleanup_devices();
+#endif
 
 fail:
 	return rc;
 }
 
+#ifdef DTO_ACCEL_CONFIG_SUPPORT
 static int dsa_init_from_accfg(void)
 {
 	int used_devids[MAX_WQS];
@@ -1104,12 +1130,14 @@ static int dsa_init_from_accfg(void)
 		if (i != num_wqs)
 			continue;
 
+#ifdef DTO_NUMA_SUPPORT
 		struct dto_device* dev = NULL;
 
 		if (is_numa_aware) {
 			const int dev_numa_node = accfg_device_get_numa_node(device);
 			dev = get_dto_device(dev_numa_node);
 		}
+#endif
 
 		accfg_wq_foreach(device, wq) {
 			enum accfg_wq_state wstate;
@@ -1139,11 +1167,13 @@ static int dsa_init_from_accfg(void)
 
 			used_devids[num_wqs] = accfg_device_get_id(device);
 
+#ifdef DTO_NUMA_SUPPORT
 			if (is_numa_aware &&
 				dev != NULL &&
 				dev->num_wqs < MAX_WQS) {
 				dev->wqs[dev->num_wqs++] = &wqs[num_wqs];
 			}
+#endif
 
 			num_wqs++;
 		}
@@ -1195,9 +1225,11 @@ static int dsa_init_from_accfg(void)
 		}
 	}
 
+#ifdef DTO_NUMA_SUPPORT
 	if (is_numa_aware) {
 		correct_devices_list();
 	}
+#endif
 
 	accfg_unref(dto_ctx);
 	return 0;
@@ -1207,11 +1239,14 @@ fail_wq:
 		munmap(wqs[j].wq_portal, 0x1000);
 	num_wqs = 0;
 
+#ifdef DTO_NUMA_SUPPORT
 	cleanup_devices();
+#endif
 fail:
 	accfg_unref(dto_ctx);
 	return rc;
 }
+#endif /* DTO_ACCEL_CONFIG_SUPPORT */
 
 static int dsa_init(void)
 {
@@ -1255,8 +1290,15 @@ static int dsa_init(void)
 	}
 
 	env_str = getenv("DTO_WQ_LIST");
-	if (env_str == NULL)
+	if (env_str == NULL) {
+#ifdef DTO_ACCEL_CONFIG_SUPPORT
 		return dsa_init_from_accfg();
+#else
+		LOG_ERROR("DTO_WQ_LIST environment variable must be set when accel-config support is disabled.\n");
+		LOG_ERROR("Example: export DTO_WQ_LIST=\"wq0.0;wq1.0\"\n");
+		return -EINVAL;
+#endif
+	}
 
 	strncpy(wq_list, env_str, sizeof(wq_list) - 1);
 	/* ensure wq_list is null terminated */
@@ -1470,6 +1512,7 @@ static int init_dto(void)
 				auto_adjust_knobs = !!auto_adjust_knobs;
 			}
 
+#ifdef DTO_NUMA_SUPPORT
 			if (numa_available() != -1) {
 				env_str = getenv("DTO_IS_NUMA_AWARE");
 				if (env_str != NULL) {
@@ -1480,6 +1523,7 @@ static int init_dto(void)
 					}
 				}
 			}
+#endif
 
 			env_str = getenv("DTO_UMWAIT_DELAY");
 
@@ -1554,13 +1598,16 @@ static void cleanup_dto(void)
 		stats_fd = -1;
 	}
 
+#ifdef DTO_NUMA_SUPPORT
 	cleanup_devices();
+#endif
 }
 
 static __always_inline  struct dto_wq *get_wq(void* buf)
 {
 	struct dto_wq* wq = NULL;
 
+#ifdef DTO_NUMA_SUPPORT
 	if (is_numa_aware) {
 		int status[1] = {-1};
 
@@ -1574,6 +1621,7 @@ static __always_inline  struct dto_wq *get_wq(void* buf)
 			}
 		}
 	}
+#endif
 
 	if (wq == NULL) {
 		wq = &wqs[next_wq++ % num_wqs];
