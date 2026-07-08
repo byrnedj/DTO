@@ -36,6 +36,18 @@
 // DSA capabilities
 #define GENCAP_CC_MEMORY  0x4
 
+/* DSA CRC Generation / Copy with CRC use the RFC3720 convention by default:
+ * the seed and the output CRC are inverted (and reflected into the device's
+ * internal bit order) by the hardware. crc32c_hw() computes the raw
+ * (reflected-domain, no inversion) CRC32C, i.e.:
+ *
+ *     crc_val = ~crc32c_hw_with_seed(data, ~crc_seed)
+ *
+ * To make the device return exactly crc32c_hw(data) (seed 0), submit with
+ * crc_seed = 0xFFFFFFFF and invert the returned crc_val. */
+#define DSA_CRC_SEED_FOR_RAW 0xFFFFFFFFu
+#define DSA_CRC_VAL_TO_RAW(v) ((uint32_t)~(uint32_t)(v))
+
 #define UMWAIT_DELAY_DEFAULT 100000
 
 #define C01_STATE 1
@@ -2077,16 +2089,17 @@ __attribute__((visibility("default"))) uint64_t dto_crc(const void *src, size_t 
 #endif
 
 	thr_desc.opcode = DSA_OPCODE_CRCGEN;
+	/* Note: IDXD_OP_FLAG_CC must NOT be set for CRC Generation; the
+	 * operation has no destination and the device fails the descriptor
+	 * with DSA_COMP_INVALID_FLAGS (0x11). */
 	thr_desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR | IDXD_OP_FLAG_BOF;
-	if (dto_dsa_cc && (wq->dsa_gencap & GENCAP_CC_MEMORY))
-		thr_desc.flags |= IDXD_OP_FLAG_CC;
 	thr_desc.completion_addr = (uint64_t)&thr_comp;
 
 	thr_bytes_completed = 0;
 	thr_desc.src_addr = (uint64_t) src;
         thr_desc.dst_addr = 0; // dst_addr is not used for CRC generation
 	thr_desc.xfer_size = (uint32_t) dsa_size;
-        thr_desc.crc_seed = 0; // default seed valuie
+        thr_desc.crc_seed = DSA_CRC_SEED_FOR_RAW;
         thr_desc.rsvd = 0;
 	thr_comp.status = 0;
 	result = dsa_submit(wq, &thr_desc);
@@ -2096,13 +2109,17 @@ __attribute__((visibility("default"))) uint64_t dto_crc(const void *src, size_t 
                 }
 		result = dsa_wait(wq, &thr_desc, &thr_comp.status);
 	}
+	/* crc_seed overlays a reserved-must-be-zero field for non-CRC opcodes
+	 * that share this thread-local descriptor; leaving it set would fail
+	 * subsequent ops with DSA_COMP_NOZERO_RESERVE (0x12). */
+	thr_desc.crc_seed = 0;
 #ifdef DTO_STATS_SUPPORT
 	DTO_COLLECT_STATS_DSA_END(collect_stats, st, et, MEMCOPY_ASYNC, n, thr_bytes_completed, result);
 #endif
         if (thr_bytes_completed < n) {
             return 0;
         }
-        return thr_comp.crc_val;
+        return DSA_CRC_VAL_TO_RAW(thr_comp.crc_val);
 }
 
 __attribute__((visibility("default"))) uint64_t dto_memcpy_crc_async(void *dest, const void *src, size_t n, callback_t cb, void* args) {
@@ -2129,6 +2146,8 @@ __attribute__((visibility("default"))) uint64_t dto_memcpy_crc_async(void *dest,
 #endif
 
 	thr_desc.opcode = DSA_OPCODE_COPY_CRC;
+	/* See dto_crc for the CRC seed/result convention. CC is valid here
+	 * (the operation writes to dest), unlike for CRC Generation. */
 	thr_desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR | IDXD_OP_FLAG_BOF;
 	if (dto_dsa_cc && (wq->dsa_gencap & GENCAP_CC_MEMORY))
 		thr_desc.flags |= IDXD_OP_FLAG_CC;
@@ -2138,7 +2157,7 @@ __attribute__((visibility("default"))) uint64_t dto_memcpy_crc_async(void *dest,
 	thr_desc.src_addr = (uint64_t) src;
 	thr_desc.dst_addr = (uint64_t) dest;
 	thr_desc.xfer_size = (uint32_t) dsa_size;
-        thr_desc.crc_seed = 0; // default seed valuie
+        thr_desc.crc_seed = DSA_CRC_SEED_FOR_RAW;
         thr_desc.rsvd = 0;
 	thr_comp.status = 0;
 	result = dsa_submit(wq, &thr_desc);
@@ -2148,13 +2167,15 @@ __attribute__((visibility("default"))) uint64_t dto_memcpy_crc_async(void *dest,
                 }
 		result = dsa_wait(wq, &thr_desc, &thr_comp.status);
 	}
+	/* See dto_crc: reset the reserved-overlaying seed field. */
+	thr_desc.crc_seed = 0;
 #ifdef DTO_STATS_SUPPORT
 	DTO_COLLECT_STATS_DSA_END(collect_stats, st, et, MEMCOPY_ASYNC, n, thr_bytes_completed, result);
 #endif
         if (thr_bytes_completed < n) {
             return 0;
         }
-        return thr_comp.crc_val;
+        return DSA_CRC_VAL_TO_RAW(thr_comp.crc_val);
 }
 
 __attribute__((visibility("default"))) void dto_memcpy_async(void *dest, const void *src, size_t n, callback_t cb, void* args) {
