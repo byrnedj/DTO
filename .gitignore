@@ -1,3 +1,4 @@
 dto-test*
 libdto.so*
 build*/
+tests/baselines*/
