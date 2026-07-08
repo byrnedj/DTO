@@ -103,12 +103,27 @@ On Fedora/CentOS/Rhel: kernel-headers, accel-config-devel, libuuid-devel, libnum
 
 On Ubuntu/Debian: linux-libc-dev, libaccel-config-dev, uuid-dev, libnuma-dev
 
+### CMake ###
 ```bash
-make libdto
-make install
+cmake -B build
+cmake --build build -j
+sudo cmake --install build
 ```
 
-Building the test application.
+The CMake build also produces the test applications in the build directory:
+`dto-test` (for the -ldto method) and `dto-test-wodto` (for the LD_PRELOAD method).
+
+CMake installs the library to `/usr/local/lib` by default, while the deprecated
+Makefile installs to `/usr/lib64`. Pass `-DCMAKE_INSTALL_PREFIX=<prefix>` at
+configure time to change the install location.
+
+### Makefile (deprecated) ###
+```bash
+make libdto
+sudo make install
+```
+
+Building the test application with the Makefile:
 ```bash
 # When using -ldto method
 make dto-test
