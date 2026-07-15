@@ -146,6 +146,14 @@ static uint8_t use_std_lib_calls;
 static int dsa_max_threads;  /* 0 = no limit */
 static enum numa_aware is_numa_aware;
 static size_t dsa_min_size = DTO_DEFAULT_MIN_SIZE;
+/* Gate for the explicit CRC API (dto_crc, dto_memcpy_crc_async); when unset
+ * it follows dsa_min_size. See DTO_CRC_MIN_BYTES. */
+#define CRC_MIN_SIZE_UNSET ((size_t)-1)
+static size_t crc_min_size = CRC_MIN_SIZE_UNSET;
+static inline size_t crc_dsa_min_size(void)
+{
+	return crc_min_size == CRC_MIN_SIZE_UNSET ? dsa_min_size : crc_min_size;
+}
 static int wait_method = WAIT_BUSYPOLL;
 static size_t cpu_size_fraction;   // range of values is 0 to 99
 
@@ -1574,6 +1582,21 @@ static int init_dto(void)
 					dsa_min_size = DTO_DEFAULT_MIN_SIZE;
 			}
 
+			/* Separate DSA gate for the explicit CRC API (dto_crc,
+			 * dto_memcpy_crc_async). Lets applications offload
+			 * explicit CRC/copy+CRC calls while keeping transparent
+			 * memcpy/memset interposition on the CPU (e.g.
+			 * DTO_MIN_BYTES very large, DTO_CRC_MIN_BYTES small).
+			 * Defaults to dsa_min_size when unset. */
+			env_str = getenv("DTO_CRC_MIN_BYTES");
+
+			if (env_str != NULL) {
+				errno = 0;
+				crc_min_size = strtoul(env_str, NULL, 10);
+				if (errno)
+					crc_min_size = CRC_MIN_SIZE_UNSET;
+			}
+
 			double cpu_size_fraction_float = 0.0;
 			env_str = getenv("DTO_CPU_SIZE_FRACTION");
 
@@ -2069,7 +2092,7 @@ static bool is_overlapping_buffers (void *dest, const void *src, size_t n)
 
 __attribute__((visibility("default"))) uint64_t dto_crc(const void *src, size_t n, callback_t cb, void* args) {
 	//submit dsa work if successful, call the callback
-        if (use_std_lib_calls || thr_dsa_disabled || n < dsa_min_size) {
+        if (use_std_lib_calls || thr_dsa_disabled || n < crc_dsa_min_size()) {
                 if (cb) {
 		    cb(args);
                 }
@@ -2124,7 +2147,7 @@ __attribute__((visibility("default"))) uint64_t dto_crc(const void *src, size_t 
 
 __attribute__((visibility("default"))) uint64_t dto_memcpy_crc_async(void *dest, const void *src, size_t n, callback_t cb, void* args) {
 	//submit dsa work if successful, call the callback
-        if (use_std_lib_calls || thr_dsa_disabled || n < dsa_min_size) {
+        if (use_std_lib_calls || thr_dsa_disabled || n < crc_dsa_min_size()) {
                 if (cb) {
 		    cb(args);
                 }
@@ -2176,6 +2199,97 @@ __attribute__((visibility("default"))) uint64_t dto_memcpy_crc_async(void *dest,
             return 0;
         }
         return DSA_CRC_VAL_TO_RAW(thr_comp.crc_val);
+}
+
+/* ---- True-async CRC / Copy+CRC implementation (see dto.h) ---- */
+
+struct dto_async_op_impl {
+	struct dsa_hw_desc desc;	/* 64 bytes, 64-aligned via dto_async_op */
+	struct dsa_completion_record comp __attribute__((aligned(32)));
+};
+_Static_assert(sizeof(struct dto_async_op_impl) <= sizeof(dto_async_op),
+	       "dto_async_op opaque storage too small");
+_Static_assert(sizeof(struct dsa_hw_desc) == 64, "unexpected descriptor size");
+
+static int dto_submit_async_common(dto_async_op *op, uint32_t opcode,
+				   void *dest, const void *src, size_t n,
+				   int cache_control)
+{
+	struct dto_async_op_impl *impl = (struct dto_async_op_impl *)op;
+	struct dto_wq *wq;
+
+	if (n == 0 || n > UINT32_MAX)
+		return DTO_ASYNC_FALLBACK;
+	if (use_std_lib_calls || thr_dsa_disabled || n < crc_dsa_min_size())
+		return DTO_ASYNC_FALLBACK;
+	wq = get_wq(dest ? dest : (void *)src);
+	if (unlikely(wq == NULL))
+		return DTO_ASYNC_FALLBACK;
+
+	memset(&impl->desc, 0, sizeof(impl->desc));
+	impl->desc.opcode = opcode;
+	impl->desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR |
+		IDXD_OP_FLAG_BOF;
+	/* CC is only legal for operations with a destination; CRC Generation
+	 * would be failed by the device with DSA_COMP_INVALID_FLAGS. */
+	if (cache_control && dest && (wq->dsa_gencap & GENCAP_CC_MEMORY))
+		impl->desc.flags |= IDXD_OP_FLAG_CC;
+	impl->desc.completion_addr = (uint64_t)&impl->comp;
+	impl->desc.src_addr = (uint64_t)src;
+	impl->desc.dst_addr = (uint64_t)dest;
+	impl->desc.xfer_size = (uint32_t)n;
+	impl->desc.crc_seed = DSA_CRC_SEED_FOR_RAW;
+	impl->comp.status = 0;
+
+	/* ENQCMD to a shared WQ can transiently fail when the queue is full;
+	 * retry briefly before giving up so momentary bursts don't push work
+	 * back onto the CPU. */
+	for (int attempt = 0; ; attempt++) {
+		int rc = dsa_submit(wq, &impl->desc);
+		if (rc == SUCCESS)
+			return DTO_ASYNC_SUBMITTED;
+		if (rc != RETRY || attempt >= 16)
+			return DTO_ASYNC_FALLBACK;
+		_mm_pause();
+	}
+}
+
+__attribute__((visibility("default")))
+int dto_submit_memcpy_crc(dto_async_op *op, void *dest, const void *src,
+			  size_t n, int cache_control)
+{
+	return dto_submit_async_common(op, DSA_OPCODE_COPY_CRC, dest, src, n,
+				       cache_control);
+}
+
+__attribute__((visibility("default")))
+int dto_submit_crc(dto_async_op *op, const void *src, size_t n)
+{
+	return dto_submit_async_common(op, DSA_OPCODE_CRCGEN, NULL, src, n, 0);
+}
+
+__attribute__((visibility("default")))
+int dto_async_poll(dto_async_op *op)
+{
+	struct dto_async_op_impl *impl = (struct dto_async_op_impl *)op;
+	uint8_t status = __atomic_load_n((uint8_t *)&impl->comp.status,
+					 __ATOMIC_ACQUIRE);
+
+	if (status == 0)
+		return DTO_ASYNC_PENDING;
+	if (likely(status == DSA_COMP_SUCCESS))
+		return DTO_ASYNC_DONE;
+	LOG_ERROR("async crc op failed status %x xfersz %x\n", status,
+		  impl->desc.xfer_size);
+	return DTO_ASYNC_FAILED;
+}
+
+__attribute__((visibility("default")))
+uint64_t dto_async_crc_val(const dto_async_op *op)
+{
+	const struct dto_async_op_impl *impl =
+		(const struct dto_async_op_impl *)op;
+	return DSA_CRC_VAL_TO_RAW(impl->comp.crc_val);
 }
 
 __attribute__((visibility("default"))) void dto_memcpy_async(void *dest, const void *src, size_t n, callback_t cb, void* args) {

@@ -11,6 +11,54 @@ typedef void(*callback_t)(void*);
 void dto_memcpy_async(void *dest, const void *src, size_t n, callback_t cb, void* args);
 uint64_t dto_memcpy_crc_async(void *dest, const void *src, size_t n, callback_t cb, void* args);
 uint64_t dto_crc(const void *src, size_t n, callback_t cb, void* args);
+
+/* ---- True-async CRC / Copy+CRC API ----
+ *
+ * Unlike dto_memcpy_crc_async/dto_crc (which submit, run the callback once,
+ * then BLOCK until completion), these return immediately after enqueueing
+ * the descriptor and the caller polls for completion. The operation state is
+ * caller-allocated so it can outlive the submitting call and be polled from
+ * a different thread; nothing is stored in thread-local state.
+ *
+ * Lifecycle:
+ *   dto_async_op op;
+ *   if (dto_submit_memcpy_crc(&op, dst, src, n, 1) == DTO_ASYNC_SUBMITTED) {
+ *       ... other CPU work ...
+ *       while (dto_async_poll(&op) == DTO_ASYNC_PENDING) { pause/yield; }
+ *       if (dto_async_poll(&op) == DTO_ASYNC_DONE)
+ *           crc = dto_async_crc_val(&op);
+ *       else { memcpy(dst, src, n); crc = <software crc32c>; }
+ *   } else {  // DTO_ASYNC_FALLBACK: nothing was submitted or copied
+ *       memcpy(dst, src, n); crc = <software crc32c>;
+ *   }
+ *
+ * Submission falls back (DTO_ASYNC_FALLBACK) when DSA is unavailable, the
+ * size is below the DTO_CRC_MIN_BYTES/DTO_MIN_BYTES gate, or enqueue fails.
+ * On DTO_ASYNC_FAILED the destination contents are unspecified; redo the
+ * whole operation on the CPU. CRC values match crc32c_hw (raw CRC32C,
+ * seed 0), same as the synchronous API.
+ *
+ * @cache_control: nonzero directs the copy output toward the CPU cache
+ * (IDXD_OP_FLAG_CC) when the device supports it, for destinations that will
+ * be read again soon. Only meaningful for dto_submit_memcpy_crc; CRC
+ * generation has no destination (CC would be rejected by the device).
+ */
+typedef struct dto_async_op {
+	unsigned char opaque[192] __attribute__((aligned(64)));
+} dto_async_op;
+
+#define DTO_ASYNC_SUBMITTED 0
+#define DTO_ASYNC_FALLBACK (-1)
+
+#define DTO_ASYNC_PENDING 0
+#define DTO_ASYNC_DONE 1
+#define DTO_ASYNC_FAILED (-1)
+
+int dto_submit_memcpy_crc(dto_async_op *op, void *dest, const void *src,
+			  size_t n, int cache_control);
+int dto_submit_crc(dto_async_op *op, const void *src, size_t n);
+int dto_async_poll(dto_async_op *op);
+uint64_t dto_async_crc_val(const dto_async_op *op);
 void dto_memset_pages(void *start_addr, void *end_addr, size_t page_size);
 
 /* Batch copy using DSA batch descriptor.
