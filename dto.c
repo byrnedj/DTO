@@ -23,6 +23,8 @@
 #include <accel-config/libaccel_config.h>
 #include <numaif.h>
 #include <numa.h>
+#include <setjmp.h>
+#include <signal.h>
 
 #define likely(x)       __builtin_expect((x), 1)
 #define unlikely(x)     __builtin_expect((x), 0)
@@ -1649,6 +1651,82 @@ static bool test_write_syscall(struct dto_wq *wq)
 	return false;
 }
 
+static sigjmp_buf probe_jmp;
+
+static void probe_sig_handler(int sig)
+{
+	siglongjmp(probe_jmp, sig);
+}
+
+/* Verify work can actually be submitted through each mmap'd portal before
+ * declaring DSA usable. ENQCMD raises #GP (delivered as SIGSEGV) when the
+ * process has no PASID bound to its mm, e.g. when WQs are dedicated mode
+ * or the platform lacks scalable-mode IOMMU/SVA. Without this probe, the
+ * fault would kill the host application on its first offloaded call.
+ */
+static int dsa_probe_wqs(void)
+{
+	struct sigaction sa = { .sa_handler = probe_sig_handler };
+	struct sigaction old_segv, old_ill, old_bus;
+	struct dsa_completion_record comp __attribute__((aligned(32)));
+	volatile uint8_t *status = &comp.status;
+	struct dsa_hw_desc desc = {0};
+	int sig, rc = 0;
+
+	desc.opcode = DSA_OPCODE_NOOP;
+	desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
+	desc.completion_addr = (unsigned long)&comp;
+
+	sigemptyset(&sa.sa_mask);
+	sigaction(SIGSEGV, &sa, &old_segv);
+	sigaction(SIGILL, &sa, &old_ill);
+	sigaction(SIGBUS, &sa, &old_bus);
+
+	for (int i = 0; i < num_wqs; i++) {
+		int submit, retry = 0;
+
+		if (!wqs[i].wq_mmapped)
+			continue;	/* write() path already validated */
+
+		if ((sig = sigsetjmp(probe_jmp, 1))) {
+			LOG_ERROR("DSA submission to %s faulted (signal %d). "
+				"Check WQ mode is shared and PASID/SVA is enabled.\n",
+				wqs[i].wq_path, sig);
+			rc = -EFAULT;
+			break;
+		}
+
+		*status = 0;
+		do {
+			submit = dsa_submit(&wqs[i], &desc);
+		} while (submit == RETRY && retry++ < 10000);
+
+		if (submit != SUCCESS) {
+			LOG_ERROR("DSA probe submission to %s failed (%d)\n",
+				wqs[i].wq_path, submit);
+			rc = -EIO;
+			break;
+		}
+
+		retry = 0;
+		while (*status == 0 && retry++ < 1000000)
+			_mm_pause();
+
+		if (*status != DSA_COMP_SUCCESS) {
+			LOG_ERROR("DSA probe on %s completion status %x\n",
+				wqs[i].wq_path, *status);
+			rc = -EIO;
+			break;
+		}
+	}
+
+	sigaction(SIGSEGV, &old_segv, NULL);
+	sigaction(SIGILL, &old_ill, NULL);
+	sigaction(SIGBUS, &old_bus, NULL);
+
+	return rc;
+}
+
 static int dsa_init_from_wq_list(char *wq_list)
 {
 	char *wq;
@@ -2230,6 +2308,20 @@ static int init_dto(void)
 
 			if (dsa_init()) {
 				LOG_ERROR("Didn't find any usable DSAs. Falling back to using CPUs.\n");
+				use_std_lib_calls = 1;
+			} else if (dsa_probe_wqs()) {
+				LOG_ERROR("DSA WQs are not usable from this process. "
+					"Falling back to using CPUs.\n");
+				for (int i = 0; i < num_wqs; i++) {
+					if (wqs[i].wq_mmapped) {
+						munmap(wqs[i].wq_portal, 0x1000);
+						wqs[i].wq_mmapped = false;
+					} else {
+						close(wqs[i].wq_fd);
+					}
+				}
+				num_wqs = 0;
+				cleanup_devices();
 				use_std_lib_calls = 1;
 			}
 
