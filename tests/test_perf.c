@@ -33,6 +33,7 @@
 #include "dto_test_utils.h"
 
 #include <stdint.h>
+#include <unistd.h>
 #include <sched.h>
 #include <dlfcn.h>
 #include <sys/mman.h>
@@ -350,7 +351,9 @@ struct dto_config {
 };
 
 static struct dto_config dto_configs[] = {
-	{"cpu",      1, {{NULL, NULL}}},
+	/* DTO_USESTDC_CALLS=1 keeps DTO's constructor from binding the DSA
+	 * WQs in children that never submit to DSA. */
+	{"cpu",      1, {{"DTO_USESTDC_CALLS", "1"}, {NULL, NULL}}},
 	{"stdc",     0, {{"DTO_USESTDC_CALLS", "1"}, {NULL, NULL}}},
 	{"dsa",      0, {{"DTO_CPU_SIZE_FRACTION", "0"},
 			  {"DTO_AUTO_ADJUST_KNOBS", "0"},
@@ -362,7 +365,10 @@ static struct dto_config dto_configs[] = {
 #define NUM_DTO_CONFIGS (sizeof(dto_configs) / sizeof(dto_configs[0]))
 #define CPU_CONFIG_IDX 0
 
-/* Page size configs */
+/* Page size configs. hugepage is the MAP_HUGE_* shift backing the buffer
+ * mappings: 0 = base 4KB pages, 21 = 2MB hugetlb, 30 = 1GB hugetlb (1GB
+ * pages must be reserved via hugepages-1048576kB/nr_hugepages; cells whose
+ * buffers cannot be allocated are reported as failed/skipped). */
 struct page_config {
 	const char *label;
 	int hugepage;
@@ -370,7 +376,8 @@ struct page_config {
 
 static struct page_config page_configs[] = {
 	{"4k",  0},
-	{"2m",  1},
+	{"2m",  21},
+	{"1g",  30},
 };
 #define NUM_PAGE_CONFIGS (sizeof(page_configs) / sizeof(page_configs[0]))
 
@@ -401,7 +408,7 @@ static uint64_t *get_cur_samples(struct shared_result *slot)
 static size_t buf_alloc_size(size_t size, int hugepage)
 {
 	if (hugepage)
-		return (size + (2 << 20) - 1) & ~((2 << 20) - 1UL);
+		return (size + (1UL << hugepage) - 1) & ~((1UL << hugepage) - 1);
 	return size;
 }
 
@@ -411,7 +418,7 @@ static void *alloc_shared_buffer(size_t size, int hugepage)
 	size_t alloc = buf_alloc_size(size, hugepage);
 
 	if (hugepage)
-		flags |= MAP_HUGETLB | (21 << MAP_HUGE_SHIFT);
+		flags |= MAP_HUGETLB | (hugepage << MAP_HUGE_SHIFT);
 
 	void *p = mmap(NULL, alloc, PROT_READ | PROT_WRITE, flags, -1, 0);
 
@@ -626,7 +633,8 @@ static void child_run_ab(struct perf_test *test,
 	 * num_pages is derived from the rounded-up allocation size so a buffer
 	 * smaller than one huge page still yields one droppable page.
 	 */
-	size_t page_size = hugepage ? (2UL << 20) : (size_t)sysconf(_SC_PAGESIZE);
+	size_t page_size = hugepage ? (1UL << hugepage)
+				    : (size_t)sysconf(_SC_PAGESIZE);
 	size_t num_pages = buf_alloc_size(test->size, hugepage) / page_size;
 	uintptr_t dst_base = (uintptr_t)dst & ~(page_size - 1);
 
@@ -732,6 +740,15 @@ static int fork_ab(struct perf_test *test, struct shared_result *slot,
 
 	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
 		return -1;
+
+	/* The kernel releases the child's idxd user context (and its PASID's
+	 * xarray entry) via deferred fput after the child is reaped. Give
+	 * that a moment to drain, or the next fork can be assigned the
+	 * recycled PASID while the stale entry is still present, triggering
+	 * "PASID entry already exist in xarray" / "xarray cmpxchg failed"
+	 * warnings in dmesg. Runs between measurements, not inside them. */
+	usleep(20000);
+
 	return slot->ok ? 0 : -1;
 }
 
@@ -999,7 +1016,8 @@ int main(void)
 		printf("\n  ==============================="
 		       "=======================================\n");
 		printf("  A/B Results — %s pages\n",
-		       page_configs[p].hugepage ? "2MB" : "4KB");
+		       page_configs[p].hugepage == 30   ? "1GB"
+		       : page_configs[p].hugepage ? "2MB" : "4KB");
 		printf("  ==============================="
 		       "=======================================\n");
 		printf("  %-13s %-9s %-9s   %-9s %-8s %-5s   %-7s   %s\n",
@@ -1066,7 +1084,8 @@ int main(void)
 
 	for (int p = 0; p < (int)NUM_PAGE_CONFIGS; p++) {
 		printf("\n  %s pages:\n",
-		       page_configs[p].hugepage ? "2MB" : "4KB");
+		       page_configs[p].hugepage == 30   ? "1GB"
+		       : page_configs[p].hugepage ? "2MB" : "4KB");
 		printf("  %-14s", "Test");
 		for (int c = 1; c < (int)NUM_DTO_CONFIGS; c++)
 			printf("  %10s", dto_configs[c].label);

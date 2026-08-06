@@ -10,6 +10,18 @@ sudo ./accelConfig.sh 0 yes 0   # Example: 1 work queue, DSA0 enabled
 
 # Allocate hugepages for 2MB page tests
 sudo sh -c 'echo 128 > /proc/sys/vm/nr_hugepages'
+
+# NOTE: while the perf test runs, dmesg will show benign idxd warnings
+#   "PASID entry already exist in xarray." / "xarray cmpxchg failed for pasid N"
+# The A/B binary contains BOTH the baseline and current DTO runtimes; each
+# opens the DSA WQs in the same process, and the kernel tracks only one user
+# context per (WQ, PASID). Submissions are unaffected; only fault-path
+# completion-record bookkeeping for the second context is skipped.
+
+# Allocate 1GB hugepages for the 1GB page tests (perf test src+dst buffers
+# round up to one 1GB page each; 4 leaves slack). Reserve early after boot,
+# before memory fragments.
+sudo sh -c 'echo 4 > /sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages'
 ```
 
 ## Build
@@ -272,7 +284,7 @@ Four DTO configurations isolate different code paths:
 | `dsa`      | Pure DSA through DTO (`CSF=0`, no auto-tuning)           |
 | `dsa_auto` | DSA with runtime auto-tuning (`CSF=0` start, `DTO_AUTO_ADJUST_KNOBS=1`) |
 
-Each config is tested with both **4KB pages** and **2MB hugepages**.
+Each config is tested with **4KB pages**, **2MB hugepages**, and **1GB hugepages** (1GB cells are skipped if no 1GB pages are reserved).
 
 DSA-enabled modes set `DTO_MIN_BYTES=4096` so DSA is exercised for all buffer
 sizes in the benchmark.

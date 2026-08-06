@@ -426,6 +426,25 @@ static void child (void)
 	dto_initialized = 0;
 	log_fd = -1;
 
+	/* Close the WQ fds and portal mappings inherited from the parent:
+	 * init_dto() below opens fresh ones for this process. Leaving the
+	 * inherited fds open leaks them and keeps the parent's per-PASID
+	 * user context alive in the idxd driver past the parent's exit,
+	 * which races with PASID reuse and produces
+	 * "PASID entry already exist in xarray" / "xarray cmpxchg failed"
+	 * kernel warnings under rapid fork/exit cycles. */
+	for (int i = 0; i < num_wqs; i++) {
+		if (wqs[i].wq_mmapped) {
+			munmap(wqs[i].wq_portal, 0x1000);
+			wqs[i].wq_mmapped = false;
+		}
+		if (wqs[i].wq_fd >= 0) {
+			close(wqs[i].wq_fd);
+			wqs[i].wq_fd = -1;
+		}
+	}
+	num_wqs = 0;
+
 	init_dto();
 }
 
@@ -1019,7 +1038,8 @@ static int dsa_init_from_wq_list(char *wq_list)
 		snprintf(wqs[num_wqs].wq_path, PATH_MAX, "/dev/dsa/%s", wq);
 
 		// open DSA WQ
-		wqs[num_wqs].wq_fd = open(wqs[num_wqs].wq_path, O_RDWR);
+		wqs[num_wqs].wq_fd = open(wqs[num_wqs].wq_path,
+					  O_RDWR | O_CLOEXEC);
 		if (wqs[num_wqs].wq_fd < 0) {
 			LOG_ERROR("DSA WQ %s open error: %s\n", wqs[num_wqs].wq_path, strerror(errno));
 			rc = -errno;
@@ -1197,7 +1217,7 @@ static int dsa_init_from_accfg(void)
 		}
 
 		// open DSA WQ
-		wqs[i].wq_fd = open(wqs[i].wq_path, O_RDWR);
+		wqs[i].wq_fd = open(wqs[i].wq_path, O_RDWR | O_CLOEXEC);
 		if (wqs[i].wq_fd < 0) {
 			LOG_ERROR("DSA WQ %s open error: %s\n", wqs[i].wq_path, strerror(errno));
 			rc = -errno;
