@@ -107,6 +107,124 @@ target_link_libraries(dto-test PRIVATE DTO::dto pthread)
 add_executable(dto-test-wodto dto-test.c)
 target_link_libraries(dto-test-wodto PRIVATE pthread)
 
+# ---- Test Suite ----
+option(DTO_BUILD_TESTS "Build the DTO test suite" ON)
+
+if(DTO_BUILD_TESTS)
+    enable_testing()
+
+    # Functional correctness tests (safe to run in CI without DSA hardware)
+    add_executable(dto-test-functional tests/test_functional.c)
+    target_link_libraries(dto-test-functional PRIVATE DTO::dto pthread)
+
+    add_test(NAME functional COMMAND dto-test-functional)
+    set_tests_properties(functional PROPERTIES
+        LABELS "functional"
+        TIMEOUT 120
+    )
+
+    # ---- A/B performance regression test ----
+    # The baseline object is compiled from unguarded upstream sources that
+    # always reference accel-config and numa, so the perf test can only be
+    # built when both features are enabled. The functional test above links
+    # DTO::dto and follows the options, so it is always available.
+    if(DTO_ACCEL_CONFIG_SUPPORT AND DTO_NUMA_SUPPORT)
+        # Compile flags shared by the current and baseline perf objects so the
+        # A/B comparison uses an identical configuration. -mwaitpkg is gated on
+        # compiler support, matching the main library above.
+        set(PERF_OBJ_CFLAGS -O3 -DNDEBUG -march=native -fPIC
+            -D_GNU_SOURCE -DDTO_STATS_SUPPORT
+            -DDTO_ACCEL_CONFIG_SUPPORT -DDTO_NUMA_SUPPORT)
+        if(HAS_WAITPKG)
+            list(APPEND PERF_OBJ_CFLAGS -mwaitpkg)
+        endif()
+
+        # Build current dto.c as object file with renamed symbols (cur_memcpy, etc.)
+        set(PERF_BASELINE_DIR "${CMAKE_BINARY_DIR}/perf_baseline")
+
+        add_custom_command(
+            OUTPUT ${CMAKE_BINARY_DIR}/dto_current.o
+            COMMAND ${CMAKE_C_COMPILER} -c ${PERF_OBJ_CFLAGS}
+                    ${CMAKE_SOURCE_DIR}/dto.c
+                    -o ${CMAKE_BINARY_DIR}/dto_current_raw.o
+            COMMAND objcopy --redefine-sym memcpy=cur_memcpy
+                            --redefine-sym memset=cur_memset
+                            --redefine-sym memcmp=cur_memcmp
+                            --redefine-sym memmove=cur_memmove
+                            ${CMAKE_BINARY_DIR}/dto_current_raw.o
+                            ${CMAKE_BINARY_DIR}/dto_current.o
+            DEPENDS ${CMAKE_SOURCE_DIR}/dto.c
+            COMMENT "Building dto_current.o with renamed symbols"
+        )
+
+        # Build baseline dto.o from baseline branch (cached by SHA). The same
+        # PERF_OBJ_CFLAGS are forwarded so the baseline matches the current object.
+        # A custom target (not a custom command) so the script runs on every
+        # build: its SHA check against upstream decides whether the cached
+        # object is still fresh, and a custom command would never re-run once
+        # the object exists.
+        add_custom_target(dto_baseline_build
+            COMMAND bash ${CMAKE_SOURCE_DIR}/tests/build_baseline.sh
+                    ${CMAKE_SOURCE_DIR} ${PERF_BASELINE_DIR} ${CMAKE_C_COMPILER}
+                    ${PERF_OBJ_CFLAGS}
+            BYPRODUCTS ${PERF_BASELINE_DIR}/dto_baseline.o
+            COMMENT "Building dto_baseline.o from baseline branch"
+        )
+
+        add_executable(dto-test-perf
+            tests/test_perf.c
+            ${CMAKE_BINARY_DIR}/dto_current.o
+            ${PERF_BASELINE_DIR}/dto_baseline.o
+        )
+        add_dependencies(dto-test-perf dto_baseline_build)
+        target_link_libraries(dto-test-perf PRIVATE m dl pthread accel-config numa)
+
+        # Common env vars for perf tests
+        # Pin core and uncore frequency to 2000 MHz by default; override with
+        # -DPERF_CORE_FREQ_MHZ=... and/or -DPERF_UNCORE_FREQ_MHZ=...
+        if(NOT DEFINED PERF_CORE_FREQ_MHZ)
+            set(PERF_CORE_FREQ_MHZ 2000)
+        endif()
+        if(NOT DEFINED PERF_UNCORE_FREQ_MHZ)
+            set(PERF_UNCORE_FREQ_MHZ 2000)
+        endif()
+
+        set(PERF_COMMON_ENV
+            "PERF_CORE_FREQ_MHZ=${PERF_CORE_FREQ_MHZ}"
+            "PERF_UNCORE_FREQ_MHZ=${PERF_UNCORE_FREQ_MHZ}"
+        )
+
+        # Both tests pin CPU 1 with SCHED_FIFO and pin core/uncore frequency,
+        # so they must never run concurrently (RUN_SERIAL). Each gets its own
+        # RESULTS_DIR because every run deletes and rewrites distributions.csv
+        # in that directory.
+
+        # --- A/B perf test (all configs + page sizes in one run) ---
+        add_test(NAME perf COMMAND dto-test-perf)
+        set_tests_properties(perf PROPERTIES
+            LABELS "perf"
+            TIMEOUT 2400
+            RUN_SERIAL TRUE
+            ENVIRONMENT "RESULTS_DIR=${CMAKE_BINARY_DIR}/perf_results;${PERF_COMMON_ENV}"
+        )
+
+        # short sanity variant: memcpy 4k/64k/1m + memset 64k,
+        # few iterations. use -V to see the
+        # condensed speedup table
+        add_test(NAME sanity COMMAND dto-test-perf)
+        set_tests_properties(sanity PROPERTIES
+            LABELS "perf"
+            TIMEOUT 120
+            RUN_SERIAL TRUE
+            ENVIRONMENT "PERF_SHORT=1;RESULTS_DIR=${CMAKE_BINARY_DIR}/perf_results_sanity;${PERF_COMMON_ENV}"
+        )
+    else()
+        message(STATUS "perf test: disabled (requires DTO_ACCEL_CONFIG_SUPPORT and "
+                       "DTO_NUMA_SUPPORT; its A/B baseline is built from unguarded "
+                       "upstream sources)")
+    endif()
+endif()
+
 # Install and export the library
 install(TARGETS dto
         EXPORT DTOTargets
@@ -136,3 +254,4 @@ install(FILES
     "${CMAKE_CURRENT_BINARY_DIR}/DTOConfig.cmake"
     "${CMAKE_CURRENT_BINARY_DIR}/DTOConfigVersion.cmake"
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/DTO)
+
