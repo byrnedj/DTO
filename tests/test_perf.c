@@ -442,6 +442,10 @@ static int cmp_u64(const void *a, const void *b)
 
 static volatile int benchmark_sink;
 
+/* Iterations per A/B round; PERF_ITERS (capped at DEFAULT_ITERS, which
+ * sizes the shared result slot) or PERF_QUICK override the default. */
+static int perf_iters = DEFAULT_ITERS;
+
 /* ---- KS test ---- */
 
 struct ks_result {
@@ -765,7 +769,7 @@ static struct cell_result run_cell(struct perf_test *test,
 	uint64_t *all_bl, *all_cur;
 	int n_bl = 0, n_cur = 0;
 
-	iters = DEFAULT_ITERS;
+	iters = perf_iters;
 	max_total = ab_rounds * iters;
 
 	uint8_t *src = alloc_shared_buffer(test->size, pg->hugepage);
@@ -874,9 +878,29 @@ int main(void)
 	const char *effect_env = getenv("PERF_MIN_EFFECT");
 	const char *rounds_env = getenv("PERF_AB_ROUNDS");
 	int cpu = cpu_env ? atoi(cpu_env) : DEFAULT_CPU;
-	double min_effect = effect_env ? atof(effect_env) : 2.0;
-	int ab_rounds = rounds_env ? atoi(rounds_env) : 3;
+	/* PERF_QUICK=1: a fast sanity pass — memcpy 4k/64k/1m only (no
+	 * fault-injection variants), few iterations, 2 A/B rounds — sized to
+	 * finish in well under a minute. Explicit PERF_ITERS/PERF_AB_ROUNDS/
+	 * PERF_MIN_EFFECT still take precedence. Statistical verdicts from so
+	 * few samples are indicative only. */
+	const char *quick_env = getenv("PERF_QUICK");
+	int quick = quick_env ? atoi(quick_env) : 0;
+	double min_effect = effect_env ? atof(effect_env) : (quick ? 5.0 : 2.0);
+	int ab_rounds = rounds_env ? atoi(rounds_env) : (quick ? 1 : 3);
 	int errors = 0, failures = 0;
+
+	{
+		const char *iters_env = getenv("PERF_ITERS");
+
+		if (iters_env)
+			perf_iters = atoi(iters_env);
+		else if (quick)
+			perf_iters = 100;
+		if (perf_iters < 1)
+			perf_iters = 1;
+		if (perf_iters > DEFAULT_ITERS)
+			perf_iters = DEFAULT_ITERS;
+	}
 
 	cold_cache = getenv("PERF_COLD_CACHE") ?
 		     atoi(getenv("PERF_COLD_CACHE")) : 1;
@@ -937,7 +961,9 @@ int main(void)
 	printf("Pinned CPU:    %d\n", cpu);
 	printf("TSC freq:      %.3f GHz\n", tsc_ghz);
 	print_freq_info(cpu);
-	printf("A/B rounds:    %d (interleaved, randomized order)\n", ab_rounds);
+	printf("A/B rounds:    %d (interleaved, randomized order)%s\n",
+	       ab_rounds, quick ? " [QUICK]" : "");
+	printf("Iters/round:   %d\n", perf_iters);
 	printf("Min effect:    %.1f%%\n", min_effect);
 	fflush(stdout);
 
@@ -981,6 +1007,10 @@ int main(void)
 		if (filter_op >= 0 && test->op != filter_op)
 			continue;
 		if (filter_size && test->size != filter_size)
+			continue;
+		if (quick && (test->op != OP_MEMCPY || test->pf_pct != 0 ||
+			      (test->size != 4096 && test->size != 65536 &&
+			       test->size != 1048576)))
 			continue;
 
 		for (int c = 0; c < (int)NUM_DTO_CONFIGS; c++) {

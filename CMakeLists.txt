@@ -198,6 +198,14 @@ if(DTO_BUILD_TESTS)
             TIMEOUT 2400
             ENVIRONMENT "${PERF_COMMON_ENV}"
         )
+
+        # --- quick sanity variant: memcpy 4k/64k/1m, few iterations (<60s) ---
+        add_test(NAME perf_quick COMMAND dto-test-perf)
+        set_tests_properties(perf_quick PROPERTIES
+            LABELS "perf"
+            TIMEOUT 120
+            ENVIRONMENT "PERF_QUICK=1;${PERF_COMMON_ENV}"
+        )
     else()
         message(STATUS "perf test: disabled (requires DTO_ACCEL_CONFIG_SUPPORT and "
                        "DTO_NUMA_SUPPORT; its A/B baseline is built from unguarded "
