@@ -58,8 +58,10 @@ Following environment variables control the behavior of DTO library:
 	DTO_CPU_SIZE_FRACTION=0.xx (specifies fraction of job performed by CPU, in parallel to DSA). Default is 0.00
 	DTO_AUTO_ADJUST_KNOBS=0/1 (disables/enables auto tuning of cpu_size_fraction and dsa_min_bytes parameters. 0 -- disable, 1 -- enable (default))
    DTO_IS_NUMA_AWARE=0/1/2 (disables/buffer-centric/cpu-centric numa awareness. 0 -- disable (default), 1 -- buffer-centric, 2 - cpu-centric)
+				Only available when DTO is built with NUMA support (see Build options).
 	DTO_WQ_LIST="semi-colon(;) separated list of DSA WQs to use". The WQ names should match their names in /dev/dsa/ directory (see example below).
-				If not specified, DTO will try to auto-discover and use all available WQs.
+				If not specified, DTO will try to auto-discover and use all available WQs. Auto-discovery requires DTO to be
+				built with accel-config support (see Build options); otherwise DTO_WQ_LIST is mandatory.
    DTO_DSA_MEMCPY=0/1, 1 (default) - DTO uses DSA to process memcpy, 0 - DTO uses system memcpy
    DTO_DSA_MEMMOVE=0/1, 1 (default) - DTO uses DSA to process memmove, 0 - DTO uses system memmove
    DTO_DSA_MEMSET=0/1, 1 (default) - DTO uses DSA to process memset, 0 - DTO use system memset
@@ -103,12 +105,35 @@ On Fedora/CentOS/Rhel: kernel-headers, accel-config-devel, libuuid-devel, libnum
 
 On Ubuntu/Debian: linux-libc-dev, libaccel-config-dev, uuid-dev, libnuma-dev
 
+The accel-config and numa packages are only required when the corresponding build options are enabled (they are enabled by default, see [Build options](#build-options) below).
+
 ### CMake ###
 ```bash
 cmake -B build
 cmake --build build -j
 sudo cmake --install build
 ```
+
+#### Build options ####
+
+The accel-config and libnuma dependencies are optional and can be disabled at configure time:
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `DTO_ACCEL_CONFIG_SUPPORT` | `ON` | Use libaccel-config to auto-discover configured DSA work queues. When disabled, libdto does not link against libaccel-config, and the `DTO_WQ_LIST` environment variable **must** be set at runtime (e.g., `export DTO_WQ_LIST="wq0.0;wq1.0"`) since auto-discovery is unavailable. |
+| `DTO_NUMA_SUPPORT` | `ON` | Use libnuma for NUMA-aware work queue selection. When disabled, libdto does not link against libnuma and the `DTO_IS_NUMA_AWARE` environment variable has no effect (work queues are used in round-robin order). |
+| `DTO_STATIC_ACCEL_CONFIG` | `OFF` | Statically link libaccel-config into libdto.so instead of depending on the shared library at runtime. Requires `libaccel-config.a` to be installed. |
+| `DTO_STATIC_NUMA` | `OFF` | Statically link libnuma into libdto.so instead of depending on the shared library at runtime. Requires a `libnuma.a` compiled with `-fPIC`. |
+
+Example: build without either dependency:
+```bash
+cmake -B build -DDTO_ACCEL_CONFIG_SUPPORT=OFF -DDTO_NUMA_SUPPORT=OFF
+cmake --build build -j
+```
+
+The deprecated Makefile always builds with both features enabled (it passes
+`-DDTO_ACCEL_CONFIG_SUPPORT -DDTO_NUMA_SUPPORT` to the compiler); use CMake if
+you need to build without them.
 
 The CMake build also produces the test applications in the build directory:
 `dto-test` (for the -ldto method) and `dto-test-wodto` (for the LD_PRELOAD method).
