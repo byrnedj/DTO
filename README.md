@@ -58,6 +58,10 @@ Following environment variables control the behavior of DTO library:
    DTO_IS_NUMA_AWARE=0/1/2 (disables/buffer-centric/cpu-centric numa awareness. 0 -- disable (default), 1 -- buffer-centric, 2 - cpu-centric)
 	DTO_WQ_LIST="semi-colon(;) separated list of DSA WQs to use". The WQ names should match their names in /dev/dsa/ directory (see example below).
 				If not specified, DTO will try to auto-discover and use all available WQs.
+				Both shared and dedicated mode WQs are supported. Shared WQs are submitted to with ENQCMD; dedicated WQs with MOVDIR64B.
+   DTO_DWQ_TIMEOUT_USEC=xxxx (dedicated WQs only) MOVDIR64B gives no feedback when a full WQ silently drops a descriptor, so completion waits
+				are bounded by this timeout (in microseconds) and fall back to the CPU when it expires. Default is 500000 (500ms).
+				Must be much larger than the worst-case time to drain a full WQ (values below 50000 are clamped); 0 disables the timeout.
    DTO_DSA_MEMCPY=0/1, 1 (default) - DTO uses DSA to process memcpy, 0 - DTO uses system memcpy
    DTO_DSA_MEMMOVE=0/1, 1 (default) - DTO uses DSA to process memmove, 0 - DTO uses system memmove
    DTO_DSA_MEMSET=0/1, 1 (default) - DTO uses DSA to process memset, 0 - DTO use system memset

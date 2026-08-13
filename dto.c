@@ -139,6 +139,7 @@ struct dto_wq {
 	int wq_fd;
 	void *wq_portal;
 	bool wq_mmapped;
+	bool wq_dedicated;
 };
 
 struct dto_device {
@@ -208,6 +209,21 @@ static bool dto_use_c02 = true; //C02 state is default -
 static uint64_t tpause_wait_time = TPAUSE_C02_DELAY_NS;
 
 static unsigned long dto_umwait_delay = UMWAIT_DELAY_DEFAULT;
+
+/* Dedicated WQ submission (MOVDIR64B) has no backpressure signal: a
+ * descriptor written while the WQ is full is silently dropped and its
+ * completion record is never written. Rather than tracking WQ occupancy,
+ * bound completion waits with a generous timeout and fall back to the
+ * CPU when it expires. Must be much larger than the worst-case time to
+ * drain a full WQ so an in-flight (not dropped) descriptor is never
+ * abandoned while the device may still write to the buffers: abandoning
+ * a live descriptor lets its late completion-record write race with the
+ * record's reuse by the next operation. Values below the floor are
+ * clamped for that reason. 0 disables the timeout. */
+#define DWQ_TIMEOUT_USEC_DEFAULT 500000UL
+#define DWQ_TIMEOUT_USEC_MIN 50000UL
+static unsigned long dto_dwq_timeout_usec = DWQ_TIMEOUT_USEC_DEFAULT;
+static uint64_t dwq_timeout_cycles;
 
 static uint8_t dto_overlapping_memmove_action = OVERLAPPING_CPU;
 
@@ -525,6 +541,21 @@ static __always_inline void dsa_wait_no_adjust(const volatile uint8_t *comp)
     }
 }
 
+/* Bounded wait for dedicated WQs. Returns -1 if the timeout expires with
+ * the completion record still unwritten (descriptor presumed dropped by a
+ * full WQ), 0 once the completion is observed. */
+static __always_inline int dsa_wait_dwq(const volatile uint8_t *comp)
+{
+	uint64_t deadline = _rdtsc() + dwq_timeout_cycles;
+
+	while (*comp == 0) {
+		__dsa_wait(comp);
+		if (unlikely(_rdtsc() > deadline) && *comp == 0)
+			return -1;
+	}
+	return 0;
+}
+
 /* A simple auto-tuning heuristic.
  * Goal of the Heuristic:
  *   - CPU and DSA should complete their fraction of the job roughly simultaneously.
@@ -595,13 +626,17 @@ static __always_inline void dsa_wait_and_adjust(const volatile uint8_t *comp)
 static __always_inline int dsa_wait(struct dto_wq *wq,
 	struct dsa_hw_desc *hw, volatile uint8_t *comp)
 {
+	int timed_out = 0;
+
 #ifdef DTO_STATS_SUPPORT
 	struct timespec _pst, _pet;
 	if (unlikely(collect_stats))
 		clock_gettime(CLOCK_BOOTTIME, &_pst);
 #endif
 
-	if (auto_adjust_knobs)
+	if (unlikely(wq->wq_dedicated) && dwq_timeout_cycles)
+		timed_out = dsa_wait_dwq(comp);
+	else if (auto_adjust_knobs)
 		dsa_wait_and_adjust(comp);
 	else
 		dsa_wait_no_adjust(comp);
@@ -612,6 +647,13 @@ static __always_inline int dsa_wait(struct dto_wq *wq,
 		thr_poll_ns += TS_NS(_pst, _pet);
 	}
 #endif
+
+	if (unlikely(timed_out)) {
+		LOG_ERROR("dedicated WQ %s completion timeout; descriptor "
+			"presumed dropped (WQ full). Falling back to CPU\n",
+			wq->wq_path);
+		return FAIL_OTHERS;
+	}
 
 	if (likely(*comp == DSA_COMP_SUCCESS)) {
 		thr_bytes_completed += hw->xfer_size;
@@ -638,7 +680,13 @@ static __always_inline int dsa_submit(struct dto_wq *wq,
 #endif
 
 	if (wq->wq_mmapped) {
-		ret = enqcmd(hw, wq->wq_portal);
+		/* MOVDIR64B never reports full-WQ backpressure; the bounded
+		 * completion wait catches dropped descriptors. */
+		if (unlikely(wq->wq_dedicated)) {
+			movdir64b(hw, wq->wq_portal);
+			ret = 0;
+		} else
+			ret = enqcmd(hw, wq->wq_portal);
 		if (!ret) {
 #ifdef DTO_STATS_SUPPORT
 			if (unlikely(collect_stats)) {
@@ -678,10 +726,13 @@ static __always_inline int dsa_execute(struct dto_wq *wq,
 		clock_gettime(CLOCK_BOOTTIME, &_sst);
 #endif
 
-	if (wq->wq_mmapped)
-		ret = enqcmd(hw, wq->wq_portal);
-
-	else {
+	if (wq->wq_mmapped) {
+		if (unlikely(wq->wq_dedicated)) {
+			movdir64b(hw, wq->wq_portal);
+			ret = 0;
+		} else
+			ret = enqcmd(hw, wq->wq_portal);
+	} else {
 		ret = write(wq->wq_fd, hw, sizeof(*hw));
 		if (ret != sizeof(*hw))
 			return FAIL_OTHERS;
@@ -689,6 +740,8 @@ static __always_inline int dsa_execute(struct dto_wq *wq,
 			ret = 0;
 	}
 	if (!ret) {
+		int timed_out = 0;
+
 #ifdef DTO_STATS_SUPPORT
 		struct timespec _pst, _pet;
 		if (unlikely(collect_stats)) {
@@ -697,7 +750,10 @@ static __always_inline int dsa_execute(struct dto_wq *wq,
 			clock_gettime(CLOCK_BOOTTIME, &_pst);
 		}
 #endif
-		dsa_wait_no_adjust(comp);
+		if (unlikely(wq->wq_dedicated) && dwq_timeout_cycles)
+			timed_out = dsa_wait_dwq(comp);
+		else
+			dsa_wait_no_adjust(comp);
 
 #ifdef DTO_STATS_SUPPORT
 		if (unlikely(collect_stats)) {
@@ -705,6 +761,13 @@ static __always_inline int dsa_execute(struct dto_wq *wq,
 			thr_poll_ns += TS_NS(_pst, _pet);
 		}
 #endif
+
+		if (unlikely(timed_out)) {
+			LOG_ERROR("dedicated WQ %s completion timeout; descriptor "
+				"presumed dropped (WQ full). Falling back to CPU\n",
+				wq->wq_path);
+			return FAIL_OTHERS;
+		}
 
 		if (*comp == DSA_COMP_SUCCESS) {
 			thr_bytes_completed += hw->xfer_size;
@@ -751,15 +814,20 @@ static void dto_batch_memset(struct dto_wq *wq, void *s, int c, size_t n,
 
 	int pending = BATCH_SIZE;
 	uint8_t done[BATCH_SIZE] = {0};
+	uint64_t deadline = (unlikely(wq->wq_dedicated) && dwq_timeout_cycles) ?
+		_rdtsc() + dwq_timeout_cycles : 0;
 
 	while (pending > 0) {
 		/* Check batch-level completion first */
 		uint8_t batch_status = thr_comp.status;
-		if (batch_status != 0 &&
+		if ((batch_status != 0 &&
 		    batch_status != DSA_COMP_SUCCESS &&
 		    batch_status != DSA_COMP_BATCH_FAIL &&
-		    batch_status != DSA_COMP_BATCH_PAGE_FAULT) {
-			/* Batch descriptor itself failed — CPU fallback for all pending */
+		    batch_status != DSA_COMP_BATCH_PAGE_FAULT) ||
+		    unlikely(batch_status == 0 && deadline && _rdtsc() > deadline)) {
+			/* Batch descriptor itself failed (or, on a dedicated WQ,
+			 * was dropped by a full WQ and timed out with status
+			 * still 0) — CPU fallback for all pending */
 			LOG_ERROR("batch memset failed: status 0x%x\n", batch_status);
 			for (int i = 0; i < BATCH_SIZE; i++) {
 				if (done[i])
@@ -858,15 +926,20 @@ static void dto_batch_memcpymove(struct dto_wq *wq, void *dest, const void *src,
 
 	int pending = BATCH_SIZE;
 	uint8_t done[BATCH_SIZE] = {0};
+	uint64_t deadline = (unlikely(wq->wq_dedicated) && dwq_timeout_cycles) ?
+		_rdtsc() + dwq_timeout_cycles : 0;
 
 	while (pending > 0) {
 		/* Check batch-level completion first */
 		uint8_t batch_status = thr_comp.status;
-		if (batch_status != 0 &&
+		if ((batch_status != 0 &&
 		    batch_status != DSA_COMP_SUCCESS &&
 		    batch_status != DSA_COMP_BATCH_FAIL &&
-		    batch_status != DSA_COMP_BATCH_PAGE_FAULT) {
-			/* Batch descriptor itself failed — CPU fallback for all pending */
+		    batch_status != DSA_COMP_BATCH_PAGE_FAULT) ||
+		    unlikely(batch_status == 0 && deadline && _rdtsc() > deadline)) {
+			/* Batch descriptor itself failed (or, on a dedicated WQ,
+			 * was dropped by a full WQ and timed out with status
+			 * still 0) — CPU fallback for all pending */
 			LOG_ERROR("batch memcpymove failed: status 0x%x\n", batch_status);
 			for (int i = 0; i < BATCH_SIZE; i++) {
 				if (done[i])
@@ -1659,9 +1732,11 @@ static void probe_sig_handler(int sig)
 }
 
 /* Verify work can actually be submitted through each mmap'd portal before
- * declaring DSA usable. ENQCMD raises #GP (delivered as SIGSEGV) when the
- * process has no PASID bound to its mm, e.g. when WQs are dedicated mode
- * or the platform lacks scalable-mode IOMMU/SVA. Without this probe, the
+ * declaring DSA usable. On shared WQs, ENQCMD raises #GP (delivered as
+ * SIGSEGV) when the process has no PASID bound to its mm, e.g. when the
+ * platform lacks scalable-mode IOMMU/SVA. On dedicated WQs, MOVDIR64B
+ * cannot fault, but a misconfigured WQ never writes the completion record,
+ * which the bounded status poll below catches. Without this probe, the
  * fault would kill the host application on its first offloaded call.
  */
 static int dsa_probe_wqs(void)
@@ -1793,7 +1868,15 @@ static int dsa_init_from_wq_list(char *wq_list)
 			goto fail_wq;
 		}
 
-		if (strcmp(wq_mode, "shared") != 0) {
+		if (strcmp(wq_mode, "shared") == 0)
+			wqs[num_wqs].wq_dedicated = false;
+		else if (strcmp(wq_mode, "dedicated") == 0)
+			wqs[num_wqs].wq_dedicated = true;
+		else {
+			LOG_ERROR("WQ %s has unsupported mode %s. Skipping\n",
+				wq, wq_mode);
+			close(dir_fd);
+			wq = strtok(NULL, ";");
 			continue;
 		}
 
@@ -1932,10 +2015,11 @@ static int dsa_init_from_accfg(void)
 			if (type != ACCFG_WQT_USER)
 				continue;
 
-			/* the wq mode should be shared work queue */
+			/* shared WQs use ENQCMD, dedicated WQs use MOVDIR64B */
 			mode = accfg_wq_get_mode(wq);
-			if (mode != ACCFG_WQ_SHARED)
+			if (mode != ACCFG_WQ_SHARED && mode != ACCFG_WQ_DEDICATED)
 				continue;
+			wqs[num_wqs].wq_dedicated = (mode == ACCFG_WQ_DEDICATED);
 
 			wqs[num_wqs].wq_size = accfg_wq_get_size(wq);
 			wqs[num_wqs].max_transfer_size = accfg_wq_get_max_transfer_size(wq);
@@ -2017,6 +2101,27 @@ fail_wq:
 fail:
 	accfg_unref(dto_ctx);
 	return rc;
+}
+
+/* TSC frequency in kHz, from CPUID.15H when available, otherwise measured
+ * against the OS clock. Used to convert the dedicated WQ timeout to cycles. */
+static uint64_t get_tsc_khz(void)
+{
+	unsigned int den, num, freq, empty;
+	struct timespec ts, te;
+	uint64_t c0, c1;
+
+	__get_cpuid(0x15, &den, &num, &freq, &empty);
+	if (den && num && freq)
+		return (uint64_t)freq * num / den / 1000;
+
+	clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+	c0 = _rdtsc();
+	do {
+		clock_gettime(CLOCK_MONOTONIC_RAW, &te);
+	} while (TS_NS(ts, te) < 5000000);
+	c1 = _rdtsc();
+	return (c1 - c0) * 1000000 / TS_NS(ts, te);
 }
 
 static int dsa_init(void)
@@ -2297,6 +2402,23 @@ static int init_dto(void)
 					dto_umwait_delay = UMWAIT_DELAY_DEFAULT;
 			}
 
+			/* 0 disables the dedicated WQ completion timeout */
+			env_str = getenv("DTO_DWQ_TIMEOUT_USEC");
+			if (env_str != NULL) {
+				errno = 0;
+				dto_dwq_timeout_usec = strtoul(env_str, NULL, 10);
+				if (errno)
+					dto_dwq_timeout_usec = DWQ_TIMEOUT_USEC_DEFAULT;
+				else if (dto_dwq_timeout_usec &&
+					 dto_dwq_timeout_usec < DWQ_TIMEOUT_USEC_MIN) {
+					LOG_ERROR("DTO_DWQ_TIMEOUT_USEC %lu below "
+						"minimum; using %lu\n",
+						dto_dwq_timeout_usec,
+						DWQ_TIMEOUT_USEC_MIN);
+					dto_dwq_timeout_usec = DWQ_TIMEOUT_USEC_MIN;
+				}
+			}
+
                         env_str = getenv("DTO_DSA_MAX_THREADS");
                         if (env_str != NULL) {
                                 errno = 0;
@@ -2323,6 +2445,16 @@ static int init_dto(void)
 				num_wqs = 0;
 				cleanup_devices();
 				use_std_lib_calls = 1;
+			}
+
+			for (int i = 0; i < num_wqs; i++) {
+				if (wqs[i].wq_dedicated && dto_dwq_timeout_usec) {
+					dwq_timeout_cycles = dto_dwq_timeout_usec *
+						get_tsc_khz() / 1000;
+					LOG_TRACE("dedicated WQ timeout: %lu usec (%lu cycles)\n",
+						dto_dwq_timeout_usec, dwq_timeout_cycles);
+					break;
+				}
 			}
 
                         // calculate the wait time for TPAUSE
