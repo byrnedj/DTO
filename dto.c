@@ -2930,7 +2930,11 @@ void dto_batch_copy(void **dst, void **src, size_t *sizes, int count,
 		//memset(desc, 0, sizeof(*desc));
 
 		desc->opcode = DSA_OPCODE_MEMMOVE;
-		desc->flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR | IDXD_OP_FLAG_BOF;
+		desc->flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
+		/* as for the single descriptor paths: block-on-fault only when the
+		 * work queue allows it, otherwise the descriptor is rejected */
+		if (dto_dsa_bof)
+			desc->flags |= IDXD_OP_FLAG_BOF;
 		if (dto_dsa_cc && (wq->dsa_gencap & GENCAP_CC_MEMORY)) {
 			desc->flags |= IDXD_OP_FLAG_CC;
 		}
@@ -2963,8 +2967,19 @@ void dto_batch_copy(void **dst, void **src, size_t *sizes, int count,
 
 		/* Check for batch-level failures and fallback if needed */
 		if (thr_batch_comp.status != DSA_COMP_SUCCESS) {
-			LOG_ERROR("Batch copy failed with status %x, falling back to memcpy\n",
-			          thr_batch_comp.status);
+			{
+				static int logged;
+				if (logged < 3) {
+					logged++;
+					int first = -1;
+					for (int i = 0; i < count; i++)
+						if (thr_batch_sub_comps[i].status != DSA_COMP_SUCCESS) { first = i; break; }
+					LOG_ERROR("Batch copy failed with status %x (first failed desc %d status %x size %zu), falling back to memcpy\n",
+					          thr_batch_comp.status, first,
+					          first >= 0 ? thr_batch_sub_comps[first].status : 0,
+					          first >= 0 ? sizes[first] : 0);
+				}
+			}
 			/* Check individual completions and retry failed ones */
 			for (int i = 0; i < count; i++) {
 				if (thr_batch_sub_comps[i].status != DSA_COMP_SUCCESS) {
