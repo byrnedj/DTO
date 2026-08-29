@@ -2254,6 +2254,108 @@ static int dto_submit_async_common(dto_async_op *op, uint32_t opcode,
 	}
 }
 
+struct dto_batch_op {
+	struct dsa_hw_desc desc __attribute__((aligned(64)));
+	struct dsa_completion_record comp __attribute__((aligned(32)));
+	struct dsa_hw_desc descs[DTO_BATCH_MAX] __attribute__((aligned(64)));
+	struct dsa_completion_record comps[DTO_BATCH_MAX] __attribute__((aligned(32)));
+	void *dst[DTO_BATCH_MAX];
+	void *src[DTO_BATCH_MAX];
+	size_t sizes[DTO_BATCH_MAX];
+	int count;
+};
+
+__attribute__((visibility("default")))
+dto_batch_op *dto_batch_op_new(void)
+{
+	void *p = NULL;
+	if (posix_memalign(&p, 64, sizeof(struct dto_batch_op)))
+		return NULL;
+	orig_memset(p, 0, sizeof(struct dto_batch_op));
+	return (dto_batch_op *)p;
+}
+
+__attribute__((visibility("default")))
+void dto_batch_op_free(dto_batch_op *op)
+{
+	free(op);
+}
+
+__attribute__((visibility("default")))
+int dto_submit_batch_copy(dto_batch_op *op, void **dst, void **src,
+			  size_t *sizes, int count)
+{
+	struct dto_wq *wq;
+	/* a DSA batch needs at least two descriptors */
+	if (unlikely(dto_initialized == 0 || count < 2 || count > DTO_BATCH_MAX ||
+		     thr_dsa_disabled || use_std_lib_calls))
+		return DTO_ASYNC_FALLBACK;
+	wq = get_wq(dst[0]);
+	if (unlikely(wq == NULL))
+		return DTO_ASYNC_FALLBACK;
+
+	orig_memset(op->descs, 0, sizeof(op->descs[0]) * count);
+	for (int i = 0; i < count; i++) {
+		struct dsa_hw_desc *desc = &op->descs[i];
+		if (sizes[i] == 0 || sizes[i] > wq->max_transfer_size)
+			return DTO_ASYNC_FALLBACK;
+		desc->opcode = DSA_OPCODE_MEMMOVE;
+		desc->flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
+		if (dto_dsa_bof)
+			desc->flags |= IDXD_OP_FLAG_BOF;
+		if (dto_dsa_cc && (wq->dsa_gencap & GENCAP_CC_MEMORY))
+			desc->flags |= IDXD_OP_FLAG_CC;
+		desc->src_addr = (uint64_t)src[i];
+		desc->dst_addr = (uint64_t)dst[i];
+		desc->xfer_size = (uint32_t)sizes[i];
+		desc->completion_addr = (uint64_t)&op->comps[i];
+		op->comps[i].status = 0;
+		op->dst[i] = dst[i];
+		op->src[i] = src[i];
+		op->sizes[i] = sizes[i];
+	}
+	op->count = count;
+	orig_memset(&op->desc, 0, sizeof(op->desc));
+	op->desc.opcode = DSA_OPCODE_BATCH;
+	op->desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
+	op->desc.desc_list_addr = (uint64_t)op->descs;
+	op->desc.desc_count = count;
+	op->desc.completion_addr = (uint64_t)&op->comp;
+	op->comp.status = 0;
+
+	for (int attempt = 0; ; attempt++) {
+		int rc = dsa_submit(wq, &op->desc);
+		if (rc == SUCCESS)
+			return DTO_ASYNC_SUBMITTED;
+		if (rc != RETRY || attempt >= 16)
+			return DTO_ASYNC_FALLBACK;
+		_mm_pause();
+	}
+}
+
+__attribute__((visibility("default")))
+int dto_batch_poll(dto_batch_op *op)
+{
+	uint8_t status = __atomic_load_n((uint8_t *)&op->comp.status,
+					 __ATOMIC_ACQUIRE);
+	if (status == 0)
+		return DTO_ASYNC_PENDING;
+	if (likely(status == DSA_COMP_SUCCESS))
+		return DTO_ASYNC_DONE;
+	{
+		static int logged;
+		if (logged < 3) {
+			logged++;
+			LOG_ERROR("async batch copy failed with status %x, redoing failed copies on the CPU\n", status);
+		}
+	}
+	for (int i = 0; i < op->count; i++) {
+		if (op->comps[i].status != DSA_COMP_SUCCESS)
+			orig_memcpy(op->dst[i], op->src[i], op->sizes[i]);
+	}
+	return DTO_ASYNC_DONE;
+}
+
 __attribute__((visibility("default")))
 int dto_submit_memcpy_crc(dto_async_op *op, void *dest, const void *src,
 			  size_t n, int cache_control)

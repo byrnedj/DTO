@@ -77,6 +77,21 @@ void dto_memset_pages(void *start_addr, void *end_addr, size_t page_size);
 void dto_batch_copy(void **dst, void **src, size_t *sizes, int count,
                     void (*callback)(void *), void *callback_arg);
 
+/* Asynchronous batch copy: the caller owns the op (dto_batch_op_new /
+ * dto_batch_op_free), submits up to DTO_BATCH_MAX copies as one DSA batch
+ * descriptor, and polls for completion. dto_submit_batch_copy returns
+ * DTO_ASYNC_SUBMITTED, or DTO_ASYNC_FALLBACK when nothing was submitted (and
+ * nothing copied: the caller copies on the CPU). dto_batch_poll returns
+ * DTO_ASYNC_PENDING or DTO_ASYNC_DONE; copies the accelerator failed are
+ * redone on the CPU before DONE is returned. */
+#define DTO_BATCH_MAX 64
+typedef struct dto_batch_op dto_batch_op;
+dto_batch_op *dto_batch_op_new(void);
+void dto_batch_op_free(dto_batch_op *op);
+int dto_submit_batch_copy(dto_batch_op *op, void **dst, void **src,
+			  size_t *sizes, int count);
+int dto_batch_poll(dto_batch_op *op);
+
 #ifdef __cplusplus
 }
 #endif
