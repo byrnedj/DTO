@@ -2238,7 +2238,8 @@ static int dto_submit_async_common(dto_async_op *op, uint32_t opcode,
 	impl->desc.src_addr = (uint64_t)src;
 	impl->desc.dst_addr = (uint64_t)dest;
 	impl->desc.xfer_size = (uint32_t)n;
-	impl->desc.crc_seed = DSA_CRC_SEED_FOR_RAW;
+	if (opcode == DSA_OPCODE_COPY_CRC || opcode == DSA_OPCODE_CRCGEN)
+		impl->desc.crc_seed = DSA_CRC_SEED_FOR_RAW;
 	impl->comp.status = 0;
 
 	/* ENQCMD to a shared WQ can transiently fail when the queue is full;
@@ -2361,6 +2362,14 @@ int dto_submit_memcpy_crc(dto_async_op *op, void *dest, const void *src,
 			  size_t n, int cache_control)
 {
 	return dto_submit_async_common(op, DSA_OPCODE_COPY_CRC, dest, src, n,
+				       cache_control);
+}
+
+__attribute__((visibility("default")))
+int dto_submit_memcpy(dto_async_op *op, void *dest, const void *src,
+		      size_t n, int cache_control)
+{
+	return dto_submit_async_common(op, DSA_OPCODE_MEMMOVE, dest, src, n,
 				       cache_control);
 }
 

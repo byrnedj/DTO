@@ -54,6 +54,8 @@ typedef struct dto_async_op {
 #define DTO_ASYNC_DONE 1
 #define DTO_ASYNC_FAILED (-1)
 
+int dto_submit_memcpy(dto_async_op *op, void *dest, const void *src,
+		      size_t n, int cache_control);
 int dto_submit_memcpy_crc(dto_async_op *op, void *dest, const void *src,
 			  size_t n, int cache_control);
 int dto_submit_crc(dto_async_op *op, const void *src, size_t n);
