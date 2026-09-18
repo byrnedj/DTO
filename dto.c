@@ -5387,6 +5387,12 @@ int dto_async_poll(dto_async_op *op)
  *	iteration of a poll loop would have.
  */
 __attribute__((visibility("default")))
+int dto_wait_blocks(void)
+{
+	return wait_method == WAIT_AGGREGATOR;
+}
+
+__attribute__((visibility("default")))
 void dto_async_wait(dto_async_op *op)
 {
 	struct dto_async_op_impl *impl = (struct dto_async_op_impl *)op;

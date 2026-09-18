@@ -85,6 +85,14 @@ int dto_submit_memcpy_crc(dto_async_op *op, void *dest, const void *src,
 int dto_submit_crc(dto_async_op *op, const void *src, size_t n);
 int dto_async_poll(dto_async_op *op);
 
+/* Nonzero when the configured wait method hands the core back to the
+ * scheduler instead of spinning on the completion record, i.e. when calling
+ * dto_async_wait()/dto_batch_wait() above the size gate parks the thread.
+ * For callers that keep their own wait loop (because they have cheaper work
+ * to switch to, such as a fiber runtime) and need to know whether delegating
+ * to DTO would idle the core or merely move the spin. */
+int dto_wait_blocks(void);
+
 /* Block until the device has written the op's completion record, honouring
  * DTO_WAIT_METHOD (under the aggregator: spin for transfers at or below
  * DTO_AGG_BLOCK_KB, otherwise give the core back through the scheduler).
