@@ -26,6 +26,47 @@
 #include <numa.h>
 #include "dto.h"
 #include <nmmintrin.h>  // For _mm_crc32_u32 etc.
+#include <sys/syscall.h>
+#include <signal.h>
+#include <limits.h>
+
+/* Raw futex opcodes. <linux/futex.h> is deliberately not included: its
+ * __kernel_timespec definitions collide with glibc's struct timespec on some
+ * kernel-header versions, and only these two private-flag operations are
+ * needed. Values are FUTEX_WAIT|FUTEX_PRIVATE_FLAG and
+ * FUTEX_WAKE|FUTEX_PRIVATE_FLAG. */
+#define DTO_FUTEX_WAIT_PRIVATE 128
+#define DTO_FUTEX_WAKE_PRIVATE 129
+
+/* rel is a RELATIVE CLOCK_MONOTONIC timeout, which is what plain FUTEX_WAIT
+ * takes. Returns -1/errno on failure; EAGAIN means *w != val, i.e. the value
+ * we were going to sleep on has already moved on and there is nothing to
+ * wait for. That kernel-side compare is what makes the wake un-loseable. */
+static inline int agg_futex_wait(_Atomic uint32_t *w, uint32_t val,
+	const struct timespec *rel)
+{
+	return syscall(SYS_futex, (uint32_t *)w, DTO_FUTEX_WAIT_PRIVATE,
+		val, rel, NULL, 0);
+}
+
+/* n > 1 is unreachable by construction, and re-proposing a batched wake is a
+ * dead end that has already been costed. FUTEX_WAKE's count applies to ONE
+ * address, and every armed slot has its own futex word (seq) by design, so
+ * there is no address that names k waiters. The variant that does -- a shared
+ * per-shard generation word that W blocked workers all wait on -- wakes all W
+ * to retire k completions and loses unless k/W > ~0.6, and it would need a
+ * SECOND futex word inside the validated block loop. The arithmetic that
+ * forecloses it: per-completion poller cost is ~1.3us of FUTEX_WAKE against
+ * ~1.7us per SWEEP (amortized over every completion in the pass), so
+ * retire_rate = k / (1.7 + 1.3k) us^-1 with an asymptote of 1/1.3us = 770K/s
+ * -- and the measured 450-750K/s sits on it. The poller is 75-90% syscall, so
+ * the only linear lever is the NUMBER OF SYSCALL ISSUERS. That is what
+ * DTO_AGG_POLLERS is. */
+static inline int agg_futex_wake(_Atomic uint32_t *w, int n)
+{
+	return syscall(SYS_futex, (uint32_t *)w, DTO_FUTEX_WAKE_PRIVATE,
+		n, NULL, NULL, 0);
+}
 
 #define likely(x)       __builtin_expect((x), 1)
 #define unlikely(x)     __builtin_expect((x), 0)
@@ -77,7 +118,27 @@
 
 // thread specific variables
 static __thread struct dsa_hw_desc thr_desc;
-static __thread struct dsa_completion_record thr_comp __attribute__((aligned(32)));
+/* The completion record for synchronous single-descriptor ops is reached
+ * through a TLS pointer rather than being a TLS object itself. Under
+ * WAIT_AGGREGATOR the pointer is redirected at a static per-slot record so
+ * that the poller thread, which reads other threads' completion records,
+ * never dereferences a TLS block or stack frame that glibc can unmap at
+ * thread exit. For every other wait method it points at the TLS record and
+ * the behavior is bit-for-bit unchanged.
+ * thr_comp is a MACRO: &thr_comp, thr_comp.status, ... all still compile.
+ * Never declare a local object named thr_comp. */
+static __thread struct dsa_completion_record thr_comp_tls __attribute__((aligned(32)));
+static __thread struct dsa_completion_record *thr_compp;
+
+static __always_inline struct dsa_completion_record *dto_compp(void)
+{
+	/* A TLS address is not a constant expression, so this cannot be a
+	 * static initializer. */
+	if (unlikely(thr_compp == NULL))
+		thr_compp = &thr_comp_tls;
+	return thr_compp;
+}
+#define thr_comp (*dto_compp())
 static __thread uint64_t thr_bytes_completed;
 static __thread int16_t wq_index = -1;
 static __thread uint8_t thr_dsa_disabled;  /* 1 = thread exceeded max threads limit */
@@ -116,7 +177,9 @@ enum wait_options {
 	WAIT_UMWAIT,
 	WAIT_YIELD,
 	WAIT_TPAUSE,
-        WAIT_SLEEP
+        WAIT_SLEEP,
+	WAIT_SPINYIELD,
+	WAIT_AGGREGATOR
 };
 
 enum numa_aware {
@@ -144,6 +207,130 @@ static atomic_uchar dto_initialized;
 static atomic_uchar dto_initializing;
 static uint8_t use_std_lib_calls;
 static int dsa_max_threads;  /* 0 = no limit */
+
+/* TinyLFU-style admission for the DSA submitter slots
+ * (DTO_DSA_ADMISSION=lfu). The dsa_max_threads slots form a cache of
+ * threads: admission compares a challenger's eligible-op frequency (exact
+ * table -- thread numbers are dense) against the coldest slot holder's, and
+ * periodic halving ages idle holders out. The default (fcfs) keeps the
+ * original first-come permanent grant. */
+enum dsa_admission_mode { ADMIT_FCFS = 0, ADMIT_LFU };
+static int dsa_admission = ADMIT_FCFS;
+
+#define DSA_SLOTS_MAX 1024
+#define FREQ_TABLE_SIZE 4096
+#define FREQ_MAX 255
+#define ADMIT_APPLY_PERIOD 64
+#define AGE_WINDOW_OPS (1u << 20)
+
+struct dsa_slot {
+	_Atomic int32_t owner; /* thread number, -1 = free */
+	_Atomic uint32_t gen;  /* bumped on every ownership change */
+	_Atomic uint8_t hinted; /* owner held an activity hint on last submit */
+};
+static struct dsa_slot dsa_slots[DSA_SLOTS_MAX];
+
+/* Ticket-aware admission (DTO_DSA_ADMISSION=ticket): the application marks
+ * threads that are inside a phase producing offload-eligible work via
+ * dto_thread_active() -- for mongod, WiredTiger execution-control ticket
+ * acquire/release. Hint possession replaces frequency inference for those
+ * threads: hinted challengers admit immediately and preferentially evict
+ * unhinted holders. Unhinted threads (storage daemons, foreign apps) keep
+ * the full TinyLFU path over whatever slots remain, so a process that never
+ * calls the hint behaves exactly as =lfu. The hint lingers for a few ops
+ * after release so per-transaction ticket cycling doesn't thrash slots. */
+static int ticket_mode;
+#define HINT_LINGER_OPS 512
+static __thread int32_t thr_hint;        /* nesting count of active hints */
+static __thread uint32_t thr_hint_linger; /* eligible ops still hinted */
+static __thread uint8_t thr_slot_hint_mirror; /* last value stored to slot */
+
+/* One frequency counter per cacheline: thousands of threads bump these, and
+ * unpadded adjacent counters turned the table into 64 contended lines under
+ * the 16-instance overload. 256KB of bss buys zero false sharing. */
+struct freq_slot {
+	_Atomic uint8_t v;
+	char pad[63];
+};
+static struct freq_slot thr_freq_tab[FREQ_TABLE_SIZE]
+	__attribute__((aligned(64)));
+static _Atomic uint32_t admit_eligible_ops;
+static _Atomic uint32_t admit_age_epoch;
+
+/* Frequency updates are sampled 1-in-freq_sample per thread: admission is a
+ * relative comparison, so uniform sampling preserves ordering while cutting
+ * shared-line write traffic by the sampling factor. The aging trigger rides
+ * the same sampled branch, so non-sampled ops touch no shared state at all.
+ * A global gap between challenges bounds the victim-scan rate process-wide
+ * no matter how many slotless threads are hot. */
+static int freq_sample = 8;            /* DTO_LFU_FREQ_SAMPLE */
+
+/* Load shed (DTO_SHED=1): a sampled scheduling probe (rdtsc around
+ * sched_yield) measures time-to-reschedule -- the quantity that decides
+ * whether synchronous offload is profitable at all. When the host is
+ * oversubscribed past the threshold, the shed level rises and ops below
+ * SHED_BASE_BYTES << level fall back to the CPU (small ops first: worst
+ * wait-to-work ratio). The probe is offload-independent, so recovery is
+ * automatic: levels step back down as yield latency subsides. */
+static int dto_shed;
+static _Atomic int shed_level;
+#define SHED_LEVEL_MAX 8
+#define SHED_BASE_BYTES 16384
+#define SHED_PROBE_PERIOD 256          /* per-thread: probe 1 in 256 */
+#define SHED_PROBE_WINDOW 64           /* probes per level decision */
+static int shed_hi_us = 20;            /* DTO_SHED_HI_US: escalate above */
+static int shed_lo_us = 5;             /* DTO_SHED_LO_US: recover below */
+static uint64_t shed_hi_cycles = 40000, shed_lo_cycles = 10000;
+static unsigned int tsc_khz = 2000000;
+static _Atomic uint64_t shed_probe_cycles;
+static _Atomic uint32_t shed_probe_count;
+static __thread uint16_t thr_probe_ctr;
+static uint32_t age_window_samples = (AGE_WINDOW_OPS >> 3);
+#define CHALLENGE_GLOBAL_GAP 8         /* sampled ops between challenges */
+static _Atomic uint32_t challenge_stamp;
+static __thread uint16_t thr_bump_ctr;
+
+/* Dynamic slot-count tuning (DTO_LFU_AUTO_K=1): the same sampled-waits
+ * signal the cpu_size_fraction heuristic uses, driving K instead. Long
+ * average waits mean the device side is saturated by the current
+ * submitters, so the working set shrinks; short waits mean headroom, so it
+ * grows. lfu_k is the live bound the victim scan and the holder fast path
+ * both honor. */
+static int lfu_auto_k;
+static _Atomic int lfu_k;
+static int lfu_k_min = 8;
+static int lfu_k_max = 512;
+#define LFU_K_STEP 8
+/* Signal window: ENQCMD WQ-full rejections per submit. Unlike sampled wait
+ * counts, retry rate is pure device backpressure -- immune to scheduler
+ * delay, which under thread oversubscription inflates yield-wait counts and
+ * misreads CPU load as device saturation. */
+#define LFU_K_WINDOW 4096
+static atomic_ullong k_win_submits;
+static atomic_ullong k_win_retries;
+
+/* Latency-trend signal (DTO_LFU_AUTO_K=2): sampled rdtsc timing of
+ * descriptors, byte-normalized (cycles per KB) and compared window-over-
+ * window against an EWMA reference. Rising latency -> shrink (the queueing
+ * knee), flat or falling -> probe upward. The relative comparison cancels
+ * the constant scheduler tax that poisons absolute wait counts under
+ * thread oversubscription. */
+#define LAT_WINDOW 256
+#define LAT_SAMPLE_PERIOD 64
+static int lat_eps_num = 115;          /* rising = > ref * eps / 100 */
+static _Atomic uint64_t lat_win_cycles;
+static _Atomic uint64_t lat_win_bytes;
+static _Atomic uint32_t lat_win_count;
+static uint64_t lat_ref_cpkb;          /* EWMA, fixed-point x256; closer-only */
+static int lat_freeze;                 /* windows to skip after a shrink */
+static __thread uint16_t thr_lat_ctr;
+static __thread uint64_t thr_lat_t0;
+static __thread uint32_t thr_lat_bytes; /* 0 = not timing this descriptor */
+
+static __thread int32_t thr_num = -1;
+static __thread int16_t thr_slot = -1;
+static __thread uint32_t thr_slot_gen;
+static __thread uint16_t thr_backoff;
 static enum numa_aware is_numa_aware;
 static size_t dsa_min_size = DTO_DEFAULT_MIN_SIZE;
 /* Gate for the explicit CRC API (dto_crc, dto_memcpy_crc_async); when unset
@@ -189,6 +376,7 @@ enum memop {
 	MEMMOVE,
 	MEMCMP,
 	BATCH_COPY,
+	CRC,
 	MAX_MEMOP,
 };
 
@@ -199,7 +387,8 @@ static const char * const memop_names[] = {
 	[MEMMOVE_INTERNAL] = "movi",
 	[MEMMOVE] = "mov",
 	[MEMCMP] = "cmp",
-	[BATCH_COPY] = "batch"
+	[BATCH_COPY] = "batch",
+	[CRC] = "crc"
 };
 
 // memory stats
@@ -240,7 +429,9 @@ static const char * const wait_names[] = {
 	[WAIT_UMWAIT] = "umwait",
 	[WAIT_YIELD] = "yield",
         [WAIT_TPAUSE] = "tpause",
-        [WAIT_SLEEP] = "sleep"
+        [WAIT_SLEEP] = "sleep",
+	[WAIT_SPINYIELD] = "spinyield",
+	[WAIT_AGGREGATOR] = "aggregator"
 };
 
 static int collect_stats;
@@ -400,6 +591,233 @@ static void dto_log(int req_log_level, const char *fmt, ...)
 	va_end(args);
 }
 
+/* ---------------------------------------------------------------------------
+ * WAIT_AGGREGATOR
+ *
+ * One dedicated poller thread per process turns N spinning workers into one
+ * spinner plus N futex-blocked workers, so the cores the workers were holding
+ * during device time become available to other threads (or to another
+ * process sharing the machine).
+ *
+ * A worker blocks immediately for transfers at or above DTO_AGG_BLOCK_KB and
+ * spins to completion below it; either way the poller sweeps the armed slots
+ * and, when the device has written a status byte, closes the slot with a CAS
+ * and issues FUTEX_WAKE.
+ *
+ * The whole protocol rests on one monotonically increasing 32-bit word per
+ * slot, seq, which is BOTH the armed flag (odd = armed) and the futex word:
+ *
+ *   - seq never decreases, not on release, not on claim by a new owner.
+ *     Therefore a stale CAS left over from a previous op, or from a previous
+ *     owner of the slot, always fails. That is the ABA answer for the CAS.
+ *   - The poller CASes from the exact value it loaded for that slot, strictly
+ *     BEFORE it wakes. A worker that reaches FUTEX_WAIT after the fact gets
+ *     EAGAIN from the kernel's own compare, so the wakeup cannot be lost.
+ *   - FUTEX_WAKE carries no compare value, so a delayed wake CAN land on a
+ *     later arming of the same slot by a different owner. That is harmless
+ *     but it is not prevented: it is absorbed by the next rule.
+ *   - The loop condition is always *comp == 0, never the futex word: every
+ *     wake is treated as possibly spurious or stale.
+ * ------------------------------------------------------------------------- */
+
+#define AGG_SLOTS_MAX 512
+
+/* CONTROL line. Written by the owner (arm/disarm) and by the poller (CAS).
+ * Deliberately not in the same cacheline as the completion record: the owner
+ * dirties this line on every arm, and the device must not have to
+ * snoop-invalidate a CPU-dirty line to land a completion. */
+struct agg_slot {
+	_Atomic uint32_t seq;	/* futex word AND armed flag; odd = armed,
+				 * even = idle. NEVER reset. */
+	_Atomic uint32_t owner;	/* 0 = free, 1 = owned */
+	char pad[64 - 8];
+} __attribute__((aligned(64)));
+_Static_assert(sizeof(struct agg_slot) == 64, "agg_slot must be one line");
+
+/* Owner-private diagnostics, deliberately NOT in struct agg_slot. The poller
+ * loads every seq on every sweep and keeps those lines in S state; a counter
+ * bump on the worker's fast path sharing that line would invalidate it and
+ * turn the sweep into a stream of coherence misses. Nothing reads these until
+ * shutdown. */
+struct agg_stat {
+	uint32_t block, spinhit, timeout, spincap, unknown, early;
+	char pad[64 - 24];
+} __attribute__((aligned(64)));
+_Static_assert(sizeof(struct agg_stat) == 64, "agg_stat must be one line");
+static struct agg_stat agg_stats[AGG_SLOTS_MAX];
+
+/* DEVICE-WRITTEN line. The record sits at offset 0 of a 64B-aligned object,
+ * which satisfies DSA's 32-byte completion-record alignment requirement. */
+struct agg_rec {
+	struct dsa_completion_record comp;	/* 32B */
+	char pad[32];
+} __attribute__((aligned(64)));
+
+static struct agg_slot agg_slots[AGG_SLOTS_MAX];
+static struct agg_rec agg_recs[AGG_SLOTS_MAX];
+
+/* SHARDED POLLERS.
+ *
+ * A single poller retires only ~450-750K completions/s (see agg_futex_wake
+ * for where that number comes from and why nothing but more syscall issuers
+ * can move it). Below ~256KB the device produces completions faster than
+ * that and throughput collapses to exactly the retire rate times the transfer
+ * size. Read as a break-even transfer size: at 222 GB/s the device produces
+ * 222e9/S completions/s, so one poller at ~700 kops/s breaks even at
+ * S ~= 300KB, and P pollers at 300KB/P -- P=2 -> 150KB, P=4 -> 77KB.
+ *
+ * The table is therefore cut into P contiguous shards, each swept by its own
+ * poller. Every piece of per-poller state below is split by WRITE FREQUENCY,
+ * which also repairs a pre-existing false-sharing bug: agg_park, agg_hb,
+ * agg_hi, agg_stop, agg_started and agg_degraded_until used to be six
+ * consecutive unpadded statics in one 64B line, so the eligibility test --
+ * which runs on EVERY offloaded op, including the spinning majority that
+ * never arms -- shared a line with a counter the poller RMWs 450-750K times a
+ * second. */
+#define AGG_POLLERS_MAX 16
+
+/* Read-mostly. Loaded on the eligibility test of every offloaded op in this
+ * shard. Written only at start, at poller death and at teardown.
+ *
+ * lo/limit are IMMUTABLE once agg_started is published; the only writes are
+ * the init-time orphan fold, which happens before publication. See agg_kick()
+ * for why immutability is a correctness requirement and not a simplification. */
+struct agg_shard {
+	_Atomic uint32_t started;
+	uint32_t lo, limit;		/* [lo, limit) */
+	int node;			/* NUMA node, or -1 for "don't bind" */
+	int created;			/* pthread_create returned 0 */
+	_Atomic uint64_t degraded_until;	/* rdtsc deadline; watchdog */
+	pthread_t tid;
+} __attribute__((aligned(64)));
+_Static_assert(sizeof(struct agg_shard) == 64, "agg_shard must be one line");
+
+/* Poller-written every sweep. Its own line for exactly the reason agg_stats
+ * is not inside struct agg_slot: a per-sweep store must not invalidate a line
+ * the workers load on their fast path. */
+struct agg_shard_hot {
+	_Atomic uint32_t park;		/* futex word: 1 = this poller parked */
+	_Atomic uint32_t hi;		/* highest claimed slot + 1, >= lo */
+	_Atomic uint64_t hb;		/* ++ at the end of every sweep */
+} __attribute__((aligned(64)));
+_Static_assert(sizeof(struct agg_shard_hot) == 64,
+	       "agg_shard_hot must be one line");
+
+static struct agg_shard agg_shards[AGG_POLLERS_MAX];
+static struct agg_shard_hot agg_hot[AGG_POLLERS_MAX];
+static uint32_t agg_npollers = 1;	/* live shard count (P_eff) */
+static uint32_t agg_pollers_per_node = 1;
+/* Init-only map. Written in full before agg_started is published and never
+ * again while a slot can be armed; the poller never reads it at all (it reads
+ * its own lo/limit), so both sides compute the same mapping by construction
+ * rather than by agreement. */
+static uint8_t agg_slot_shard[AGG_SLOTS_MAX];
+static cpu_set_t agg_shard_cpus[AGG_POLLERS_MAX];
+static uint8_t agg_shard_cpus_valid[AGG_POLLERS_MAX];
+static int agg_any_created;		/* at least one poller to join */
+
+/* PROCESS-WIDE, deliberately not sharded. One word, read-mostly, written
+ * once, and teardown is by definition all-shards; sharding it would add
+ * stores to the one path that must stay simple and would make the bounded
+ * join deadline harder to bound. */
+static _Atomic uint32_t agg_stop;
+/* The claim gate in get_wq(), meaning "the pool is final and the table is
+ * open". Set once by init_dto() after the create loop and cleared by
+ * cleanup_dto(). No poller writes it: with P pollers, "the last one out" is
+ * not a condition any single poller can evaluate, and agg_stop is already the
+ * flag every worker tests. Per-shard liveness lives in agg_shards[s].started. */
+static _Atomic uint32_t agg_started;
+static pthread_key_t agg_key;
+static int agg_key_ready;		/* keys survive fork: create once */
+static pthread_attr_t agg_attr;		/* built once; fork-child safe */
+static int agg_attr_ready;
+static uint32_t agg_nodes = 1;		/* NUMA nodes to partition slots over */
+
+static uint32_t agg_nslots = 64;	/* live table size */
+static uint64_t agg_postarm_cyc, agg_idle_cyc, agg_idle_min_cyc,
+		agg_degrade_cyc, agg_dead_cyc;
+static uint32_t agg_to_us = 100, agg_to_max_us = 1000;
+static int agg_cpu = -1, agg_rt;
+
+/* Read-mostly after init, loaded on the fast path of every offloaded op.
+ * Given their own 64B line: a poller stores its agg_hot[] heartbeat on every
+ * sweep at 450-750K/s, and the gate compare must never become a coherence
+ * miss. The
+ * aligned attribute opens a fresh line, so nothing declared above can share
+ * with these. */
+static uint32_t agg_block_bytes __attribute__((aligned(64))) = 64u << 10;
+static uint64_t agg_spin_cap_cyc;
+static _Atomic uint32_t agg_spincap_logged;	/* one log line per process */
+static _Atomic uint32_t agg_full_logged;	/* one log line per process */
+
+/* Claim sequencer. Bumped once per successful-or-failed claim attempt, i.e.
+ * about once per offloading thread, never on a wait path. It exists because
+ * the claimed slot index now SELECTS THE POLLER: with one poller the claim's
+ * placement inside the table was a NUMA detail, with P pollers it is the load
+ * balance, so the start position has to come from something that actually
+ * varies. thr_num does not -- it is assigned only by get_wq_lfu(), which
+ * get_wq_inner() reaches only under DTO_DSA_ADMISSION=lfu, so in the default
+ * fcfs mode every thread hashed from -1 and linear-probed from the same slot,
+ * packing every claim into the lowest shard. */
+static _Atomic uint32_t agg_claim_ticket;
+
+/* Call counters for the public wait API. The consumer that motivated it
+ * (WiredTiger) resolves these by dlsym and silently keeps its old poll loop
+ * when they are absent, so "did the new path engage" is otherwise
+ * unfalsifiable from outside the process. */
+static _Atomic uint64_t dto_wait_calls_async, dto_wait_calls_batch,
+		        dto_wait_entered_async, dto_wait_entered_batch;
+/* Latched one-shot, not reported at exit: mongod is terminated by a signal and
+ * never runs cleanup_dto, so a shutdown-only report is invisible in exactly the
+ * process this API exists for. */
+static _Atomic uint32_t dto_wait_logged_async, dto_wait_logged_batch;
+static _Atomic uint32_t dto_sub_logged_batch, dto_sub_logged_crc;
+
+static __thread int32_t thr_agg_slot = -1;	/* -1 unclaimed, -2 table full,
+						 * -3 thread is exiting */
+static __thread uint32_t thr_agg_retry;		/* re-claim backoff counter */
+/* Resolved once, at claim time, from agg_slot_shard[]. Never computed on a
+ * wait path and never on the spin path. */
+static __thread struct agg_shard *thr_agg_sh;
+static __thread struct agg_shard_hot *thr_agg_hot;
+
+/* Measured DSA cost model, used at INIT ONLY -- to floor the spin cap against
+ * the size gate and to log the effective configuration. It is never consulted
+ * on a wait path, so a stale calibration on future silicon misplaces a knob
+ * and can never produce a wrong wait decision. Re-measure both constants on
+ * new silicon. */
+#define AGG_DSA_FIXED_NS	700ULL		/* 0.70us fixed */
+#define AGG_DSA_BW_MB_PER_S	56600ULL	/* 56.6 GB/s */
+
+static inline uint64_t agg_model_ns(uint64_t bytes)
+{
+	return AGG_DSA_FIXED_NS + bytes * 1000ULL / AGG_DSA_BW_MB_PER_S;
+}
+
+static int agg_getenv_int(const char *name, int def)
+{
+	const char *e = getenv(name);
+	long v;
+
+	if (e == NULL || *e == '\0')
+		return def;
+	errno = 0;
+	v = strtol(e, NULL, 10);
+	if (errno)
+		return def;
+	return (int)v;
+}
+
+static inline uint64_t agg_us_to_cyc(uint64_t us)
+{
+	return us * tsc_khz / 1000;
+}
+
+static inline int agg_clamp(int v, int lo, int hi)
+{
+	return v < lo ? lo : (v > hi ? hi : v);
+}
+
 /* Reinitialize DTO in the child process. */
 static void child (void)
 {
@@ -420,6 +838,76 @@ static void child (void)
 	dto_initializing = 0;
 	dto_initialized = 0;
 	log_fd = -1;
+
+	/* The poller thread did not survive the fork. Resetting seq to zero is
+	 * safe here and only here: the child is single-threaded at this
+	 * instant, so no stale CAS and no stale wake can exist to be confused
+	 * by the restart. Explicit stores, never memset(), which is
+	 * interposed and whose orig_memset may still be NULL. */
+	for (uint32_t i = 0; i < AGG_SLOTS_MAX; i++) {
+		atomic_store_explicit(&agg_slots[i].owner, 0,
+		    memory_order_relaxed);
+		atomic_store_explicit(&agg_slots[i].seq, 0,
+		    memory_order_relaxed);
+		agg_recs[i].comp.status = 0;
+		/* agg_stats is the only thing cleanup_dto() dumps and it is
+		 * the instrument the bring-up gate reads. Inherited, the
+		 * child's dump would be parent+child summed and labelled with
+		 * the CHILD's slot-to-shard map, so a parent-side timeout or
+		 * spincap would read as a child-side watchdog event that
+		 * never happened. */
+		agg_stats[i].block = 0;
+		agg_stats[i].spinhit = 0;
+		agg_stats[i].timeout = 0;
+		agg_stats[i].spincap = 0;
+		agg_stats[i].unknown = 0;
+		agg_stats[i].early = 0;
+	}
+	atomic_store_explicit(&agg_stop, 0, memory_order_relaxed);
+	atomic_store_explicit(&agg_started, 0, memory_order_relaxed);
+	/* One-shot log latches, or the child never reports its own first
+	 * occurrence of an event the parent happened to hit already. */
+	atomic_store_explicit(&agg_spincap_logged, 0, memory_order_relaxed);
+	atomic_store_explicit(&agg_full_logged, 0, memory_order_relaxed);
+	atomic_store_explicit(&agg_claim_ticket, 0, memory_order_relaxed);
+	/* AGG_POLLERS_MAX, not the live agg_npollers: the child re-runs the
+	 * whole knob block and DTO_AGG_POLLERS can come back LARGER than the
+	 * parent's, so a shard left live here would survive holding a
+	 * pthread_t that names a stranger -- the same hazard that forces a
+	 * single poller's pthread_t to be cleared here, now applied to
+	 * sixteen of them. lo/limit/hi are
+	 * re-seeded by the partition computation when init_dto() re-runs;
+	 * zeroing them here is a clean slate, not a valid state.
+	 * agg_slot_shard[] needs no clearing: it is rewritten in full before
+	 * agg_started is published. */
+	for (uint32_t s = 0; s < AGG_POLLERS_MAX; s++) {
+		atomic_store_explicit(&agg_shards[s].started, 0,
+		    memory_order_relaxed);
+		atomic_store_explicit(&agg_shards[s].degraded_until, 0,
+		    memory_order_relaxed);
+		agg_shards[s].tid = (pthread_t)0;
+		agg_shards[s].created = 0;
+		agg_shards[s].lo = 0;
+		agg_shards[s].limit = 0;
+		agg_shards[s].node = -1;
+		agg_shard_cpus_valid[s] = 0;
+		atomic_store_explicit(&agg_hot[s].park, 0,
+		    memory_order_relaxed);
+		atomic_store_explicit(&agg_hot[s].hb, 0, memory_order_relaxed);
+		atomic_store_explicit(&agg_hot[s].hi, 0, memory_order_relaxed);
+	}
+	agg_npollers = 1;
+	agg_pollers_per_node = 1;
+	agg_any_created = 0;
+	thr_agg_slot = -1;
+	thr_agg_sh = NULL;
+	thr_agg_hot = NULL;
+	thr_compp = &thr_comp_tls;
+	/* Clear this thread's key value, or its destructor would later
+	 * release a slot that a different child thread owns. The key itself
+	 * survives the fork and must not be re-created. */
+	if (agg_key_ready)
+		pthread_setspecific(agg_key, NULL);
 
 	init_dto();
 }
@@ -475,6 +963,26 @@ static __always_inline void dsa_wait_yield(const volatile uint8_t *comp)
 	}
 }
 
+/* Spin briefly (long enough to cover the device time of a typical small
+ * operation), then yield. Under an uncontended sprint the completion lands
+ * during the spin and the op pays nothing; under contention the thread
+ * donates its CPU like plain yield. This closes the gap where a yield's
+ * reschedule latency -- a full scheduling quantum when every thread is
+ * runnable -- was charged to each offloaded op. */
+static uint64_t spinyield_cycles = 16000;   /* ~8us at 2GHz; see init */
+
+static __always_inline void dsa_wait_spinyield(const volatile uint8_t *comp)
+{
+	uint64_t deadline = __rdtsc() + spinyield_cycles;
+
+	while (*comp == 0) {
+		if (__rdtsc() < deadline)
+			_mm_pause();
+		else
+			sched_yield();
+	}
+}
+
 static __always_inline void dsa_wait_busy_poll(const volatile uint8_t *comp)
 {
 	while (*comp == 0) {
@@ -505,6 +1013,1156 @@ static __always_inline void dsa_wait_umwait(const volatile uint8_t *comp)
         }
 }
 
+
+/* pthread_key destructor: hand the slot back when the owning thread exits.
+ * A thread cannot exit from inside its own wait, so seq is even here.
+ * Nothing needs to be quiesced and nothing is freed: the poller only ever
+ * touches agg_slots[] and agg_recs[], which live in .bss for the life of the
+ * process. */
+static void agg_slot_release(void *v)
+{
+	uint32_t i = (uint32_t)(uintptr_t)v - 1;
+
+	if (i >= AGG_SLOTS_MAX)
+		return;
+	thr_compp = &thr_comp_tls;
+	/* -3, not -1: glibc runs key destructors in up to four rounds, and a
+	 * destructor registered by any other library may call an interposed
+	 * mem* function. That would reach get_wq() -> agg_claim_slot() and
+	 * hand this dying thread a second slot, whose completion record it
+	 * would then point thr_compp at -- after this key value has already
+	 * been consumed, so nothing would ever release it. */
+	thr_agg_slot = -3;
+	thr_agg_retry = 0;
+	/* Cleared for the same reason the slot index goes to -3: a destructor
+	 * registered by another library can reach get_wq() and must not find a
+	 * stale shard pointer sitting beside a dead slot index. */
+	thr_agg_sh = NULL;
+	thr_agg_hot = NULL;
+	atomic_store_explicit(&agg_slots[i].owner, 0, memory_order_release);
+}
+
+static int agg_claim_slot(void)
+{
+	uint32_t tk = atomic_fetch_add_explicit(&agg_claim_ticket, 1,
+	    memory_order_relaxed);
+	uint32_t base = 0, span = agg_nslots, start, k, ppn;
+	struct agg_shard_hot *hot;
+
+	/* Prefer the region of the table belonging to this thread's NUMA
+	 * node. Slots are 64B and agg_recs is plain .bss, so 64 completion
+	 * records share a 4KB page: with an unpartitioned search one page is
+	 * first-touched by whichever node claims first and every other node's
+	 * threads then take a cross-socket write (device) and read (worker)
+	 * on the one byte whose latency this whole path is built around.
+	 * Partitioned, a page is only ever claimed by same-node threads, so
+	 * first touch places it on their node. */
+	if (agg_nodes > 1) {
+		int cpu = sched_getcpu();
+		int nd = cpu >= 0 ? numa_node_of_cpu(cpu) : -1;
+
+		if (nd >= 0) {
+			span = agg_nslots / agg_nodes;
+			if (span == 0)
+				span = 1;
+			base = ((uint32_t)nd % agg_nodes) * span;
+		}
+	}
+	/* Spread SHARD-FIRST inside the node region, not slot-first: the
+	 * region is cut into agg_pollers_per_node contiguous shards, so
+	 * consecutive claims must step by a whole shard width to land under
+	 * distinct pollers. Slot-first (start = base + tk % span) fills shard
+	 * 0 completely before touching shard 1, which is what leaves the
+	 * other pollers sweeping empty ranges and parked while one of them
+	 * carries the whole process at the P == 1 retire rate.
+	 * This is a START HINT only -- the probe below still walks the node
+	 * region and then the whole table, so no slot becomes unreachable. */
+	ppn = agg_pollers_per_node;
+	if (ppn == 0 || ppn > span)
+		ppn = 1;
+	start = base + ((tk % ppn) * (span / ppn) + tk / ppn) % span;
+
+	for (k = 0; k < agg_nslots; k++) {
+		/* The node's own region first, then the rest of the table:
+		 * a slot on the wrong node still beats no slot at all. */
+		uint32_t i = k < span ? base + (start - base + k) % span
+				      : (base + k) % agg_nslots;
+		uint32_t z = 0;
+
+		if (atomic_compare_exchange_strong_explicit(&agg_slots[i].owner,
+				&z, 1u, memory_order_acq_rel,
+				memory_order_relaxed)) {
+			/* seq is never RESET across owners -- monotonicity is
+			 * what makes a stale CAS or wake from the previous
+			 * owner inert -- but the even-means-idle parity the
+			 * poller filters on is load-bearing, so normalize it
+			 * upwards here rather than assume the previous owner
+			 * left it even. */
+			uint32_t sq = atomic_load_explicit(&agg_slots[i].seq,
+			    memory_order_relaxed);
+
+			if (sq & 1u)
+				atomic_store_explicit(&agg_slots[i].seq,
+				    sq + 1, memory_order_relaxed);
+			agg_recs[i].comp.status = 0;
+			thr_compp = &agg_recs[i].comp;	/* device lands here */
+			thr_agg_slot = (int32_t)i;
+			/* One byte load, once per thread. The shard that owns
+			 * this slot is a property of the slot, not of the
+			 * thread, so no wait path ever recomputes it. */
+			hot = &agg_hot[agg_slot_shard[i]];
+			thr_agg_sh = &agg_shards[agg_slot_shard[i]];
+			thr_agg_hot = hot;
+			pthread_setspecific(agg_key,
+			    (void *)(uintptr_t)(i + 1));
+			/* CAS-max THIS SHARD's hi. seq_cst on success, not
+			 * release: the poller's park-time load of hi decides
+			 * whether slot i is inside the range it re-checks
+			 * before sleeping, so this store has to join the
+			 * single total order S that already carries the arm
+			 * and the park store. release/acquire on hi orders
+			 * NOTHING against the park word, which leaves C11
+			 * permitting a poller to load a stale hi that excludes
+			 * i while the worker's Dekker load of park still sees
+			 * 0 -- a lost wakeup, saved today only by x86's LOCK
+			 * XCHG on the arm draining the store buffer. At
+			 * seq_cst a poller that missed this CAS has
+			 * hi-load <S hi-CAS <S arm <S park-load together with
+			 * park-store <S hi-load, so park-store <S park-load
+			 * and the worker necessarily observes park == 1 and
+			 * kicks. Strengthening only, and free on x86: the CAS
+			 * is already a locked RMW.
+			 * INVARIANT: this CAS-max must stay ordered BEFORE the
+			 * arm in dsa_wait_aggregator(). */
+			for (;;) {
+				uint32_t h = atomic_load_explicit(&hot->hi,
+				    memory_order_relaxed);
+
+				if (h >= i + 1)
+					break;
+				if (atomic_compare_exchange_weak_explicit(
+				    &hot->hi, &h, i + 1, memory_order_seq_cst,
+				    memory_order_relaxed))
+					break;
+			}
+			return 0;
+		}
+	}
+	thr_agg_slot = -2;
+	thr_agg_retry = 4096;
+	/* A full table is indistinguishable from a working aggregator in the
+	 * log otherwise: the pollers are up, agg_started is set, and every
+	 * unslotted thread silently spinyields forever under the re-claim
+	 * backoff -- i.e. the entire CPU saving this wait method exists for
+	 * is gone with no diagnostic. Once per process; the backoff makes
+	 * this path recur. */
+	{
+		uint32_t z = 0;
+
+		if (atomic_compare_exchange_strong_explicit(&agg_full_logged,
+		    &z, 1u, memory_order_relaxed, memory_order_relaxed))
+			LOG_ERROR("aggregator: all %u slots are owned; further threads fall back to spinyield until one is released (raise DTO_AGG_SLOTS, max %d)\n",
+			    agg_nslots, AGG_SLOTS_MAX);
+	}
+	return -1;
+}
+
+/* Called by a worker immediately after arming, on ITS OWN shard's park word.
+ * Steady state costs one load of a read-mostly line: no RMW, no syscall.
+ *
+ * Dekker pair with agg_park_wait(): the worker's seq_cst arm (W1) precedes
+ * its seq_cst load of hot->park (W2); the shard's poller's seq_cst store
+ * hot->park = 1 (A1) precedes its seq_cst loads of every seq in its range
+ * (A2). If both missed -- W2 saw 0 and A2 saw even -- the single total order
+ * over seq_cst operations would need W2 < A1, A1 < A2, A2 < W1 and W1 < W2, a
+ * cycle. So at most one of them can miss, and the poller can never park with
+ * a slot armed. S is a GLOBAL total order, so restricting attention to one
+ * shard cannot break the argument; it only requires that W1 and A2 name the
+ * SAME seq and that W2 and A1 name the SAME park word.
+ *
+ * The park word must be per shard for the same reason. Under one shared park
+ * word a kick from an unrelated shard could consume the 1 -> 0 transition and
+ * leave shard s parked with slot i armed: a lost wakeup.
+ *
+ * SHARDING ADDS TWO OBLIGATIONS, and they are obligations on the PARTITION,
+ * not on memory order:
+ *
+ *   TOTALITY AND DISJOINTNESS -- the shard ranges must partition
+ *   [0, agg_nslots) exactly (shard 0's lo == 0, each lo == the previous
+ *   limit, the last limit == agg_nslots; verified once at init). A gap is a
+ *   permanent hang for every thread that claims into it. An overlap is two
+ *   pollers CASing one seq, which the CAS makes safe but which wastes a
+ *   sweep.
+ *
+ *   IMMUTABILITY -- agg_slot_shard[], lo and limit are written once, before
+ *   agg_started is published, and never again while a slot can be armed.
+ *   Under a dynamic map a slot could move between the worker's W1/W2 and the
+ *   new owner's A1/A2: W2 would have loaded the park word of a poller that no
+ *   longer owns the slot, while the new owner's A1 preceded its own A2. That
+ *   is not a cycle, it is a LOST WAKEUP, and the failing-CAS rule does not
+ *   cover it. This is why there is no work stealing, no rebalancing, and no
+ *   poller adopting a dead neighbour's range.
+ *
+ * The third obligation is COVERAGE, not ordering: A2 must include slot i,
+ * i.e. i < hot->hi. That is what the seq_cst CAS-max in agg_claim_slot()
+ * buys. Sweeping fewer slots than the shard owns loses a wakeup; sweeping
+ * more is correct but is the cross-socket sweep the NUMA composition exists
+ * to prevent. */
+static inline void agg_kick(struct agg_shard_hot *hot)
+{
+	if (atomic_load_explicit(&hot->park, memory_order_seq_cst) == 1) {
+		uint32_t one = 1;
+
+		/* The 1 -> 0 CAS also makes the poller's
+		 * FUTEX_WAIT(&hot->park, 1) return EAGAIN if it had not yet
+		 * entered the syscall when the wake was issued. */
+		if (atomic_compare_exchange_strong_explicit(&hot->park, &one,
+		    0u, memory_order_acq_rel, memory_order_relaxed))
+			agg_futex_wake(&hot->park, 1);
+	}
+}
+
+static void dsa_wait_aggregator(const volatile uint8_t *comp, uint32_t xfer)
+{
+	struct agg_slot *s;
+	struct agg_stat *sv;
+	struct agg_shard *sh;
+	struct agg_shard_hot *hot;
+	uint64_t deadline, hb0, dead_since;
+	uint32_t myseq, to_us = agg_to_us, it;
+
+	/* Eligibility FIRST, before any spinning. The pointer-identity test is
+	 * what keeps the batch, dto_memset_pages and async paths -- whose
+	 * completion records are TLS, stack or caller-owned, i.e. not visible
+	 * to the poller -- off this path without extra branching at those call
+	 * sites. Testing it after the spin, as an ordinary "slow path" guard
+	 * would, means every one of those waits burns the full spin budget
+	 * here and THEN enters dsa_wait_spinyield, which
+	 * starts its own fresh deadline: double the intended time on the core
+	 * for every ineligible op in the process.
+	 *
+	 * Liveness and the watchdog deadline are read from THIS THREAD's
+	 * shard, which is a read-mostly line by construction -- nothing the
+	 * pollers write every sweep lives in it. One wedged poller therefore
+	 * degrades only its own shard's workers instead of disabling the
+	 * aggregator process-wide, which is exactly what sharding is supposed
+	 * to stop being possible. */
+	if (thr_agg_slot < 0 || thr_agg_sh == NULL ||
+	    comp != (const volatile uint8_t *)&thr_compp->status ||
+	    !atomic_load_explicit(&thr_agg_sh->started, memory_order_relaxed) ||
+	    atomic_load_explicit(&agg_stop, memory_order_relaxed) ||
+	    __rdtsc() < atomic_load_explicit(&thr_agg_sh->degraded_until,
+	    memory_order_relaxed)) {
+		dsa_wait_spinyield(comp);
+		atomic_thread_fence(memory_order_acquire);
+		return;
+	}
+
+	sh = thr_agg_sh;
+	hot = thr_agg_hot;
+	sv = &agg_stats[thr_agg_slot];
+
+	/* SIZE GATE. The decision is the transfer size and nothing else. Below
+	 * the threshold the op is shorter than a futex round trip (3-9us of CPU
+	 * across two threads), so spinning is strictly cheaper. Above it the op
+	 * outlives that round trip and the core is better given away, which is
+	 * the entire reason this wait method exists. One compare
+	 * against a global that is L1-resident forever; no TLS, no shared
+	 * write, no timestamp on the block path at all.
+	 *
+	 * xfer == 0 means the caller could not report a size, not that the
+	 * transfer is tiny. It BLOCKS. The only site that passes 0 is
+	 * dsa_wait_no_adjust, reached from the batch, async and
+	 * dto_memset_pages paths, whose completion records are TLS, stack or
+	 * caller-owned and are therefore already rejected by the
+	 * pointer-identity test above -- so this is a "must not misbehave if
+	 * that invariant ever changes" rule, not a live policy. Blocking is the
+	 * right failure direction three times over: it costs one bounded futex
+	 * round trip where guessing "small" costs a core held for an op of
+	 * unbounded size; it is the path carrying the whole self-rescue ladder
+	 * (timeout escalation, heartbeat, repair kick, dead-poller degrade,
+	 * spinyield backstop) rather than the path whose only protection is the
+	 * valve below; and it preserves the deleted adaptive model's own
+	 * semantics, since agg_class_of(0) already returned the largest
+	 * class. */
+	if (unlikely(xfer == 0)) {
+		sv->unknown++;
+		goto arm;
+	}
+	/* Strictly greater, so DTO_AGG_BLOCK_KB=64 means "more than 64KB
+	 * blocks" -- the instruction verbatim. Not a one-byte quibble: an
+	 * exactly-64KB copy is the commonest large memcpy there is, and 64K is
+	 * the measured WORST case for this wait method (13% of busypoll
+	 * throughput, CPU/op moving the wrong way, 9.3 -> 13.0), so the shipped
+	 * default must leave it on the spin side. With >= the policy would also
+	 * have hinged on an unrelated knob: any nonzero DTO_CPU_SIZE_FRACTION
+	 * shrinks the DSA share of a 64KB copy below 64KB and makes it spin,
+	 * while the same call at fraction 0 blocked. */
+	if (xfer > agg_block_bytes)
+		goto arm;			/* no spin at all */
+
+	/* Spin to completion. agg_spin_cap_cyc is a safety valve, not a budget:
+	 * it sits two orders of magnitude above any completion that can
+	 * legitimately appear below the gate, and exists only so that a page
+	 * fault, a wedged descriptor or a saturated device cannot pin this
+	 * core. The deadline is sampled every 16th pause rather than every one
+	 * -- a pause is ~140 cycles and an rdtsc ~30, so testing each iteration
+	 * would stretch the poll period by ~20% and with it the detection
+	 * latency of the very completion this loop exists to catch. At 1-in-16
+	 * the tax is ~1.3%; widening further buys ~1% and is not worth touching
+	 * a validated loop for. */
+	deadline = __rdtsc() + agg_spin_cap_cyc;
+	it = 0;
+	while (*comp == 0) {
+		if ((++it & 15u) == 0 && __rdtsc() >= deadline)
+			goto spincap;
+		_mm_pause();
+	}
+	sv->spinhit++;
+	goto out;
+
+spincap:
+	/* The valve fired. Arm and block exactly as an over-threshold op does
+	 * -- NOT dsa_wait_spinyield, which would keep the thread on the
+	 * runqueue spinning and yielding for the duration of a fault, i.e. the
+	 * pathology this wait method exists to prevent. The valve does not feed
+	 * back into the gate: reacting to it would rebuild the estimator that
+	 * was just deleted, and would adapt on fault samples, which is
+	 * precisely what the old agg_outlier_cyc filter existed to stop. */
+	sv->spincap++;
+	if (atomic_exchange_explicit(&agg_spincap_logged, 1u,
+	    memory_order_relaxed) == 0)
+		LOG_ERROR("aggregator: spin cap expired on a %u-byte transfer; "
+		    "blocking instead. Page fault, device stall, or "
+		    "DTO_AGG_BLOCK_KB set too high. Further occurrences are "
+		    "counted in the per-slot spincap stat only.\n", xfer);
+	/* fall through */
+
+arm:
+	/* Already done? Deleting the pre-spin also deleted the free completion
+	 * check that spinning performed at iteration 0, and a descriptor can
+	 * easily have retired before the wait is even entered: with
+	 * DTO_CPU_SIZE_FRACTION the caller memcpys its own share of the buffer
+	 * BEFORE calling dsa_wait, which at a 50% split is ~5us of CPU work
+	 * against 1.86us of device time. Without this load such an op pays the
+	 * whole arm + kick + sweep + wake round trip -- 3-9us of cross-thread
+	 * CPU, the exact cost this wait method exists to avoid -- for a wait of
+	 * zero length. One load on a path that is about to issue a seq_cst RMW
+	 * anyway; it covers the xfer == 0 and spin-cap fall-throughs too, and
+	 * `out` is the identical exit the spin hit already takes. */
+	if (*comp != 0) {
+		sv->early++;
+		goto out;
+	}
+
+	s = &agg_slots[thr_agg_slot];
+	sv->block++;
+
+	/* ARM. A full-barrier RMW, not a release store: it is the publishing
+	 * half of the Dekker pair with the poller's park, and a release store
+	 * would not order the following load of this shard's park word. */
+	myseq = atomic_load_explicit(&s->seq, memory_order_relaxed) + 1; /* odd */
+	atomic_exchange_explicit(&s->seq, myseq, memory_order_seq_cst);
+	agg_kick(hot);
+
+	/* Post-arm window, default 0. Under the size gate a worker arms at t~0
+	 * of a descriptor that by construction needs at least
+	 * agg_block_bytes/56.6GB/s of device time -- 1.86us at the default
+	 * gate, more under queueing -- so a 1us window catches essentially
+	 * nothing and just burns the core the gate exists to give back. It
+	 * earned its keep under the old model, which armed only AFTER spinning
+	 * out an estimate, i.e. already near the expected completion. Retained
+	 * as a sweep axis because it is the correct recovery if the gate is
+	 * ever configured far down (at DTO_AGG_BLOCK_KB=8, ops modelling at
+	 * 0.85us really can land inside it). Guarded rather than merely
+	 * defaulted off: the unguarded loop still executes two rdtsc when the
+	 * knob is 0, on what is now the common path for every large op.
+	 *
+	 * Correctness never depended on it. The block loop re-tests *comp == 0
+	 * before every futex_wait, and if the poller has already CASed seq the
+	 * kernel's own compare returns EAGAIN immediately. Removing the window
+	 * can cost one extra syscall in a race; it cannot lose a wakeup. */
+	if (agg_postarm_cyc) {
+		uint64_t d2 = __rdtsc() + agg_postarm_cyc;
+
+		while (*comp == 0 && __rdtsc() < d2)
+			_mm_pause();
+	}
+
+	/* This shard's heartbeat, not a process-wide one. With one counter for
+	 * every poller a shard ticking at 600K/s makes hb != hb0 true on every
+	 * timeout, so a genuinely dead shard's workers never degrade -- while
+	 * one slow shard freezes a counter that is then blamed on three live
+	 * ones. */
+	hb0 = atomic_load_explicit(&hot->hb, memory_order_acquire);
+	dead_since = 0;
+	while (*comp == 0) {
+		struct timespec ts;
+		int r;
+
+		if (unlikely(atomic_load_explicit(&agg_stop,
+		    memory_order_relaxed)))
+			break;		/* finish by polling below */
+
+		ts.tv_sec = 0;
+		ts.tv_nsec = (long)to_us * 1000;
+		r = agg_futex_wait(&s->seq, myseq, &ts);
+		if (r == 0)
+			continue;			/* re-test *comp */
+		if (errno == EAGAIN || errno == EINTR)
+			continue;			/* seq moved on */
+		if (errno == ETIMEDOUT) {
+			uint64_t now, hb;
+
+			if (*comp != 0)
+				break;
+			sv->timeout++;
+			hb = atomic_load_explicit(&hot->hb,
+			    memory_order_acquire);
+			now = __rdtsc();
+			if (to_us < agg_to_max_us)
+				to_us = agg_to_max_us;
+			if (hb != hb0) {		/* poller is alive */
+				hb0 = hb;
+				dead_since = 0;
+				continue;
+			}
+			/* No sweep has completed since we armed. On the
+			 * oversubscribed machine this wait method exists for,
+			 * a SCHED_OTHER poller simply waiting for a slice is
+			 * by far the likeliest explanation, and a few hundred
+			 * microseconds of that is ordinary -- so it must not
+			 * be mistaken for poller death, which disables the
+			 * aggregator PROCESS-WIDE. Kick once, since a lost
+			 * unpark is the one cause we can actually repair, then
+			 * require the heartbeat to stay frozen for agg_dead_cyc
+			 * (tens of milliseconds, i.e. far longer than any
+			 * plausible scheduling delay) before degrading. */
+			if (dead_since == 0) {
+				dead_since = now;
+				agg_kick(hot);
+				continue;
+			}
+			if (now - dead_since < agg_dead_cyc)
+				continue;
+			atomic_store_explicit(&sh->degraded_until,
+			    now + agg_degrade_cyc, memory_order_relaxed);
+			break;
+		}
+		break;					/* self-rescue */
+	}
+
+	/* DISARM. Release store of myseq + 1 (even). If the poller already
+	 * CASed, this stores the identical value; seq never decreases. */
+	atomic_store_explicit(&s->seq, myseq + 1, memory_order_release);
+
+	/* The device still owns the destination buffer until it writes the
+	 * completion record, so this function must never return with the
+	 * status byte still zero -- not on degrade, not on shutdown, not on
+	 * poller death. */
+	if (unlikely(*comp == 0))
+		dsa_wait_spinyield(comp);
+
+out:
+	/* Order the status byte ahead of the caller's reads of
+	 * thr_comp.bytes_completed / .result / .crc_val. Free on x86. */
+	atomic_thread_fence(memory_order_acquire);
+}
+
+/* Returns the number of slots still armed with no completion yet. Sweeps only
+ * this poller's own range: a shard is a contiguous sub-range of exactly one
+ * NUMA node region, so a sweep never reads another socket's status bytes. */
+static uint32_t agg_sweep(struct agg_shard *sh, struct agg_shard_hot *hot)
+{
+	uint32_t lo = __atomic_load_n(&sh->lo, __ATOMIC_RELAXED);
+	uint32_t limit = __atomic_load_n(&sh->limit, __ATOMIC_RELAXED);
+	uint32_t hi = atomic_load_explicit(&hot->hi, memory_order_acquire);
+	uint32_t live = 0, n = 0, i, k;
+	struct {
+		uint32_t i, seq;
+	} g[AGG_SLOTS_MAX];
+
+	if (limit > AGG_SLOTS_MAX)
+		limit = AGG_SLOTS_MAX;
+	if (hi > limit)
+		hi = limit;
+
+	/* Pass A: collect the armed slots and start the completion-record
+	 * line fills up front, so the status loads below are MLP-bound
+	 * instead of serialized on LLC latency. An idle slot keeps the
+	 * NON-ZERO status of its last completed op, which is why armedness
+	 * has to be the filter and the status byte can never be one. */
+	for (i = lo; i < hi; i++) {
+		uint32_t sq = atomic_load_explicit(&agg_slots[i].seq,
+		    memory_order_acquire);
+
+		if ((sq & 1u) == 0)
+			continue;
+		g[n].i = i;
+		g[n].seq = sq;
+		n++;
+		__builtin_prefetch((const void *)&agg_recs[i].comp.status, 0, 0);
+	}
+
+	/* Pass B: read status, close the slot, then wake. The order matters
+	 * twice over: seq was loaded BEFORE status (so the CAS can only
+	 * succeed for the arming this status belongs to), and the CAS is
+	 * issued BEFORE the wake (so a worker arriving late at FUTEX_WAIT is
+	 * rejected by the kernel's compare instead of sleeping forever). */
+	for (k = 0; k < n; k++) {
+		uint32_t sq = g[k].seq;
+
+		i = g[k].i;
+		if (((volatile struct dsa_completion_record *)
+		    &agg_recs[i].comp)->status == 0) {
+			live++;
+			continue;
+		}
+		if (atomic_compare_exchange_strong_explicit(&agg_slots[i].seq,
+		    &sq, sq + 1, memory_order_acq_rel, memory_order_relaxed))
+			agg_futex_wake(&agg_slots[i].seq, 1);
+		else
+			live++;		/* the owner self-rescued */
+	}
+	atomic_fetch_add_explicit(&hot->hb, 1, memory_order_release);
+	return live;
+}
+
+/* Returns 1 if the park actually entered the futex sleep, which is the input
+ * to the rate-adaptive idle window in agg_main(). Poller-private, so it must
+ * be a return value and not a static: with P pollers a shared flag would be
+ * three other pollers' answer. */
+static int agg_park_wait(struct agg_shard *sh, struct agg_shard_hot *hot)
+{
+	/* Pure liveness backstop, not a wakeup mechanism: agg_kick() is what
+	 * unparks the poller, and a worker whose kick was somehow lost
+	 * self-rescues through its own futex timeout. Short timeouts here buy
+	 * nothing and cost a timer plus a full pre-park spin window in an
+	 * otherwise completely idle process. */
+	struct timespec ts = { 0, 100 * 1000 * 1000 };	/* 100 ms backstop */
+	uint32_t lo = __atomic_load_n(&sh->lo, __ATOMIC_RELAXED);
+	uint32_t limit = __atomic_load_n(&sh->limit, __ATOMIC_RELAXED);
+	uint32_t hi, i;
+	int slept = 0;
+
+	atomic_store_explicit(&hot->park, 1, memory_order_seq_cst);
+	/* seq_cst, not acquire: this load decides which slots the re-check
+	 * below covers, so it has to join the same total order as the claim's
+	 * CAS-max. See agg_claim_slot() for the execution this rules out. */
+	hi = atomic_load_explicit(&hot->hi, memory_order_seq_cst);
+	if (limit > AGG_SLOTS_MAX)
+		limit = AGG_SLOTS_MAX;
+	if (hi > limit)
+		hi = limit;
+	/* Re-check every slot AFTER publishing the park flag; see agg_kick()
+	 * for why this pair cannot both miss. */
+	for (i = lo; i < hi; i++)
+		if (atomic_load_explicit(&agg_slots[i].seq,
+		    memory_order_seq_cst) & 1u)
+			goto out;
+	if (atomic_load_explicit(&agg_stop, memory_order_seq_cst))
+		goto out;
+	slept = 1;
+	agg_futex_wait(&hot->park, 1, &ts);
+out:
+	atomic_store_explicit(&hot->park, 0, memory_order_seq_cst);
+	return slept;
+}
+
+static void *agg_main(void *arg)
+{
+	uint32_t sidx = (uint32_t)(uintptr_t)arg;
+	struct agg_shard *sh = &agg_shards[sidx];
+	struct agg_shard_hot *hot = &agg_hot[sidx];
+	uint64_t idle_deadline = 0, idle_cur = agg_idle_cyc;
+	char name[16] = "dto-agg";
+
+	/* This thread must never offload and must never consume an admission
+	 * slot; USE_ORIG_FUNC is now unconditionally true for it. */
+	thr_dsa_disabled = 1;
+	wq_index = -2;
+	thr_agg_slot = -2;
+	thr_agg_sh = NULL;
+	thr_agg_hot = NULL;
+	/* Formed by hand rather than with snprintf: this runs before the
+	 * thread has done anything else and stdio would drag an interposed
+	 * mem* call underneath it for a diagnostic string. */
+	name[7] = (char)('0' + (sidx / 10) % 10);
+	name[8] = (char)('0' + sidx % 10);
+	name[9] = '\0';
+	pthread_setname_np(pthread_self(), name);
+	/* Placement is decided once, at init, on the initializing thread:
+	 * agg_shard_cpus[] is either the operator's DTO_AGG_CPU + shard index
+	 * or this shard's NUMA node mask, and is invalid when neither applies
+	 * (the agg_nodes == 1 default, where today's code made no affinity
+	 * call at all). */
+	if (agg_shard_cpus_valid[sidx])
+		pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t),
+		    &agg_shard_cpus[sidx]);
+	if (agg_rt) {
+		struct sched_param p = { .sched_priority = 1 };
+
+		pthread_setschedparam(pthread_self(), SCHED_RR, &p);
+	}
+	atomic_store_explicit(&sh->started, 1, memory_order_release);
+
+	/* No logging, no malloc and no interposed mem* call below this point:
+	 * cleanup_dto() closes log_fd while this thread may still be alive. */
+	while (!atomic_load_explicit(&agg_stop, memory_order_relaxed)) {
+		if (agg_sweep(sh, hot) > 0) {
+			idle_deadline = 0;
+			_mm_pause();
+			continue;
+		}
+		/* No slot in this shard has ever been claimed, so nothing can
+		 * arrive until one is -- and a claim CAS-maxes hi before the
+		 * first arm, and that arm kicks. Park with NO spin window at
+		 * all. At P == 1 "the table is empty" means "this process
+		 * never offloads" and is rare; at P > 1 in a process with a
+		 * handful of threads it is the COMMON case for most shards,
+		 * and without this each of them burns a full DTO_AGG_IDLE_US
+		 * window before every park. */
+		if (atomic_load_explicit(&hot->hi, memory_order_relaxed) ==
+		    __atomic_load_n(&sh->lo, __ATOMIC_RELAXED)) {
+			agg_park_wait(sh, hot);
+			idle_deadline = 0;
+			continue;
+		}
+		/* Nothing is armed, so no completion can arrive until some
+		 * worker arms -- and arming kicks us. Spinning here is
+		 * therefore pure insurance against park/unpark churn, and its
+		 * cost is a whole core. Hold the window only as long as it
+		 * keeps paying: if the last park actually slept, the process
+		 * is slower than the window and the window halves; if it
+		 * returned without sleeping, arrivals are dense and it grows
+		 * back. A fixed window is the worst of both -- at mongod-like
+		 * rates (one offload every few hundred microseconds) a 200us
+		 * window never expires and the poller burns a core to serve a
+		 * few thousand ops per second. */
+		if (idle_deadline == 0) {
+			idle_deadline = __rdtsc() + idle_cur;
+		} else if (__rdtsc() >= idle_deadline) {
+			uint64_t t = __rdtsc();
+			int slept = agg_park_wait(sh, hot);
+
+			if (slept && __rdtsc() - t > idle_cur) {
+				idle_cur >>= 1;
+				if (idle_cur < agg_idle_min_cyc)
+					idle_cur = agg_idle_min_cyc;
+			} else {
+				idle_cur <<= 1;
+				if (idle_cur > agg_idle_cyc)
+					idle_cur = agg_idle_cyc;
+			}
+			idle_deadline = 0;
+		}
+		_mm_pause();
+	}
+
+	/* Drain: one last sweep so anyone whose op really completed gets the
+	 * real answer, then release every remaining waiter. Each woken worker
+	 * re-tests its status byte, sees agg_stop and polls its own descriptor
+	 * to completion, so nobody is left blocked and nobody returns with an
+	 * unwritten completion record. */
+	agg_sweep(sh, hot);
+	{
+		uint32_t hi = atomic_load_explicit(&hot->hi,
+		    memory_order_acquire);
+		uint32_t limit = __atomic_load_n(&sh->limit, __ATOMIC_RELAXED);
+		uint32_t i;
+
+		if (limit > AGG_SLOTS_MAX)
+			limit = AGG_SLOTS_MAX;
+		if (hi > limit)
+			hi = limit;
+		for (i = __atomic_load_n(&sh->lo, __ATOMIC_RELAXED); i < hi;
+		    i++) {
+			uint32_t sq = atomic_load_explicit(&agg_slots[i].seq,
+			    memory_order_acquire);
+
+			if (sq & 1u)
+				agg_futex_wake(&agg_slots[i].seq, INT_MAX);
+		}
+	}
+	atomic_store_explicit(&sh->started, 0, memory_order_release);
+	return NULL;
+}
+
+/* Turns DTO_AGG_CPU / the NUMA composition into one cpu_set_t per shard, once,
+ * on the initializing thread. Never pile pollers onto one CPU: that would
+ * serialize them and silently reproduce P == 1 throughput through a knob that
+ * appears to have been honoured. */
+static void agg_build_cpusets(void)
+{
+	cpu_set_t inherited;
+	int have_inherited;
+	uint32_t sidx;
+
+	have_inherited = pthread_getaffinity_np(pthread_self(),
+	    sizeof(inherited), &inherited) == 0;
+
+	for (sidx = 0; sidx < agg_npollers; sidx++)
+		agg_shard_cpus_valid[sidx] = 0;
+
+	if (agg_cpu >= 0) {
+		/* DTO_AGG_CPU keeps its type and gains a meaning for P > 1:
+		 * the FIRST CPU of a contiguous run, so poller s pins to
+		 * agg_cpu + s. At P == 1 that is agg_cpu, bit-for-bit today.
+		 * A run rather than a comma list because an operator carving
+		 * out cores has a range (isolcpus=84-87), and because
+		 * agg_getenv_int is this file's knob idiom -- a list parser
+		 * would be new string handling in an LD_PRELOAD initialiser
+		 * for a diagnostic knob.
+		 * With agg_nodes > 1 the run must therefore be ORDERED to
+		 * match the shard-to-node map (shards 0..ppn-1 on node 0,
+		 * ppn..2*ppn-1 on node 1, ...); with agg_nodes == 1 the whole
+		 * run must lie within the one node. A CPU on the wrong node is
+		 * rejected below rather than honoured: it is the single
+		 * placement agg_start_pollers' header comment forbids, because
+		 * a sweep is unconditional where a claim is once per thread. */
+		for (sidx = 0; sidx < agg_npollers; sidx++) {
+			int cpu = agg_cpu + (int)sidx;
+			int cpu_nd;
+
+			if (cpu >= CPU_SETSIZE ||
+			    (have_inherited && !CPU_ISSET(cpu, &inherited))) {
+				LOG_ERROR("aggregator: DTO_AGG_CPU run reaches cpu %d for shard %u, which is outside CPU_SETSIZE or this process's affinity mask; that poller is left unpinned\n",
+				    cpu, sidx);
+				continue;
+			}
+			/* agg_nodes > 1 is only ever set when numa_available()
+			 * succeeded, so numa_node_of_cpu is callable here for
+			 * the same reason it is on the claim path. */
+			cpu_nd = agg_nodes > 1 && agg_shards[sidx].node >= 0 ?
+			    numa_node_of_cpu(cpu) : -1;
+			if (cpu_nd >= 0 && cpu_nd != agg_shards[sidx].node) {
+				LOG_ERROR("aggregator: DTO_AGG_CPU would pin shard %u (slots [%u,%u) on node %d) to cpu %d, which is on node %d; that poller would take a cross-socket miss on every status byte of every sweep, so it is left unpinned -- order the DTO_AGG_CPU run to match the shard-to-node map or unset it\n",
+				    sidx, agg_shards[sidx].lo,
+				    agg_shards[sidx].limit,
+				    agg_shards[sidx].node, cpu, cpu_nd);
+				continue;
+			}
+			CPU_ZERO(&agg_shard_cpus[sidx]);
+			CPU_SET(cpu, &agg_shard_cpus[sidx]);
+			agg_shard_cpus_valid[sidx] = 1;
+		}
+		return;
+	}
+
+	/* Default. agg_nodes == 1 (every P == 1 config, and the measured
+	 * 86-core single-node machine) makes no affinity call at all, which is
+	 * bit-identical to the behaviour this replaces. With more than one
+	 * node a poller is bound to the CPU MASK OF ITS NODE -- node level,
+	 * never core level. Its agg_recs pages are homed on that node by first
+	 * touch and a wrong-socket poller takes a cross-socket miss on every
+	 * status byte of every sweep; but pinning to a specific core on the
+	 * oversubscribed machine this wait method exists for takes that core
+	 * from workers, and a SCHED_OTHER poller sharing a core with a
+	 * spinning worker is the exact interaction the heartbeat watchdog was
+	 * tuned around. */
+	if (numa_available() == -1)
+		return;
+	{
+		/* One allocation for the whole pool. init_dto() is also
+		 * reached from the pthread_atfork child handler, so every
+		 * allocation on this path is one more thing that has to be
+		 * safe there; pthread_create already allocates below, but
+		 * there is no reason to add sixteen more. */
+		struct bitmask *bm = numa_allocate_cpumask();
+
+		if (bm == NULL)
+			return;
+		for (sidx = 0; sidx < agg_npollers; sidx++) {
+			int i, any = 0;
+
+			if (agg_shards[sidx].node < 0)
+				continue;
+			if (numa_node_to_cpus(agg_shards[sidx].node, bm) != 0)
+				continue;
+			CPU_ZERO(&agg_shard_cpus[sidx]);
+			for (i = 0; i < CPU_SETSIZE &&
+			    (unsigned long)i < bm->size; i++) {
+				if (!numa_bitmask_isbitset(bm, i))
+					continue;
+				if (have_inherited &&
+				    !CPU_ISSET(i, &inherited))
+					continue;
+				CPU_SET(i, &agg_shard_cpus[sidx]);
+				any = 1;
+			}
+			if (any)
+				agg_shard_cpus_valid[sidx] = 1;
+			else
+				LOG_ERROR("aggregator: node %d has no CPU inside this process's affinity mask; shard %u is left unpinned\n",
+				    agg_shards[sidx].node, sidx);
+		}
+		numa_free_cpumask(bm);
+	}
+}
+
+/* One poller per shard, ~700 kops/s each. */
+#define AGG_POLLER_KOPS 700ULL
+/* Peak measured device throughput, used only to state the arrival rate the
+ * gate admits in the init log. */
+#define AGG_PEAK_BYTES_PER_S 222000000000ULL
+
+/* Composes the slot-to-shard partition with the NUMA claim partition, starts
+ * the pollers, repairs the table for any poller that could not be created,
+ * and only then publishes agg_started. Returns 0 when at least one poller is
+ * live and every claimable slot is swept by exactly one of them.
+ *
+ * A shard MUST be a contiguous sub-range of exactly one node region. The
+ * claim's NUMA partition exists so that a 4KB page of agg_recs (64 slots) is
+ * first-touched only by same-node threads; a poller sweeping across a node
+ * boundary reads those status bytes cross-socket on EVERY pass, which is
+ * worse than the per-op traffic the partition removed, because a sweep is
+ * unconditional where a claim is once per thread. */
+static int agg_start_pollers(void)
+{
+	/* ONE POLLER PER NODE by default -- the minimum that gives every node
+	 * region a sweeper, and the configuration the bring-up gate validated.
+	 *
+	 * It is tempting to derive this from the gate instead (peak device
+	 * bandwidth / DTO_AGG_BLOCK_KB, over AGG_POLLER_KOPS), and that
+	 * arithmetic is exactly what the warning below reports. It must not be
+	 * the DEFAULT, because it can only assume the gate's WORST-CASE
+	 * arrival rate while the pollers a process needs depends on the rate
+	 * it actually produces. Measured at 1MB, where the gate blocks
+	 * everything but the arrival rate is only ~214 kops/s: P=1 costs
+	 * 10.4us/op and 2.18 cores, P=4 14.4us and 3.08, P=8 23.4us and 4.98.
+	 * An extra poller costs very nearly one whole core, because a poller
+	 * whose shard has work in flight on most sweeps never reaches the park
+	 * path at all and the rate-adaptive idle window never gets to shrink.
+	 * Over-provisioning from a static worst case would therefore burn
+	 * cores in every process that is not at the gate's saturation point,
+	 * which is nearly all of them.
+	 *
+	 * The count is PER NODE: agg_claim_slot partitions the table by NUMA
+	 * node, so a process whose threads all run on one node is served only
+	 * by that node's pollers. Measured: at P=2 on a 2-node box a node-0
+	 * workload took claims in shard 0 alone and matched P=1 exactly. The
+	 * node multiply happens below, in the ppn composition. */
+	int def = agg_clamp((int)agg_nodes, 1, AGG_POLLERS_MAX);
+	int req = agg_clamp(agg_getenv_int("DTO_AGG_POLLERS", def), 1,
+	    AGG_POLLERS_MAX);
+	uint32_t node_span, ppn, d, j, sidx, i;
+	uint32_t created = 0;
+	sigset_t all, old_set;
+
+	for (sidx = 0; sidx < AGG_POLLERS_MAX; sidx++) {
+		agg_shards[sidx].lo = agg_shards[sidx].limit = 0;
+		agg_shards[sidx].node = -1;
+		agg_shards[sidx].created = 0;
+		agg_shards[sidx].tid = (pthread_t)0;
+		agg_shard_cpus_valid[sidx] = 0;
+		atomic_store_explicit(&agg_shards[sidx].started, 0,
+		    memory_order_relaxed);
+		atomic_store_explicit(&agg_shards[sidx].degraded_until, 0,
+		    memory_order_relaxed);
+		atomic_store_explicit(&agg_hot[sidx].park, 0,
+		    memory_order_relaxed);
+		atomic_store_explicit(&agg_hot[sidx].hb, 0,
+		    memory_order_relaxed);
+		atomic_store_explicit(&agg_hot[sidx].hi, 0,
+		    memory_order_relaxed);
+	}
+
+	node_span = agg_nslots / agg_nodes;	/* the claim's own expression */
+	if (node_span == 0)
+		node_span = 1;
+
+	if (req == 1) {
+		/* P == 1 is special-cased AHEAD of all composition. Without
+		 * it, ppn = max(1, 1/agg_nodes) = 1 would yield
+		 * P_eff = agg_nodes and break "P == 1 reproduces today's
+		 * behaviour exactly" on the commonest multi-socket
+		 * configuration. */
+		agg_npollers = 1;
+		agg_pollers_per_node = 1;
+		agg_shards[0].lo = 0;
+		agg_shards[0].limit = agg_nslots;
+		agg_shards[0].node = -1;
+	} else if (agg_nodes > AGG_POLLERS_MAX) {
+		/* More configured NUMA nodes than the shard table can hold.
+		 * Group WHOLE node regions per shard: such a shard does sweep
+		 * across a node boundary, which S3 exists to avoid, but every
+		 * node region is still swept by exactly one poller and no
+		 * region is split between two -- the correctness requirement.
+		 * Logged, because the alternative (silently leaving regions
+		 * unswept) is a permanent hang. */
+		uint32_t gsz = (agg_nodes + AGG_POLLERS_MAX - 1) /
+		    AGG_POLLERS_MAX;
+		uint32_t ng = (agg_nodes + gsz - 1) / gsz;
+
+		for (sidx = 0; sidx < ng; sidx++) {
+			uint32_t n0 = sidx * gsz, n1 = (sidx + 1) * gsz;
+
+			if (n1 > agg_nodes)
+				n1 = agg_nodes;
+			agg_shards[sidx].lo = n0 * node_span;
+			agg_shards[sidx].limit = (sidx == ng - 1) ?
+			    agg_nslots : n1 * node_span;
+			agg_shards[sidx].node = (int)n0;
+		}
+		agg_npollers = ng;
+		agg_pollers_per_node = 1;
+		LOG_ERROR("aggregator: %u configured NUMA nodes exceeds AGG_POLLERS_MAX %d; %u shards each cover %u whole node regions and will sweep across a node boundary\n",
+		    agg_nodes, AGG_POLLERS_MAX, ng, gsz);
+	} else {
+		/* Round DOWN, then floor at one poller per node. The claim
+		 * spreads threads evenly across nodes, so an asymmetric
+		 * allocation makes the under-served node's retire rate the
+		 * process-wide ceiling and the extra poller buys nothing.
+		 * Relaxing the floor is not an option: it would leave a node
+		 * region under no poller, and folding that region under a
+		 * neighbour is the cross-socket sweep forbidden above. The
+		 * consequence is logged rather than hidden -- agg_nodes counts
+		 * CONFIGURED nodes (numa_max_node() + 1), empty and CXL ones
+		 * included, so P = 4 becomes P_eff = 8 on a machine reporting
+		 * eight nodes with two populated. Those extra shards claim
+		 * nothing and park immediately. */
+		ppn = (uint32_t)req / agg_nodes;
+		if (ppn < 1)
+			ppn = 1;
+		if (ppn > node_span)		/* no shard may be empty */
+			ppn = node_span;
+		if (ppn * agg_nodes > AGG_POLLERS_MAX)
+			ppn = (uint32_t)AGG_POLLERS_MAX / agg_nodes;
+		if (ppn < 1)
+			ppn = 1;
+		for (d = 0; d < agg_nodes; d++) {
+			uint32_t nlo = d * node_span;
+			/* THE TAIL FOLD IS LOAD-BEARING. When agg_nodes does
+			 * not divide agg_nslots, the slots in
+			 * [agg_nodes * node_span, agg_nslots) lie outside
+			 * every node region but ARE reachable by the claim's
+			 * fallback arm. A slot that is claimable and swept by
+			 * nobody is a guaranteed hang, so the last node's
+			 * upper bound is forced to agg_nslots: the last
+			 * shard's swept range is deliberately wider than its
+			 * preferred-claim range. */
+			uint32_t nhi = (d == agg_nodes - 1) ? agg_nslots :
+			    (d + 1) * node_span;
+
+			for (j = 0; j < ppn; j++) {
+				sidx = d * ppn + j;
+				agg_shards[sidx].lo = nlo + (uint32_t)
+				    ((uint64_t)j * (nhi - nlo) / ppn);
+				agg_shards[sidx].limit = nlo + (uint32_t)
+				    ((uint64_t)(j + 1) * (nhi - nlo) / ppn);
+				agg_shards[sidx].node = agg_nodes > 1 ?
+				    (int)d : -1;
+			}
+		}
+		agg_npollers = ppn * agg_nodes;
+		agg_pollers_per_node = ppn;
+	}
+
+	/* Partition verification, before anything can be claimed. One loop
+	 * over at most sixteen shards, once per process; a gap is a permanent
+	 * hang for every thread that claims into it, so publishing a table
+	 * with one is never better than falling back to spinyield. */
+	{
+		uint32_t prev = 0;
+		int bad = agg_npollers == 0 || agg_npollers > AGG_POLLERS_MAX;
+
+		for (sidx = 0; !bad && sidx < agg_npollers; sidx++) {
+			if (agg_shards[sidx].lo != prev ||
+			    agg_shards[sidx].limit <= agg_shards[sidx].lo)
+				bad = 1;
+			prev = agg_shards[sidx].limit;
+		}
+		if (!bad && prev != agg_nslots)
+			bad = 1;
+		if (bad) {
+			LOG_ERROR("aggregator: computed shard partition is not a total, disjoint cover of %u slots; using spinyield\n",
+			    agg_nslots);
+			return -1;
+		}
+	}
+
+	if ((uint32_t)req != agg_npollers)
+		LOG_ERROR("aggregator: DTO_AGG_POLLERS=%d composed to %u pollers (%u node%s x %u per node); set DTO_AGG_POLLERS explicitly to override\n",
+		    req, agg_npollers, agg_nodes, agg_nodes == 1 ? "" : "s",
+		    agg_pollers_per_node);
+
+	for (i = 0; i < agg_nslots; i++)
+		agg_slot_shard[i] = 0;
+	for (sidx = 0; sidx < agg_npollers; sidx++) {
+		for (i = agg_shards[sidx].lo; i < agg_shards[sidx].limit; i++)
+			agg_slot_shard[i] = (uint8_t)sidx;
+		atomic_store_explicit(&agg_hot[sidx].hi, agg_shards[sidx].lo,
+		    memory_order_relaxed);
+	}
+
+	agg_build_cpusets();
+
+	/* Created one at a time, in shard order, so that a failure at shard s
+	 * is observed with s-1 live, s+1 not yet attempted, and -- because
+	 * agg_started is still clear -- no concurrent claimer anywhere. */
+	sigfillset(&all);		/* the pollers take no app signal */
+	pthread_sigmask(SIG_SETMASK, &all, &old_set);
+	for (sidx = 0; sidx < agg_npollers; sidx++) {
+		if (pthread_create(&agg_shards[sidx].tid, &agg_attr, agg_main,
+		    (void *)(uintptr_t)sidx) == 0) {
+			/* NOT started, which the poller sets only once it has
+			 * been scheduled: teardown has to run for a thread
+			 * that exists but has not run yet, or a short-lived
+			 * process unmaps the WQ portals and closes the log out
+			 * from under it. */
+			agg_shards[sidx].created = 1;
+			created++;
+		} else {
+			agg_shards[sidx].tid = (pthread_t)0;
+			LOG_ERROR("aggregator: pthread_create failed for shard %u [%u,%u)\n",
+			    sidx, agg_shards[sidx].lo, agg_shards[sidx].limit);
+		}
+	}
+	pthread_sigmask(SIG_SETMASK, &old_set, NULL);
+	agg_any_created = created > 0;
+	if (created == 0) {
+		LOG_ERROR("aggregator: no poller could be created, using spinyield\n");
+		return -1;
+	}
+
+	/* Repair, structurally rather than by a per-claim test. Widening a
+	 * live sibling's range is a plain store it picks up on its next
+	 * sweep; it can only ADD slots to that sweep, never remove one, so the
+	 * sibling cannot miss an arm it was already responsible for. And no
+	 * slot can be armed yet in any case, because agg_started is published
+	 * below. Never fold across a node boundary: that would trade a clean
+	 * spinyield fallback for a permanent cross-socket sweep. */
+	for (sidx = 0; sidx < agg_npollers; sidx++) {
+		uint32_t t;
+		int folded = 0;
+
+		if (agg_shards[sidx].created)
+			continue;
+		for (t = sidx; t-- > 0; ) {
+			if (agg_shards[t].node != agg_shards[sidx].node)
+				break;
+			if (!agg_shards[t].created)
+				continue;
+			if (agg_shards[t].limit < agg_shards[sidx].limit)
+				__atomic_store_n(&agg_shards[t].limit,
+				    agg_shards[sidx].limit, __ATOMIC_RELAXED);
+			folded = 1;
+			break;
+		}
+		for (t = sidx + 1; !folded && t < agg_npollers; t++) {
+			if (agg_shards[t].node != agg_shards[sidx].node)
+				break;
+			if (!agg_shards[t].created)
+				continue;
+			if (agg_shards[t].lo > agg_shards[sidx].lo)
+				__atomic_store_n(&agg_shards[t].lo,
+				    agg_shards[sidx].lo, __ATOMIC_RELAXED);
+			folded = 1;
+		}
+		if (folded) {
+			LOG_ERROR("aggregator: shard %u [%u,%u) has no poller; its slots were folded into a same-node sibling\n",
+			    sidx, agg_shards[sidx].lo, agg_shards[sidx].limit);
+			continue;
+		}
+		/* PRE-OWN the orphaned range. The claim's CAS from 0 then
+		 * fails forever, so those slots are simply not in the table:
+		 * no new test on any path, no cost anywhere, and child()'s
+		 * existing owner = 0 loop undoes it for free before init_dto()
+		 * re-runs. Shrinking agg_nslots instead is wrong -- it feeds
+		 * span and base in the claim, so it would silently re-point
+		 * every node's preferred region. A thread that loses its
+		 * node's region takes the claim's fallback arm to another
+		 * node's slot, or gets thr_agg_slot = -2 and spinyields under
+		 * the existing re-claim backoff: the existing table-full
+		 * behaviour, not a new failure mode. */
+		for (i = agg_shards[sidx].lo; i < agg_shards[sidx].limit; i++)
+			atomic_store_explicit(&agg_slots[i].owner, 1u,
+			    memory_order_relaxed);
+		LOG_ERROR("aggregator: shard %u [%u,%u) has no poller and no same-node sibling; those slots are retired (unclaimable)\n",
+		    sidx, agg_shards[sidx].lo, agg_shards[sidx].limit);
+	}
+
+	for (sidx = 0; sidx < agg_npollers; sidx++) {
+		if (!agg_shards[sidx].created)
+			continue;
+		for (i = agg_shards[sidx].lo; i < agg_shards[sidx].limit; i++)
+			agg_slot_shard[i] = (uint8_t)sidx;
+	}
+
+	/* Coverage verification after the repair: every slot is either swept
+	 * by exactly one LIVE shard or retired out of the table entirely. */
+	for (i = 0; i < agg_nslots; i++) {
+		uint32_t cov = 0;
+
+		for (sidx = 0; sidx < agg_npollers; sidx++)
+			if (agg_shards[sidx].created &&
+			    i >= agg_shards[sidx].lo &&
+			    i < agg_shards[sidx].limit)
+				cov++;
+		if (cov == 1)
+			continue;
+		if (cov == 0 && atomic_load_explicit(&agg_slots[i].owner,
+		    memory_order_relaxed) == 1u)
+			continue;
+		LOG_ERROR("aggregator: slot %u is swept by %u live shards after repair; using spinyield\n",
+		    i, cov);
+		atomic_store_explicit(&agg_stop, 1, memory_order_seq_cst);
+		for (sidx = 0; sidx < agg_npollers; sidx++) {
+			atomic_store_explicit(&agg_hot[sidx].park, 0,
+			    memory_order_seq_cst);
+			agg_futex_wake(&agg_hot[sidx].park, 1);
+		}
+		return -1;		/* cleanup_dto still joins them */
+	}
+
+	/* The gate and the poller count belong in ONE line. Lowering
+	 * DTO_AGG_BLOCK_KB without raising DTO_AGG_POLLERS is how the
+	 * throughput collapse this pool exists to fix gets recreated
+	 * somewhere new and quietly. */
+	{
+		/* PER NODE, not the pool total. agg_claim_slot partitions the
+		 * table by node, so a process confined to one node is served
+		 * only by that node's pollers and the pool figure overstates
+		 * its real ceiling by agg_nodes. Measured: at P=2 on a 2-node
+		 * box a node-0 workload used shard 0 alone and matched P=1
+		 * exactly, while the pool figure claimed twice the budget. */
+		uint32_t per_node = agg_npollers / agg_nodes;
+		uint64_t cap_kops;
+		uint64_t arr_kops = agg_block_bytes ?
+		    AGG_PEAK_BYTES_PER_S / 1000ULL / agg_block_bytes : 0;
+
+		if (per_node == 0)
+			per_node = 1;
+		cap_kops = (uint64_t)per_node * AGG_POLLER_KOPS;
+
+		LOG_TRACE("aggregator: %u poller%s over %u slots and %u NUMA node%s (%u per node), per-node retire budget ~%llu kops/s; gate blocks above %u bytes, which at peak device throughput admits ~%llu kops/s (break-even transfer size ~%llu KB)\n",
+		    agg_npollers, agg_npollers == 1 ? "" : "s", agg_nslots,
+		    agg_nodes, agg_nodes == 1 ? "" : "s", per_node,
+		    (unsigned long long)cap_kops, agg_block_bytes,
+		    (unsigned long long)arr_kops,
+		    (unsigned long long)(AGG_PEAK_BYTES_PER_S / 1024ULL /
+			(cap_kops * 1000ULL)));
+		if (agg_block_bytes == 0)
+			LOG_ERROR("aggregator: DTO_AGG_BLOCK_KB=0 blocks every offloaded op regardless of size; the per-node retire budget (%u poller%s, ~%llu kops/s) is then the only ceiling\n",
+			    per_node, per_node == 1 ? "" : "s",
+			    (unsigned long long)cap_kops);
+		else if (arr_kops > cap_kops)
+			LOG_ERROR("aggregator: the DTO_AGG_BLOCK_KB=%u gate admits up to ~%llu kops/s but %u poller%s per node retire only ~%llu kops/s; raise DTO_AGG_POLLERS or the gate\n",
+			    agg_block_bytes >> 10,
+			    (unsigned long long)arr_kops, per_node,
+			    per_node == 1 ? "" : "s",
+			    (unsigned long long)cap_kops);
+	}
+
+	/* Only now is the table open for claims. */
+	atomic_store_explicit(&agg_started, 1, memory_order_release);
+	return 0;
+}
+
+/* WAIT_AGGREGATOR never reaches here: the aggregator path is dispatched
+ * before the auto_adjust_knobs switch, and the auto-tuning heuristics that
+ * call this count wait-loop iterations, a signal that is meaningless for a
+ * thread that blocks. */
 static __always_inline void __dsa_wait(const volatile uint8_t *comp)
 {
         switch(wait_method) {
@@ -525,6 +2183,9 @@ static __always_inline void __dsa_wait(const volatile uint8_t *comp)
 static __always_inline void dsa_wait_no_adjust(const volatile uint8_t *comp)
 {
     switch (wait_method) {
+        case WAIT_SPINYIELD:
+            dsa_wait_spinyield(comp);
+            break;
         case WAIT_YIELD:
             dsa_wait_yield(comp);
             break;
@@ -537,6 +2198,12 @@ static __always_inline void dsa_wait_no_adjust(const volatile uint8_t *comp)
         case WAIT_BUSYPOLL:
             dsa_wait_busy_poll(comp);
             break;
+        case WAIT_AGGREGATOR:
+            /* transfer size is not available here; the gate treats 0 as
+             * unknown and blocks. Note WAIT_SLEEP below deliberately falls
+             * through */
+            dsa_wait_aggregator(comp, 0);
+            break;
         case WAIT_SLEEP:
             // This method is not typically used in high-performance scenarios but
             // gives a good demonstration of how much CPU time can be reduced
@@ -546,6 +2213,57 @@ static __always_inline void dsa_wait_no_adjust(const volatile uint8_t *comp)
         default:
             dsa_wait_busy_poll(comp);
     }
+}
+
+/* Wait for a CALLER-OWNED completion record (the public async and batch ops).
+ *
+ * These records are deliberately NOT aggregated, and the reason is an
+ * ordering one rather than a CAS one. To aggregate them the poller would have
+ * to be handed a pointer into the caller's storage, and its sequence is:
+ * load seq (odd) -> load the registered pointer -> DEREFERENCE -> CAS. The
+ * CAS is issued AFTER the dereference, so a failing CAS suppresses a spurious
+ * WAKE but cannot retroactively make the LOAD legal. The hazardous
+ * interleaving is precisely the one where the owner is no longer blocked: it
+ * sees its status byte, disarms, returns from its wait, returns from the
+ * function whose op was a local array in a stack frame, and the thread exits
+ * -- glibc's stack cache munmaps past its 40MB limit. The poller can be
+ * descheduled between its seq load and the dereference for an unbounded time,
+ * so there is no bound on the window from its side. Heap storage does not
+ * rescue it either: dto_batch_op_free can return the page to the OS. The
+ * poller dereferencing nothing but agg_slots[] and agg_recs[], both .bss for
+ * the life of the process, is exactly why the aggregator has no lifetime
+ * problems at all; registering caller pointers spends that.
+ *
+ * So the size gate is applied HERE, directly, against the same threshold and
+ * the same spin cap the interposed path uses: at or below it spin, above it
+ * hand the core back through the scheduler. This must never call
+ * dsa_wait_aggregator() -- a foreign comp fails its pointer-identity test and
+ * falls through to spinyield having already discarded the transfer size,
+ * which reaches the right place by accident, with no gate applied and the
+ * misleading appearance of using the aggregator. */
+static void dto_wait_caller_owned(const volatile uint8_t *comp, uint64_t bytes)
+{
+	if (wait_method != WAIT_AGGREGATOR) {
+		dsa_wait_no_adjust(comp);
+	} else if (bytes != 0 && bytes <= agg_block_bytes) {
+		/* Sampling the deadline every 16th pause, and why, is lifted
+		 * unchanged from dsa_wait_aggregator's spin loop. */
+		uint64_t deadline = __rdtsc() + agg_spin_cap_cyc;
+		uint32_t it = 0;
+
+		while (*comp == 0) {
+			if ((++it & 15u) == 0 && __rdtsc() >= deadline) {
+				dsa_wait_spinyield(comp);
+				break;
+			}
+			_mm_pause();
+		}
+	} else {
+		dsa_wait_spinyield(comp);
+	}
+	/* Order the status byte ahead of the caller's reads of crc_val /
+	 * bytes_completed, exactly as dsa_wait_aggregator's out: does. */
+	atomic_thread_fence(memory_order_acquire);
 }
 
 
@@ -632,10 +2350,146 @@ static __always_inline void dsa_wait_and_adjust_v2(const volatile uint8_t *comp)
     }
 }
 
+/* Grow or shrink the LFU slot count from the retry rate of the closing
+ * window. Shrink must dispossess holders of the slots being retired: their
+ * generation is bumped (holder fast path fails) and ownership cleared so a
+ * later regrow starts from free slots. Thresholds: >2% WQ-full rejections
+ * is backpressure, a clean window is headroom. */
+/* CAS K downward and retire the dropped slots: generation bump evicts the
+ * holders lazily, cleared ownership lets a regrow start from free slots.
+ * Returns the new K, or -1 if the CAS lost. */
+static int lfu_shrink_to(int k, int nk)
+{
+	int i;
+
+	if (!atomic_compare_exchange_strong(&lfu_k, &k, nk))
+		return -1;
+	for (i = nk; i < k; i++) {
+		atomic_fetch_add(&dsa_slots[i].gen, 1);
+		atomic_store(&dsa_slots[i].owner, -1);
+	}
+	return nk;
+}
+
+static void lfu_adjust_k(void)
+{
+	uint64_t r = atomic_exchange(&k_win_retries, 0);
+	int k = atomic_load(&lfu_k);
+	int nk;
+
+	if (r * 50 > LFU_K_WINDOW && k > lfu_k_min) {
+		nk = k - LFU_K_STEP < lfu_k_min ? lfu_k_min : k - LFU_K_STEP;
+		if (lfu_shrink_to(k, nk) >= 0)
+			LOG_TRACE("lfu_auto_k: shrink %d -> %d (%llu retries/%d)\n",
+			    k, nk, (unsigned long long)r, LFU_K_WINDOW);
+	} else if (r == 0 && k < lfu_k_max) {
+		nk = k + LFU_K_STEP > lfu_k_max ? lfu_k_max : k + LFU_K_STEP;
+		if (atomic_compare_exchange_strong(&lfu_k, &k, nk))
+			LOG_TRACE("lfu_auto_k: grow %d -> %d (clean window)\n",
+			    k, nk);
+	}
+}
+
+/* Latency-trend controller, run by the thread that closes a window. */
+static void lat_window_close(void)
+{
+	uint64_t cycles = atomic_exchange(&lat_win_cycles, 0);
+	uint64_t bytes = atomic_exchange(&lat_win_bytes, 0);
+	uint64_t kb = bytes >> 10 ? bytes >> 10 : 1;
+	uint64_t cpkb = (cycles << 8) / kb;
+	int k = atomic_load(&lfu_k);
+	int nk;
+
+	atomic_store(&lat_win_count, 0);
+
+	if (lat_ref_cpkb == 0) {		/* bootstrap window */
+		lat_ref_cpkb = cpkb;
+		return;
+	}
+	if (lat_freeze) {			/* queue drain after a shrink */
+		lat_freeze--;
+		lat_ref_cpkb = (3 * lat_ref_cpkb + cpkb) / 4;
+		return;
+	}
+
+	if (cpkb * 100 > lat_ref_cpkb * (uint64_t)lat_eps_num) {
+		if (k > lfu_k_min) {
+			nk = k - 2 * LFU_K_STEP;
+			if (nk < lfu_k_min)
+				nk = lfu_k_min;
+			if (lfu_shrink_to(k, nk) >= 0) {
+				lat_freeze = 2;
+				LOG_TRACE("lfu_auto_k: lat shrink %d -> %d (cpkb %llu ref %llu)\n",
+				    k, nk, (unsigned long long)cpkb,
+				    (unsigned long long)lat_ref_cpkb);
+			}
+		}
+	} else if (k < lfu_k_max) {
+		nk = k + LFU_K_STEP > lfu_k_max ? lfu_k_max : k + LFU_K_STEP;
+		if (atomic_compare_exchange_strong(&lfu_k, &k, nk))
+			LOG_TRACE("lfu_auto_k: lat grow %d -> %d (cpkb %llu ref %llu)\n",
+			    k, nk, (unsigned long long)cpkb,
+			    (unsigned long long)lat_ref_cpkb);
+	}
+	lat_ref_cpkb = (3 * lat_ref_cpkb + cpkb) / 4;
+}
+
+static __always_inline void lfu_account_submit(int retried)
+{
+	uint64_t subs;
+
+	if (lfu_auto_k != 1)
+		return;
+	if (retried)
+		atomic_fetch_add_explicit(&k_win_retries, 1,
+		    memory_order_relaxed);
+	subs = atomic_fetch_add_explicit(&k_win_submits, 1,
+	    memory_order_relaxed) + 1;
+	if ((subs & (LFU_K_WINDOW - 1)) == 0)
+		lfu_adjust_k();
+}
+
+/* Latency-signal submit hook: start timing 1 of every LAT_SAMPLE_PERIOD
+ * successful submissions on this thread. Non-sampled cost is one TLS
+ * decrement; the descriptor/completion pair is thread-local so the sample
+ * needs no tagging. */
+static __always_inline void lfu_lat_submit(uint32_t xfer)
+{
+	if (lfu_auto_k != 2)
+		return;
+	if (thr_lat_ctr != 0) {
+		thr_lat_ctr--;
+		return;
+	}
+	thr_lat_ctr = LAT_SAMPLE_PERIOD;
+	thr_lat_bytes = xfer;
+	thr_lat_t0 = __rdtsc();
+}
+
+static __always_inline void lfu_lat_complete(void)
+{
+	if (lfu_auto_k != 2 || thr_lat_bytes == 0)
+		return;
+	atomic_fetch_add_explicit(&lat_win_cycles, __rdtsc() - thr_lat_t0,
+	    memory_order_relaxed);
+	atomic_fetch_add_explicit(&lat_win_bytes, thr_lat_bytes,
+	    memory_order_relaxed);
+	thr_lat_bytes = 0;
+	if (atomic_fetch_add_explicit(&lat_win_count, 1,
+	    memory_order_relaxed) == LAT_WINDOW - 1)
+		lat_window_close();
+}
+
 static __always_inline int dsa_wait(struct dto_wq *wq,
 	struct dsa_hw_desc *hw, volatile uint8_t *comp)
 {
-	switch (auto_adjust_knobs) {
+	/* Dispatched ahead of the knobs switch so the aggregator gets the
+	 * transfer size (it decides spin-vs-block from the transfer size) and
+	 * stays selected
+	 * even if auto-tuning is forced back on. */
+	if (wait_method == WAIT_AGGREGATOR)
+		dsa_wait_aggregator(comp, hw->xfer_size);
+	else switch (auto_adjust_knobs) {
             case AUTO_ADJUST_KNOBS:
                 dsa_wait_and_adjust(comp);
                 break;
@@ -645,6 +2499,8 @@ static __always_inline int dsa_wait(struct dto_wq *wq,
             default:
                 dsa_wait_no_adjust(comp);
         }
+
+	lfu_lat_complete();
 
 	if (likely(*comp == DSA_COMP_SUCCESS)) {
 		thr_bytes_completed += hw->xfer_size;
@@ -666,8 +2522,11 @@ static __always_inline int dsa_submit(struct dto_wq *wq,
 
 	if (wq->wq_mmapped) {
 		ret = enqcmd(hw, wq->wq_portal);
-		if (!ret)
+		if (!ret) {
+			lfu_account_submit(0);
+			lfu_lat_submit(hw->xfer_size);
 			return SUCCESS;
+		}
 	} else {
 		ret = write(wq->wq_fd, hw, sizeof(*hw));
 		if (ret == sizeof(*hw))
@@ -675,6 +2534,7 @@ static __always_inline int dsa_submit(struct dto_wq *wq,
 		else
 			return FAIL_OTHERS;
 	}
+	lfu_account_submit(1);
 	return RETRY;
 }
 
@@ -702,7 +2562,10 @@ static __always_inline int dsa_execute(struct dto_wq *wq,
         }
 
 	if (!ret) {
-	        switch (auto_adjust_knobs) {
+		/* see dsa_wait(): size-gated dispatch, knobs-independent */
+		if (wait_method == WAIT_AGGREGATOR)
+			dsa_wait_aggregator(comp, hw->xfer_size);
+		else switch (auto_adjust_knobs) {
                     case AUTO_ADJUST_KNOBS:
                         dsa_wait_and_adjust(comp);
                         break;
@@ -727,6 +2590,28 @@ static __always_inline int dsa_execute(struct dto_wq *wq,
 }
 
 #ifdef DTO_STATS_SUPPORT
+static void print_stats(void);
+
+/* Dump aggregated stats to the log every DTO_STATS_DUMP_SEC while the
+ * workload runs, so long-lived processes that never run library
+ * destructors (or are killed) still produce statistics. */
+#define DTO_STATS_DUMP_SEC 30
+static _Atomic long stats_last_dump_sec;
+
+static void maybe_dump_stats(void)
+{
+	struct timespec now;
+	long prev;
+
+	clock_gettime(CLOCK_BOOTTIME, &now);
+	prev = atomic_load(&stats_last_dump_sec);
+	if (now.tv_sec - prev < DTO_STATS_DUMP_SEC)
+		return;
+	if (atomic_compare_exchange_strong(&stats_last_dump_sec, &prev,
+					   now.tv_sec))
+		print_stats();
+}
+
 static void update_stats(int op, size_t n, size_t bytes_completed,
 		uint64_t elapsed_ns, int group, int error_code)
 {
@@ -762,12 +2647,16 @@ static void update_stats(int op, size_t n, size_t bytes_completed,
 	tl_stats->lat_counter[bucket][group][op] += elapsed_ns;
 	if (group == DSA_CALL_FAILED)
 		++tl_stats->fail_counter[bucket][error_code];
+	maybe_dump_stats();
 }
 
 static void print_stats(void)
 {
 	struct timespec dto_end_time;
-	struct thread_stats aggregated_stats;
+	/* Static: this is ~250KB and print_stats can run on an application
+	 * thread via the periodic dump; single writer is ensured by the
+	 * dump rate-limit CAS and the destructor ordering. */
+	static struct thread_stats aggregated_stats;
 	int num_threads;
 
 	if (likely(!collect_stats))
@@ -776,10 +2665,39 @@ static void print_stats(void)
 	clock_gettime(CLOCK_BOOTTIME, &dto_end_time);
 
 	LOG_TRACE("DTO Run Time: %ld ms\n", TS_NS(dto_start_time, dto_end_time)/1000000);
+	if (dsa_admission == ADMIT_LFU) {
+		int k = atomic_load(&lfu_k);
+
+		if (ticket_mode) {
+			int held = 0, hinted_held = 0;
+
+			for (int si = 0; si < k; si++) {
+				if (atomic_load_explicit(&dsa_slots[si].owner,
+				    memory_order_relaxed) >= 0) {
+					held++;
+					if (atomic_load_explicit(
+					    &dsa_slots[si].hinted,
+					    memory_order_relaxed))
+						hinted_held++;
+				}
+			}
+			LOG_TRACE("DTO LFU slots (K): %d held: %d hinted: %d\n",
+			    k, held, hinted_held);
+		} else {
+			LOG_TRACE("DTO LFU slots (K): %d\n", k);
+		}
+	}
+	if (dto_shed)
+		LOG_TRACE("DTO shed level: %d\n", atomic_load(&shed_level));
 	LOG_TRACE("DTO CPU Fraction: %.2f \n", cpu_size_fraction/100.0);
 
 	/* Aggregate all thread-local stats */
-	memset(&aggregated_stats, 0, sizeof(aggregated_stats));
+	/* Never the interposed memset: this runs on an application thread
+	 * from inside a memop's stats epilogue, and the 250KB fill would be
+	 * offloaded through that thread's own descriptor and completion
+	 * record -- clobbering the result of the operation still being
+	 * consumed (observed as CRC 0 / false checksum mismatches). */
+	orig_memset(&aggregated_stats, 0, sizeof(aggregated_stats));
 
 	pthread_mutex_lock(&stats_registry_lock);
 	num_threads = atomic_load(&global_stats_count);
@@ -1119,7 +3037,7 @@ static int dsa_init_from_wq_list(char *wq_list)
 		if (rc)
 			goto fail_wq;
 
-		snprintf(wqs[num_wqs].wq_path, PATH_MAX, "/dev/dsa/%s", wq);
+		snprintf(wqs[num_wqs].wq_path, sizeof(wqs[num_wqs].wq_path), "/dev/dsa/%s", wq);
 
 		// open DSA WQ
 		wqs[num_wqs].wq_fd = open(wqs[num_wqs].wq_path, O_RDWR);
@@ -1282,7 +3200,7 @@ static int dsa_init_from_accfg(void)
 	for (i = 0; i < num_wqs; i++) {
 		struct accfg_wq *acc_wq = wqs[i].acc_wq;
 
-		rc = accfg_wq_get_user_dev_path(acc_wq, wqs[i].wq_path, PATH_MAX);
+		rc = accfg_wq_get_user_dev_path(acc_wq, wqs[i].wq_path, sizeof(wqs[i].wq_path));
 		if (rc) {
 			LOG_ERROR("Error getting device path\n");
 			goto fail_wq;
@@ -1361,6 +3279,10 @@ static int dsa_init(void)
 			wait_method = WAIT_BUSYPOLL;
 			min_avg_waits = MIN_AVG_POLL_WAITS;
 			max_avg_waits = MAX_AVG_POLL_WAITS;
+		} else if (!strncmp(env_str, wait_names[WAIT_SPINYIELD], strlen(wait_names[WAIT_SPINYIELD]))) {
+			wait_method = WAIT_SPINYIELD;
+			min_avg_waits = MIN_AVG_YIELD_WAITS;
+			max_avg_waits = MAX_AVG_YIELD_WAITS;
 		} else if (!strncmp(env_str, wait_names[WAIT_YIELD], strlen(wait_names[WAIT_YIELD]))) {
 			wait_method = WAIT_YIELD;
 			min_avg_waits = MIN_AVG_YIELD_WAITS;
@@ -1404,7 +3326,27 @@ static int dsa_init(void)
                         LOG_ERROR("sleep not supported for partial offloading (fraction > 0 and/or autotuning is selected\n");
                         wait_method = WAIT_BUSYPOLL;
                     }
-                }
+                } else if (!strncmp(env_str, wait_names[WAIT_AGGREGATOR],
+				strlen(wait_names[WAIT_AGGREGATOR]))) {
+			wait_method = WAIT_AGGREGATOR;
+			min_avg_waits = MIN_AVG_POLL_WAITS;
+			max_avg_waits = MAX_AVG_POLL_WAITS;
+			/* DTO_AUTO_ADJUST_KNOBS is parsed before dsa_init() is
+			 * called, so clearing it here sticks. The heuristic's
+			 * input is the number of wait-loop iterations, which
+			 * is ~1 whenever the thread blocks, so leaving it on
+			 * would feed the tuner a constant. */
+			if (auto_adjust_knobs) {
+				/* LOG_ERROR, not LOG_TRACE: this silently
+				 * changes a second tuning axis, so an A/B of
+				 * aggregator against umwait with
+				 * DTO_AUTO_ADJUST_KNOBS set would be comparing
+				 * two things at once. */
+				LOG_ERROR("aggregator: DTO_AUTO_ADJUST_KNOBS=%d ignored; benchmark both arms with it off\n",
+					auto_adjust_knobs);
+				auto_adjust_knobs = 0;
+			}
+		}
 	}
 
 	env_str = getenv("DTO_WQ_LIST");
@@ -1547,6 +3489,11 @@ static int init_dto(void)
 
 		if (collect_stats) {
 			clock_gettime(CLOCK_BOOTTIME, &dto_start_time);
+			/* Arm the periodic dump so the first one fires a full
+			 * interval from now: dumping on the very first
+			 * operation puts a large print in the middle of the
+			 * host application's early single-threaded init. */
+			atomic_store(&stats_last_dump_sec, dto_start_time.tv_sec);
 			/* Change the log level to 'trace' so that the
 			 * stats can be logged
 			 */
@@ -1588,6 +3535,17 @@ static int init_dto(void)
 			 * memcpy/memset interposition on the CPU (e.g.
 			 * DTO_MIN_BYTES very large, DTO_CRC_MIN_BYTES small).
 			 * Defaults to dsa_min_size when unset. */
+			env_str = getenv("DTO_SHED");
+			if (env_str != NULL &&
+			    strtoul(env_str, NULL, 10) == 1)
+				dto_shed = 1;
+			env_str = getenv("DTO_SHED_HI_US");
+			if (env_str != NULL && atoi(env_str) > 0)
+				shed_hi_us = atoi(env_str);
+			env_str = getenv("DTO_SHED_LO_US");
+			if (env_str != NULL && atoi(env_str) > 0)
+				shed_lo_us = atoi(env_str);
+
 			env_str = getenv("DTO_CRC_MIN_BYTES");
 
 			if (env_str != NULL) {
@@ -1670,6 +3628,54 @@ static int init_dto(void)
                                 if (errno || dsa_max_threads < 0)
                                         dsa_max_threads = 0;
                                 LOG_TRACE("dsa_max_threads: %d\n", dsa_max_threads);
+			}
+
+			env_str = getenv("DTO_DSA_ADMISSION");
+			if (env_str != NULL && (!strcmp(env_str, "lfu") ||
+			    !strcmp(env_str, "ticket"))) {
+				dsa_admission = ADMIT_LFU;
+				ticket_mode = !strcmp(env_str, "ticket");
+				if (dsa_max_threads <= 0)
+					dsa_max_threads = 64;
+				if (dsa_max_threads > DSA_SLOTS_MAX)
+					dsa_max_threads = DSA_SLOTS_MAX;
+				for (int si = 0; si < DSA_SLOTS_MAX; si++)
+					atomic_store(&dsa_slots[si].owner, -1);
+				atomic_store(&lfu_k, dsa_max_threads);
+
+				env_str = getenv("DTO_LFU_AUTO_K");
+				if (env_str != NULL) {
+					lfu_auto_k = strtoul(env_str, NULL, 10);
+					if (lfu_auto_k < 0 || lfu_auto_k > 2)
+						lfu_auto_k = 0;
+				}
+				env_str = getenv("DTO_LFU_LAT_EPS");
+				if (env_str != NULL && atoi(env_str) > 100)
+					lat_eps_num = atoi(env_str);
+				env_str = getenv("DTO_LFU_FREQ_SAMPLE");
+				if (env_str != NULL && atoi(env_str) >= 1 &&
+				    atoi(env_str) <= 256) {
+					freq_sample = atoi(env_str);
+					age_window_samples =
+					    AGE_WINDOW_OPS / freq_sample;
+					if (age_window_samples < 1024)
+						age_window_samples = 1024;
+				}
+				env_str = getenv("DTO_LFU_K_MIN");
+				if (env_str != NULL)
+					lfu_k_min = atoi(env_str);
+				env_str = getenv("DTO_LFU_K_MAX");
+				if (env_str != NULL)
+					lfu_k_max = atoi(env_str);
+				if (lfu_k_min < 1)
+					lfu_k_min = 1;
+				if (lfu_k_max > DSA_SLOTS_MAX)
+					lfu_k_max = DSA_SLOTS_MAX;
+				if (lfu_k_max < lfu_k_min)
+					lfu_k_max = lfu_k_min;
+				LOG_TRACE("dsa_admission: %s, slots: %d, auto_k: %d [%d..%d]\n",
+					ticket_mode ? "ticket" : "lfu",
+					dsa_max_threads, lfu_auto_k, lfu_k_min, lfu_k_max);
                         }
 
 			if (dsa_init()) {
@@ -1687,11 +3693,214 @@ static int init_dto(void)
     			freq *= num;
     			freq /= den;
     			LOG_TRACE( "CPU freq = %u kHz\n", freq );
+			if (freq > 0) {
+				tsc_khz = freq;
+				shed_hi_cycles =
+				    (uint64_t)shed_hi_us * tsc_khz / 1000;
+				shed_lo_cycles =
+				    (uint64_t)shed_lo_us * tsc_khz / 1000;
+				{
+					int us = 8;
+					const char *e =
+					    getenv("DTO_SPINYIELD_US");
+
+					if (e != NULL && atoi(e) > 0)
+						us = atoi(e);
+					spinyield_cycles =
+					    (uint64_t)us * tsc_khz / 1000;
+				}
+			}
+			if (dto_shed)
+				LOG_TRACE("shed: enabled, hi %d us (%llu cyc), lo %d us (%llu cyc)\n",
+				    shed_hi_us,
+				    (unsigned long long)shed_hi_cycles,
+				    shed_lo_us,
+				    (unsigned long long)shed_lo_cycles);
     			LOG_TRACE( "Requested wait: %llu nsec\n", tpause_wait_time );
     			tmp = tpause_wait_time;
     			tmp *= freq;
     			tpause_wait_time = tmp / NSEC_PER_MSEC;
     			LOG_TRACE( "Requested wait duration: %llu cycles\n", tpause_wait_time );
+
+			/* Started here, before dto_initialized = 1, so that
+			 * every interposed mem* call issued from inside
+			 * pthread_create's allocator still takes the
+			 * dto_internal_* path: there is no re-entrancy window
+			 * to guard. Creating the poller lazily from the wait
+			 * path would put pthread_create underneath an
+			 * interposed memcpy. */
+			if (wait_method == WAIT_AGGREGATOR && num_wqs > 0 &&
+			    !use_std_lib_calls) {
+				/* every knob is clamped: a negative or absurd
+				 * value must not turn into a huge unsigned
+				 * cycle budget or a zero futex timeout */
+				/* SIZE GATE. ABOVE this a copy arms and blocks
+				 * with no spin at all; at or below it spins to
+				 * completion. The compare is strict, so 64 leaves
+				 * an exactly-64KB copy -- the measured worst case
+				 * for this wait method -- on the spin side.
+				 * 64KB is the instructed default
+				 * (1.86us of device time by the measured cost
+				 * model). The ">4us" reading of the same
+				 * instruction is ~187KB, and the microbenchmark
+				 * crossover is between 128 and 256, so
+				 * 64/128/187/256/512 are the sweep points. 0
+				 * blocks every op; 1048576 (1GB) spins every op.
+				 * Both ends are valid sweep bounds. Clamped in
+				 * KB so the shift cannot overflow the uint32_t
+				 * it is compared against. */
+				agg_block_bytes = (uint32_t)agg_clamp(
+				    agg_getenv_int("DTO_AGG_BLOCK_KB", 64),
+				    0, 1048576) << 10;
+
+				agg_postarm_cyc = agg_us_to_cyc(agg_clamp(
+				    agg_getenv_int("DTO_AGG_POSTARM_US", 0),
+				    0, 10000));
+				agg_idle_cyc = agg_us_to_cyc(agg_clamp(
+				    agg_getenv_int("DTO_AGG_IDLE_US", 200),
+				    0, 1000000));
+				agg_idle_min_cyc = agg_us_to_cyc(agg_clamp(
+				    agg_getenv_int("DTO_AGG_IDLE_MIN_US", 4),
+				    0, 1000000));
+				/* never 0: the window is halved and doubled,
+				 * and 0 is an absorbing state */
+				if (agg_idle_min_cyc == 0)
+					agg_idle_min_cyc = 1;
+				if (agg_idle_min_cyc > agg_idle_cyc)
+					agg_idle_min_cyc = agg_idle_cyc;
+				/* SAFETY VALVE for the spin path, which under the
+				 * gate has no other bound. dto_dsa_bof defaults
+				 * to 1, so a page fault does NOT abort the
+				 * descriptor with status 0x03 -- the device
+				 * stalls it while the IOMMU is serviced and
+				 * writes no completion record for the whole
+				 * duration. A wedged descriptor or a WQ reset
+				 * writes none ever. Neither may pin a core.
+				 * 200us is ~100x the device time of the largest
+				 * op that can reach the spin path at the default
+				 * gate, ~20x a heavily queued one, and 250x
+				 * below agg_dead_cyc, so it always fires long
+				 * before the poller-death watchdog can be
+				 * implicated, and never in steady state.
+				 *
+				 * The floor is the load-bearing part. The cap is
+				 * absolute time, but the spin path's legitimate
+				 * duration is a function of a DIFFERENT knob.
+				 * Decoupled, DTO_AGG_BLOCK_KB=8192 quietly puts
+				 * a 200us cap in front of ops that legitimately
+				 * need 149us: every sub-threshold op then burns
+				 * a full cap of spin AND a futex round trip --
+				 * the worst of both policies, reached silently
+				 * through a knob that does not name the valve.
+				 * Flooring at 8x the modelled device time of the
+				 * gate makes the valve track the policy
+				 * automatically; 8x is loose enough not to cry
+				 * wolf on a busy device and tight enough to catch
+				 * a stuck descriptor within a millisecond at any
+				 * sane gate. Never 0: a 0 cap would make the spin
+				 * loop a no-op and convert the whole policy to
+				 * block-everything through a knob that does not
+				 * name the gate. */
+				agg_spin_cap_cyc = agg_us_to_cyc((uint64_t)agg_clamp(
+				    agg_getenv_int("DTO_AGG_SPIN_CAP_US", 200),
+				    1, 1000000));
+				{
+					uint64_t floor_us =
+					    (8ULL * agg_model_ns(agg_block_bytes)
+					    + 999ULL) / 1000ULL;	/* round up */
+					uint64_t floor_cyc = agg_us_to_cyc(floor_us);
+
+					if (agg_spin_cap_cyc < floor_cyc)
+						agg_spin_cap_cyc = floor_cyc;
+				}
+				agg_degrade_cyc = agg_us_to_cyc(1000ULL *
+				    (uint64_t)agg_clamp(agg_getenv_int(
+					"DTO_AGG_DEGRADE_MS", 100), 0, 60000));
+				/* How long the poller's heartbeat must stay
+				 * frozen before a worker calls it dead. Must
+				 * exceed any plausible run-queue delay for a
+				 * SCHED_OTHER thread on an oversubscribed
+				 * node, or ordinary scheduling latency turns
+				 * into a process-wide fallback to spinyield. */
+				agg_dead_cyc = agg_us_to_cyc(1000ULL *
+				    (uint64_t)agg_clamp(agg_getenv_int(
+					"DTO_AGG_DEAD_MS", 50), 1, 60000));
+				agg_nslots = agg_clamp(
+				    agg_getenv_int("DTO_AGG_SLOTS",
+					dsa_max_threads > 0 ? dsa_max_threads : 64),
+				    1, AGG_SLOTS_MAX);
+				agg_cpu = agg_getenv_int("DTO_AGG_CPU", -1);
+				agg_rt = agg_getenv_int("DTO_AGG_RT", 0);
+				agg_nodes = 1;
+				if (numa_available() != -1) {
+					int mx = numa_max_node();
+
+					if (mx > 0 && agg_nslots >=
+					    2u * (uint32_t)(mx + 1))
+						agg_nodes = (uint32_t)(mx + 1);
+				}
+				/* 999999, not 1000000: these become tv_nsec
+				 * directly, and a tv_nsec of 1e9 is EINVAL,
+				 * which would silently turn blocking into a
+				 * spin loop. */
+				agg_to_us = agg_clamp(agg_getenv_int(
+				    "DTO_AGG_TIMEOUT_US", 100), 1, 999999);
+				agg_to_max_us = agg_clamp(agg_getenv_int(
+				    "DTO_AGG_TIMEOUT_MAX_US", 1000), 1, 999999);
+				if (agg_to_max_us < agg_to_us)
+					agg_to_max_us = agg_to_us;
+
+				/* getenv on a removed name is silent, so without
+				 * these a stale sweep harness produces a run that
+				 * looks configured and is not. */
+				if (getenv("DTO_AGG_ADAPT"))
+					LOG_ERROR("DTO_AGG_ADAPT is obsolete and ignored; the spin/block decision is now DTO_AGG_BLOCK_KB\n");
+				if (getenv("DTO_AGG_SPIN_MIN_US") ||
+				    getenv("DTO_AGG_SPIN_MAX_US"))
+					LOG_ERROR("DTO_AGG_SPIN_MIN_US/DTO_AGG_SPIN_MAX_US are obsolete and ignored; see DTO_AGG_BLOCK_KB and DTO_AGG_SPIN_CAP_US\n");
+				LOG_TRACE("aggregator gate: block at > %u bytes (modelled %llu ns of device time), spin cap %llu us, postarm %llu us\n",
+				    agg_block_bytes,
+				    (unsigned long long)agg_model_ns(agg_block_bytes),
+				    (unsigned long long)(agg_spin_cap_cyc * 1000ULL / tsc_khz),
+				    (unsigned long long)(agg_postarm_cyc * 1000ULL / tsc_khz));
+
+				/* pthread keys survive fork, so create one
+				 * once per process image and never in the
+				 * child handler, which would leak a key per
+				 * fork. */
+				if (!agg_key_ready &&
+				    pthread_key_create(&agg_key, agg_slot_release) == 0)
+					agg_key_ready = 1;
+
+				if (agg_key_ready) {
+					/* Built once per process image and
+					 * reused. init_dto() is also reached
+					 * from the pthread_atfork child
+					 * handler, where POSIX allows only
+					 * async-signal-safe calls:
+					 * pthread_attr_init takes glibc's
+					 * internal allocator lock, which a
+					 * thread that did not survive the fork
+					 * may have been holding. */
+					if (!agg_attr_ready) {
+						pthread_attr_init(&agg_attr);
+						pthread_attr_setstacksize(
+						    &agg_attr, 128 * 1024);
+						agg_attr_ready = 1;
+					}
+					/* P threads, created unconditionally
+					 * here, 128KB of stack each. They
+					 * cannot be created lazily: doing it
+					 * from the wait path would put
+					 * pthread_create underneath an
+					 * interposed memcpy. */
+					if (agg_start_pollers() != 0)
+						wait_method = WAIT_SPINYIELD;
+				} else {
+					LOG_ERROR("aggregator: pthread_key_create failed, using spinyield\n");
+					wait_method = WAIT_SPINYIELD;
+				}
+			}
     
 
 			// display configuration
@@ -1713,6 +3922,93 @@ static int init_dto(void)
 
 static void cleanup_dto(void)
 {
+	/* The poller must be gone before the WQ portals are unmapped and
+	 * before log_fd is closed. Every shard's degraded_until is stamped
+	 * first so that no thread can enter a new aggregator wait during
+	 * teardown,
+	 * and every armed slot is woken so no worker is left blocked: each
+	 * one re-tests its status byte, sees agg_stop and polls its own
+	 * descriptor to completion. */
+	if (agg_any_created) {
+		struct timespec abs;
+		uint32_t sidx, i;
+
+		for (sidx = 0; sidx < agg_npollers; sidx++)
+			atomic_store_explicit(&agg_shards[sidx].degraded_until,
+			    ~0ull, memory_order_seq_cst);
+		atomic_store_explicit(&agg_stop, 1, memory_order_seq_cst);
+		atomic_store_explicit(&agg_started, 0, memory_order_seq_cst);
+
+		/* The wake phase must COMPLETE FOR ALL SHARDS BEFORE ANY JOIN
+		 * BEGINS. Waking and joining shard by shard leaves shard 1
+		 * sleeping out its 100ms backstop while this code is blocked
+		 * on shard 0. */
+		for (sidx = 0; sidx < agg_npollers; sidx++) {
+			atomic_store_explicit(&agg_hot[sidx].park, 0,
+			    memory_order_seq_cst);
+			agg_futex_wake(&agg_hot[sidx].park, 1);
+		}
+		for (sidx = 0; sidx < agg_npollers; sidx++) {
+			uint32_t hi = atomic_load(&agg_hot[sidx].hi);
+			uint32_t limit = agg_shards[sidx].limit;
+
+			if (limit > AGG_SLOTS_MAX)
+				limit = AGG_SLOTS_MAX;
+			if (hi > limit)
+				hi = limit;
+			for (i = agg_shards[sidx].lo; i < hi; i++)
+				agg_futex_wake(&agg_slots[i].seq, INT_MAX);
+		}
+
+		/* ONE shared ABSOLUTE deadline for every join. Per-shard
+		 * deadlines would make worst-case teardown P x 200ms = 3.2s at
+		 * P = 16, out of a destructor at process exit. */
+		clock_gettime(CLOCK_REALTIME, &abs);
+		abs.tv_nsec += 200 * 1000 * 1000;
+		if (abs.tv_nsec >= NSEC_PER_SEC) {
+			abs.tv_sec++;
+			abs.tv_nsec -= NSEC_PER_SEC;
+		}
+		/* Bounded join, never pthread_cancel and never a free: every
+		 * object a poller touches is .bss for the life of the
+		 * process, so an unreaped poller is harmless. */
+		for (sidx = 0; sidx < agg_npollers; sidx++) {
+			if (!agg_shards[sidx].created)
+				continue;
+			if (pthread_timedjoin_np(agg_shards[sidx].tid, NULL,
+			    &abs) != 0)
+				LOG_ERROR("aggregator shard %u did not exit in 200ms; leaving it running\n",
+				    sidx);
+			else
+				agg_shards[sidx].created = 0;
+		}
+
+		agg_any_created = 0;
+		for (i = 0; i < agg_nslots; i++) {
+			if (agg_stats[i].block || agg_stats[i].spinhit)
+				LOG_TRACE("aggregator slot %u (shard %u): spinhit %u, early %u, blocked %u, spincap %u, unknown %u, timeouts %u\n",
+				    i, agg_slot_shard[i],
+				    agg_stats[i].spinhit,
+				    agg_stats[i].early,
+				    agg_stats[i].block,
+				    agg_stats[i].spincap,
+				    agg_stats[i].unknown,
+				    agg_stats[i].timeout);
+		}
+	}
+
+	{
+		uint64_t ca = atomic_load(&dto_wait_calls_async);
+		uint64_t cb = atomic_load(&dto_wait_calls_batch);
+
+		if (ca | cb)
+			LOG_TRACE("public wait API: async %llu calls / %llu waited, batch %llu calls / %llu waited\n",
+			    (unsigned long long)ca,
+			    (unsigned long long)atomic_load(&dto_wait_entered_async),
+			    (unsigned long long)cb,
+			    (unsigned long long)atomic_load(&dto_wait_entered_batch));
+	}
+
 	// unmap and close wq portal
 	for (int i = 0; i < num_wqs; i++) {
 		if (wqs[i].wq_mmapped) {
@@ -1758,9 +4054,293 @@ static void cleanup_dto(void)
 //    return wq;
 //}
 
-static __always_inline  struct dto_wq *get_wq(void* buf)
+/* One scheduling probe: the yield round-trip time is the per-op exposure a
+ * synchronous offload risks whenever its thread loses the CPU between
+ * submit and completion. Windows of SHED_PROBE_WINDOW probes drive the
+ * shed level with hysteresis in both directions. */
+static void shed_probe(void)
+{
+	uint64_t t0 = __rdtsc(), dt, c;
+	uint64_t avg;
+	int lvl;
+
+	sched_yield();
+	dt = __rdtsc() - t0;
+	thr_probe_ctr = SHED_PROBE_PERIOD - 1;
+
+	atomic_fetch_add_explicit(&shed_probe_cycles, dt,
+	    memory_order_relaxed);
+	if (atomic_fetch_add_explicit(&shed_probe_count, 1,
+	    memory_order_relaxed) != SHED_PROBE_WINDOW - 1)
+		return;
+
+	c = atomic_exchange(&shed_probe_cycles, 0);
+	atomic_store(&shed_probe_count, 0);
+	avg = c / SHED_PROBE_WINDOW;
+	lvl = atomic_load(&shed_level);
+	if (avg > shed_hi_cycles && lvl < SHED_LEVEL_MAX) {
+		atomic_store(&shed_level, lvl + 1);
+		LOG_TRACE("shed: level %d -> %d (yield avg %llu cycles)\n",
+		    lvl, lvl + 1, (unsigned long long)avg);
+	} else if (avg < shed_lo_cycles && lvl > 0) {
+		atomic_store(&shed_level, lvl - 1);
+		LOG_TRACE("shed: level %d -> %d (yield avg %llu cycles)\n",
+		    lvl, lvl - 1, (unsigned long long)avg);
+	}
+}
+
+/* WQ selection for a thread that holds a slot: NUMA buffer-centric when
+ * enabled, else a stable thread-number mapping (same policy as fcfs). */
+static __always_inline struct dto_wq *wq_for_thread(void *buf, int tnum)
+{
+	struct dto_wq *wq = NULL;
+
+	if (is_numa_aware) {
+		const int numa_node = get_numa_node(buf);
+
+		if (numa_node >= 0 && numa_node < MAX_NUMA_NODES) {
+			struct dto_device *dev = devices[numa_node];
+
+			if (dev != NULL && dev->num_wqs > 0)
+				wq = dev->wqs[dev->next_wq++ % dev->num_wqs];
+		}
+		return wq != NULL ? wq : &wqs[0];
+	}
+	return &wqs[tnum % num_wqs];
+}
+
+/* Application hint: the calling thread entered (active=1) or left
+ * (active=0) a phase that produces offload-eligible work. Advisory and
+ * optional -- resolved by callers via dlsym, no-op unless
+ * DTO_DSA_ADMISSION=ticket. Counted, not boolean, so nested holders (or a
+ * release arriving on a thread that never acquired, after a cross-thread
+ * ticket move) degrade gracefully instead of corrupting state. */
+void dto_thread_active(int active)
+{
+	if (active) {
+		if (thr_hint < INT32_MAX)
+			thr_hint++;
+	} else if (thr_hint > 0) {
+		if (--thr_hint == 0)
+			thr_hint_linger = HINT_LINGER_OPS;
+	}
+}
+
+static inline int thr_is_hinted(void)
+{
+	if (thr_hint > 0)
+		return 1;
+	if (thr_hint_linger > 0) {
+		thr_hint_linger--;
+		return 1;
+	}
+	return 0;
+}
+
+static struct dto_wq *get_wq_lfu(void *buf, size_t opsz)
+{
+	uint32_t idx, ops;
+	uint8_t f;
+	int i, victim;
+	int hinted = ticket_mode ? thr_is_hinted() : 0;
+
+	if (unlikely(thr_num < 0))
+		thr_num = atomic_fetch_add(&num_threads, 1);
+	idx = (uint32_t)thr_num & (FREQ_TABLE_SIZE - 1);
+
+	/* Sampled, byte-weighted frequency bump (relaxed and racy on
+	 * purpose): 1 in freq_sample eligible ops per thread updates the
+	 * shared table; the rest touch only TLS. The weight scales with
+	 * bytes -- 16KB counts 1, doubling per octave, capped at 8 -- so a
+	 * checkpoint image outranks a stream of gate-sized ops. */
+	if (thr_bump_ctr != 0) {
+		thr_bump_ctr--;
+		ops = 0;
+	} else {
+		unsigned int w = 1, nf;
+		size_t v = opsz >> 14;
+
+		thr_bump_ctr = (uint16_t)freq_sample - 1;
+		while (v > 1 && w < 8) {
+			v >>= 1;
+			w++;
+		}
+		f = atomic_load_explicit(&thr_freq_tab[idx].v,
+		    memory_order_relaxed);
+		nf = (unsigned int)f + w;
+		atomic_store_explicit(&thr_freq_tab[idx].v,
+		    nf > FREQ_MAX ? FREQ_MAX : (uint8_t)nf,
+		    memory_order_relaxed);
+
+		/* Aging rides the sampled branch: one thread per window
+		 * halves the table so idle holders decay. */
+		ops = atomic_fetch_add_explicit(&admit_eligible_ops, 1,
+		    memory_order_relaxed) + 1;
+		if (unlikely((ops & (age_window_samples - 1)) == 0)) {
+			uint32_t epoch = atomic_load(&admit_age_epoch);
+
+			if (atomic_compare_exchange_strong(&admit_age_epoch,
+			    &epoch, epoch + 1)) {
+				for (i = 0; i < FREQ_TABLE_SIZE; i++) {
+					uint8_t v2 = atomic_load_explicit(
+					    &thr_freq_tab[i].v,
+					    memory_order_relaxed);
+					atomic_store_explicit(
+					    &thr_freq_tab[i].v, v2 >> 1,
+					    memory_order_relaxed);
+				}
+			}
+		}
+	}
+
+	/* Holder fast path: still the owner iff the slot is in the live
+	 * range (auto-K may have shrunk it) and the generation matches. */
+	if (thr_slot >= 0) {
+		if (thr_slot < atomic_load_explicit(&lfu_k,
+		    memory_order_relaxed) &&
+		    atomic_load_explicit(&dsa_slots[thr_slot].gen,
+		    memory_order_acquire) == thr_slot_gen) {
+			/* Keep the slot's hint flag fresh (store only on
+			 * change; the line is effectively thread-private
+			 * between challenges) so challengers can class
+			 * holders without touching TLS of other threads. */
+			if (ticket_mode &&
+			    thr_slot_hint_mirror != (uint8_t)hinted) {
+				thr_slot_hint_mirror = (uint8_t)hinted;
+				atomic_store_explicit(
+				    &dsa_slots[thr_slot].hinted,
+				    (uint8_t)hinted, memory_order_relaxed);
+			}
+			return wq_for_thread(buf, thr_num);
+		}
+		thr_slot = -1; /* evicted or slot retired while away */
+	}
+
+	/* Challenger path, rate-limited so the scan below stays amortized
+	 * noise. Falling back to the CPU here is the common, cheap case. */
+	if (thr_backoff-- != 0)
+		return NULL;
+	if (hinted) {
+		/* Ticketed threads are known-eligible by construction; the
+		 * short fixed cadence (plus the global gap below) is all the
+		 * rate limiting they need. */
+		thr_backoff = 4;
+	} else {
+	/* Adaptive cadence: a slotless-but-hot thread re-challenges within a
+	 * few ops (its fallback work is exactly what should be offloaded),
+	 * while cold threads keep the long period that makes the slot scan
+	 * amortized noise. */
+	f = atomic_load_explicit(&thr_freq_tab[idx].v, memory_order_relaxed);
+	thr_backoff = ADMIT_APPLY_PERIOD >> (f >> 5);
+	if (thr_backoff < 4)
+		thr_backoff = 4;
+	}
+
+	/* Global cap: at most one challenge (one K-wide victim scan) per
+	 * CHALLENGE_GLOBAL_GAP sampled ops, however many slotless threads
+	 * are hot. Losing the CAS just means CPU for this op. */
+	{
+		uint32_t now = atomic_load_explicit(&admit_eligible_ops,
+		    memory_order_relaxed);
+		uint32_t stamp = atomic_load_explicit(&challenge_stamp,
+		    memory_order_relaxed);
+
+		if (now - stamp < CHALLENGE_GLOBAL_GAP)
+			return NULL;
+		if (!atomic_compare_exchange_strong(&challenge_stamp, &stamp,
+		    now))
+			return NULL;
+	}
+
+	victim = 0;
+	{
+		uint8_t vmin = 255, uvmin = 255;
+		int uvictim = -1;
+		int32_t owner;
+
+		int kNow = atomic_load_explicit(&lfu_k, memory_order_relaxed);
+
+		for (i = 0; i < kNow; i++) {
+			owner = atomic_load_explicit(&dsa_slots[i].owner,
+			    memory_order_relaxed);
+			if (owner < 0) {
+				victim = i;
+				vmin = 0;
+				break;
+			}
+			f = atomic_load_explicit(
+			    &thr_freq_tab[(uint32_t)owner &
+			    (FREQ_TABLE_SIZE - 1)].v, memory_order_relaxed);
+			if (f < vmin) {
+				vmin = f;
+				victim = i;
+			}
+			if (ticket_mode &&
+			    !atomic_load_explicit(&dsa_slots[i].hinted,
+			    memory_order_relaxed) && f < uvmin) {
+				uvmin = f;
+				uvictim = i;
+			}
+		}
+		/* Ticket outranks statistics: a hinted challenger takes the
+		 * coldest unhinted slot without a frequency test (the hint is
+		 * exact evidence of eligibility; the holder's isn't). Among
+		 * hinted holders -- or for unhinted challengers -- frequency
+		 * stays the arbiter, so daemons can still displace an idle
+		 * decayed holder and churn stays bounded. */
+		if (vmin != 0 && hinted && uvictim >= 0) {
+			victim = uvictim;
+		} else if (vmin != 0) {
+			f = atomic_load_explicit(&thr_freq_tab[idx].v,
+			    memory_order_relaxed);
+			/* TinyLFU admission: candidate must beat the victim. */
+			if (f <= vmin)
+				return NULL;
+		}
+	}
+
+	{
+		int32_t old = atomic_load_explicit(&dsa_slots[victim].owner,
+		    memory_order_relaxed);
+
+		/* Losing the race just means CPU for this op; the thread
+		 * challenges again after the backoff. The generation bump
+		 * lands after the owner swap, so a deposed holder can
+		 * overlap for at most its in-flight op (a transient K+1
+		 * submitters, harmless: every thread has its own
+		 * descriptor and completion record). */
+		if (!atomic_compare_exchange_strong(&dsa_slots[victim].owner,
+		    &old, thr_num))
+			return NULL;
+		thr_slot_gen = atomic_fetch_add(&dsa_slots[victim].gen, 1) + 1;
+		thr_slot = (int16_t)victim;
+		if (ticket_mode) {
+			thr_slot_hint_mirror = (uint8_t)hinted;
+			atomic_store_explicit(&dsa_slots[victim].hinted,
+			    (uint8_t)hinted, memory_order_relaxed);
+		}
+	}
+	return wq_for_thread(buf, thr_num);
+}
+
+static __always_inline  struct dto_wq *get_wq_inner(void* buf, size_t opsz)
 {
 	struct dto_wq* wq = NULL;
+
+	if (dto_shed) {
+		int lvl;
+
+		if (thr_probe_ctr != 0)
+			thr_probe_ctr--;
+		else
+			shed_probe();
+		lvl = atomic_load_explicit(&shed_level,
+		    memory_order_relaxed);
+		if (lvl != 0 && opsz < ((size_t)SHED_BASE_BYTES << lvl))
+			return NULL;	/* callers fall back to the CPU */
+	}
+	if (dsa_admission == ADMIT_LFU)
+		return get_wq_lfu(buf, opsz);
         if (wq_index >= 0) {
             wq = &wqs[wq_index];
             __builtin_prefetch(wq, 0, 3);
@@ -1806,6 +4386,51 @@ static __always_inline  struct dto_wq *get_wq(void* buf)
 	return wq;
 }
 
+/* The aggregator slot is claimed here and nowhere else, for two reasons.
+ * Claiming only on a non-NULL return keeps threads that the dsa_max_threads
+ * admission check is about to reject from burning slots, which in a process
+ * with hundreds of threads would exhaust the table and starve the threads
+ * that actually offload. And because get_wq() always runs before the
+ * thr_desc.completion_addr assignment of an op, the redirection of thr_compp
+ * can never move while a descriptor is in flight -- which would make the
+ * worker read bytes_completed/result out of a record the device is not
+ * writing. */
+static __always_inline struct dto_wq *get_wq(void* buf, size_t opsz)
+{
+	struct dto_wq *wq = get_wq_inner(buf, opsz);
+
+	if (unlikely(wq != NULL && wait_method == WAIT_AGGREGATOR &&
+	    atomic_load_explicit(&agg_started, memory_order_relaxed))) {
+		if (thr_agg_slot == -1)
+			agg_claim_slot();
+		else if (thr_agg_slot == -2 && --thr_agg_retry == 0) {
+			thr_agg_slot = -1;	/* periodic re-claim attempt */
+			agg_claim_slot();
+		}
+	}
+	return wq;
+}
+
+/* WQ selection for a submit whose completion record is NOT thr_comp: the
+ * public caller-owned async and batch ops, and the TLS-completion batch path.
+ * Identical to get_wq() minus the claim, and the omission is structural
+ * rather than an optimisation. Those waits reach dsa_wait_spinyield either
+ * directly (dto_wait_caller_owned, which by construction never calls
+ * dsa_wait_aggregator) or through dsa_wait_aggregator's pointer-identity
+ * test, which rejects any comp that is not &thr_compp->status. So such a
+ * thread can never arm the slot it would claim, yet would hold it until it
+ * exits -- and agg_nslots defaults to dsa_max_threads or 64, not 512. In a
+ * process where those threads outnumber the table (mongod's log and eviction
+ * threads use only the public API) every later thread, INCLUDING the
+ * interposed-memcpy threads that are the only ones able to block, gets
+ * thr_agg_slot = -2 and spinyields forever. The claim gate in get_wq() was
+ * written to keep threads the dsa_max_threads cap rejects from burning slots;
+ * this is the same hazard from threads the cap accepts. */
+static __always_inline struct dto_wq *get_wq_no_agg(void* buf, size_t opsz)
+{
+	return get_wq_inner(buf, opsz);
+}
+
 static void dto_memset_api(void *s, int c, size_t n)
 {
         int r = 0;
@@ -1813,7 +4438,14 @@ static void dto_memset_api(void *s, int c, size_t n)
 
 	uint64_t memset_pattern;
 	size_t cpu_size, dsa_size;
-	struct dto_wq *wq = get_wq(s);
+	struct dto_wq *wq = get_wq(s, n);
+
+	if (unlikely(wq == NULL)) {
+		/* Not admitted to a DSA slot: report zero progress so the
+		 * interposer completes the operation with the std call. */
+		thr_bytes_completed = 0;
+		return;
+	}
 
 	for (int i = 0; i < 8; ++i)
 		((uint8_t *) &memset_pattern)[i] = (uint8_t) c;
@@ -1888,7 +4520,7 @@ static void dto_memset(void *s, int c, size_t n, int *result)
 {
 	uint64_t memset_pattern;
 	size_t cpu_size, dsa_size;
-	struct dto_wq *wq = get_wq(s);
+	struct dto_wq *wq = get_wq(s, n);
 
 	if (unlikely(wq == NULL)) {
 		*result = -1;
@@ -2099,7 +4731,7 @@ __attribute__((visibility("default"))) uint64_t dto_crc(const void *src, size_t 
                 return crc32c_hw(src, n);
         }
 	int result = 0;
-	struct dto_wq *wq = get_wq(src);
+	struct dto_wq *wq = get_wq(src, n);
 	if (unlikely(wq == NULL)) {
 		if (cb) cb(args);
 		return crc32c_hw(src, n);
@@ -2136,13 +4768,105 @@ __attribute__((visibility("default"))) uint64_t dto_crc(const void *src, size_t 
 	 * that share this thread-local descriptor; leaving it set would fail
 	 * subsequent ops with DSA_COMP_NOZERO_RESERVE (0x12). */
 	thr_desc.crc_seed = 0;
+	{
+		uint64_t done = thr_bytes_completed;
+		uint64_t dev_crc = thr_comp.crc_val;
+
 #ifdef DTO_STATS_SUPPORT
-	DTO_COLLECT_STATS_DSA_END(collect_stats, st, et, MEMCOPY_ASYNC, n, thr_bytes_completed, result);
+		DTO_COLLECT_STATS_DSA_END(collect_stats, st, et, MEMCOPY_ASYNC, n, done, result);
 #endif
-        if (thr_bytes_completed < n) {
-            return 0;
-        }
-        return DSA_CRC_VAL_TO_RAW(thr_comp.crc_val);
+		if (done < n)
+			return 0;
+		return DSA_CRC_VAL_TO_RAW(dev_crc);
+	}
+}
+
+/* CPU CRC32C in the iSCSI presentation (seed and result inverted), matching
+ * the device's default CRCGEN convention: f(0, data) is standard CRC32C. */
+static uint32_t crc32c_iscsi_cpu(uint32_t seed, const uint8_t *data, size_t len)
+{
+	uint32_t crc = ~seed;
+
+	while (len >= sizeof(uint64_t)) {
+		crc = (uint32_t)_mm_crc32_u64(crc, *(const uint64_t *)data);
+		data += sizeof(uint64_t);
+		len -= sizeof(uint64_t);
+	}
+	while (len--)
+		crc = _mm_crc32_u8(crc, *data++);
+	return ~crc;
+}
+
+/* Seeded CRC32C in the iSCSI presentation. The device's default CRC seed and
+ * result inversion implements this convention directly, so the descriptor
+ * takes the caller's seed unchanged and the completion crc_val is returned
+ * unchanged; chaining across chunks behaves exactly like the CPU loop.
+ * CRC generation has no destination, so every failure path (below the CRC
+ * gate, no WQ, oversized transfer, submit failure, partial completion) can
+ * safely redo the whole buffer on the CPU. */
+__attribute__((visibility("default")))
+uint32_t dto_crc32c_with_seed(uint32_t seed, const void *src, size_t n)
+{
+	struct dto_wq *wq;
+	uint32_t crc;
+	int result;
+#ifdef DTO_STATS_SUPPORT
+	struct timespec st, et;
+#endif
+
+	if (use_std_lib_calls || thr_dsa_disabled || n < crc_dsa_min_size()) {
+		DTO_COLLECT_STATS_START(collect_stats, st);
+		crc = crc32c_iscsi_cpu(seed, src, n);
+		DTO_COLLECT_STATS_CPU_END(collect_stats, st, et, CRC, n, n);
+		return crc;
+	}
+
+	wq = get_wq((void *)src, n);
+	if (unlikely(wq == NULL) || n > wq->max_transfer_size) {
+		DTO_COLLECT_STATS_START(collect_stats, st);
+		crc = crc32c_iscsi_cpu(seed, src, n);
+		DTO_COLLECT_STATS_CPU_END(collect_stats, st, et, CRC, n, n);
+		return crc;
+	}
+
+	DTO_COLLECT_STATS_START(collect_stats, st);
+	thr_desc.opcode = DSA_OPCODE_CRCGEN;
+	/* CC is invalid for CRC generation (no destination); BOF only when the
+	 * WQ configuration allows it. */
+	thr_desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
+	if (dto_dsa_bof)
+		thr_desc.flags |= IDXD_OP_FLAG_BOF;
+	thr_desc.completion_addr = (uint64_t)&thr_comp;
+	thr_desc.src_addr = (uint64_t)src;
+	thr_desc.dst_addr = 0;
+	thr_desc.xfer_size = (uint32_t)n;
+	thr_desc.crc_seed = seed;
+	thr_desc.rsvd = 0;
+	thr_comp.status = 0;
+	thr_bytes_completed = 0;
+
+	result = dsa_submit(wq, &thr_desc);
+	if (result == SUCCESS)
+		result = dsa_wait(wq, &thr_desc, &thr_comp.status);
+	/* crc_seed overlays a reserved-must-be-zero field for non-CRC opcodes
+	 * that share this thread-local descriptor. */
+	thr_desc.crc_seed = 0;
+	/* Consume the completion record before anything that could re-enter
+	 * the library on this thread (the stats epilogue may run the periodic
+	 * dump); thr_comp and thr_bytes_completed are shared by every op. */
+	{
+		uint64_t done = thr_bytes_completed;
+		uint32_t dev_crc = (uint32_t)thr_comp.crc_val;
+
+		DTO_COLLECT_STATS_DSA_END(collect_stats, st, et, CRC, n,
+		    done, result);
+		if (done >= n)
+			return dev_crc;
+	}
+	DTO_COLLECT_STATS_START(collect_stats, st);
+	crc = crc32c_iscsi_cpu(seed, src, n);
+	DTO_COLLECT_STATS_CPU_END(collect_stats, st, et, CRC, n, n);
+	return crc;
 }
 
 __attribute__((visibility("default"))) uint64_t dto_memcpy_crc_async(void *dest, const void *src, size_t n, callback_t cb, void* args) {
@@ -2155,7 +4879,7 @@ __attribute__((visibility("default"))) uint64_t dto_memcpy_crc_async(void *dest,
                 return crc32c_hw(src, n);
         }
 	int result = 0;
-	struct dto_wq *wq = get_wq(dest);
+	struct dto_wq *wq = get_wq(dest, n);
 	if (unlikely(wq == NULL)) {
 		if (cb) cb(args);
 		orig_memcpy(dest, src, n);
@@ -2170,8 +4894,12 @@ __attribute__((visibility("default"))) uint64_t dto_memcpy_crc_async(void *dest,
 
 	thr_desc.opcode = DSA_OPCODE_COPY_CRC;
 	/* See dto_crc for the CRC seed/result convention. CC is valid here
-	 * (the operation writes to dest), unlike for CRC Generation. */
-	thr_desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR | IDXD_OP_FLAG_BOF;
+	 * (the operation writes to dest), unlike for CRC Generation. BOF only
+	 * when the WQ allows it: on a block_on_fault=0 queue the flag fails
+	 * every descriptor with DSA_COMP_INVALID_FLAGS. */
+	thr_desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
+	if (dto_dsa_bof)
+		thr_desc.flags |= IDXD_OP_FLAG_BOF;
 	if (dto_dsa_cc && (wq->dsa_gencap & GENCAP_CC_MEMORY))
 		thr_desc.flags |= IDXD_OP_FLAG_CC;
 	thr_desc.completion_addr = (uint64_t)&thr_comp;
@@ -2192,44 +4920,67 @@ __attribute__((visibility("default"))) uint64_t dto_memcpy_crc_async(void *dest,
 	}
 	/* See dto_crc: reset the reserved-overlaying seed field. */
 	thr_desc.crc_seed = 0;
+	{
+		uint64_t done = thr_bytes_completed;
+		uint64_t dev_crc = thr_comp.crc_val;
+
 #ifdef DTO_STATS_SUPPORT
-	DTO_COLLECT_STATS_DSA_END(collect_stats, st, et, MEMCOPY_ASYNC, n, thr_bytes_completed, result);
+		DTO_COLLECT_STATS_DSA_END(collect_stats, st, et, MEMCOPY_ASYNC, n, done, result);
 #endif
-        if (thr_bytes_completed < n) {
-            return 0;
-        }
-        return DSA_CRC_VAL_TO_RAW(thr_comp.crc_val);
+		if (done < n)
+			return 0;
+		return DSA_CRC_VAL_TO_RAW(dev_crc);
+	}
 }
 
 /* ---- True-async CRC / Copy+CRC implementation (see dto.h) ---- */
 
+/* A wait turns "never submitted" from a wrong answer into a permanent stall:
+ * dto_async_poll on an un-submitted op reads uninitialised caller storage and
+ * returns garbage once, but dto_async_wait would spin forever on a status
+ * byte no device will ever write -- and dto.h's own example, like
+ * WiredTiger's call site, puts the op on the stack. The magic is written as
+ * the FIRST statement of the submit path, ahead of every early return, which
+ * is what makes a REUSED op safe, and again immediately before the submitted
+ * return. One store on a cold path. The 2^-32 false positive against stack
+ * garbage is a probabilistic guard, accepted because the alternative is an
+ * unconditional hang. */
+#define DTO_OP_SUBMITTED_MAGIC 0x64746F53u	/* "dtoS" */
+
 struct dto_async_op_impl {
 	struct dsa_hw_desc desc;	/* 64 bytes, 64-aligned via dto_async_op */
 	struct dsa_completion_record comp __attribute__((aligned(32)));
+	uint32_t submitted;
 };
 _Static_assert(sizeof(struct dto_async_op_impl) <= sizeof(dto_async_op),
 	       "dto_async_op opaque storage too small");
 _Static_assert(sizeof(struct dsa_hw_desc) == 64, "unexpected descriptor size");
 
-static int dto_submit_async_common(dto_async_op *op, uint32_t opcode,
+/* crc_seed_raw selects the CRC presentation: DSA_CRC_SEED_FOR_RAW yields the
+ * raw CRC32C reported by dto_async_crc_val, while a caller-supplied seed (0
+ * for a fresh checksum) yields the iSCSI presentation of
+ * dto_crc32c_with_seed, which is what WiredTiger checksums use. */
+static int dto_submit_async_common_seeded(dto_async_op *op, uint32_t opcode,
 				   void *dest, const void *src, size_t n,
-				   int cache_control)
+				   int cache_control, uint32_t crc_seed)
 {
 	struct dto_async_op_impl *impl = (struct dto_async_op_impl *)op;
 	struct dto_wq *wq;
 
+	impl->submitted = 0;		/* first, ahead of every early return */
 	if (n == 0 || n > UINT32_MAX)
 		return DTO_ASYNC_FALLBACK;
 	if (use_std_lib_calls || thr_dsa_disabled || n < crc_dsa_min_size())
 		return DTO_ASYNC_FALLBACK;
-	wq = get_wq(dest ? dest : (void *)src);
+	wq = get_wq_no_agg(dest ? dest : (void *)src, n);
 	if (unlikely(wq == NULL))
 		return DTO_ASYNC_FALLBACK;
 
 	memset(&impl->desc, 0, sizeof(impl->desc));
 	impl->desc.opcode = opcode;
-	impl->desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR |
-		IDXD_OP_FLAG_BOF;
+	impl->desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
+	if (dto_dsa_bof)
+		impl->desc.flags |= IDXD_OP_FLAG_BOF;
 	/* CC is only legal for operations with a destination; CRC Generation
 	 * would be failed by the device with DSA_COMP_INVALID_FLAGS. */
 	if (cache_control && dest && (wq->dsa_gencap & GENCAP_CC_MEMORY))
@@ -2239,7 +4990,7 @@ static int dto_submit_async_common(dto_async_op *op, uint32_t opcode,
 	impl->desc.dst_addr = (uint64_t)dest;
 	impl->desc.xfer_size = (uint32_t)n;
 	if (opcode == DSA_OPCODE_COPY_CRC || opcode == DSA_OPCODE_CRCGEN)
-		impl->desc.crc_seed = DSA_CRC_SEED_FOR_RAW;
+		impl->desc.crc_seed = crc_seed;
 	impl->comp.status = 0;
 
 	/* ENQCMD to a shared WQ can transiently fail when the queue is full;
@@ -2247,8 +4998,10 @@ static int dto_submit_async_common(dto_async_op *op, uint32_t opcode,
 	 * back onto the CPU. */
 	for (int attempt = 0; ; attempt++) {
 		int rc = dsa_submit(wq, &impl->desc);
-		if (rc == SUCCESS)
+		if (rc == SUCCESS) {
+			impl->submitted = DTO_OP_SUBMITTED_MAGIC;
 			return DTO_ASYNC_SUBMITTED;
+		}
 		if (rc != RETRY || attempt >= 16)
 			return DTO_ASYNC_FALLBACK;
 		_mm_pause();
@@ -2286,20 +5039,57 @@ __attribute__((visibility("default")))
 int dto_submit_batch_copy(dto_batch_op *op, void **dst, void **src,
 			  size_t *sizes, int count)
 {
+	/* Mean batch size, not just the first call: these paths exist to
+	 * amortize the ~0.7us descriptor cost over many copies, and a mean
+	 * near 1 means they are paying it per copy instead. */
+	{
+		static _Atomic uint64_t n_calls, n_members;
+		uint64_t c = atomic_fetch_add_explicit(&n_calls, 1,
+		    memory_order_relaxed) + 1;
+
+		atomic_fetch_add_explicit(&n_members, (uint64_t)count,
+		    memory_order_relaxed);
+		if (c == 1 || c == 1000 || c == 100000)
+			LOG_ERROR("public API: dto_submit_batch_copy call %llu, this count=%d, mean batch %.2f\n",
+			    (unsigned long long)c, count,
+			    (double)atomic_load(&n_members) / (double)c);
+	}
 	struct dto_wq *wq;
+
+	/* count == 0 is the exact "nothing was submitted" test: a successful
+	 * submit requires count >= 2, dto_batch_op is opaque to callers, so no
+	 * new field and no ABI change. Clearing it on EVERY fallback return
+	 * also clears a stale count left on a reused op. It fixes a live
+	 * latent bug: the ENQCMD retry loop below can return
+	 * DTO_ASYNC_FALLBACK after op->count and op->comp.status have already
+	 * been set, leaving count > 0 with status 0 -- on which dto_batch_wait
+	 * would block forever and a caller spinning on dto_batch_poll already
+	 * spins forever today. */
+	op->count = 0;
 	/* a DSA batch needs at least two descriptors */
-	if (unlikely(dto_initialized == 0 || count < 2 || count > DTO_BATCH_MAX ||
+	/* count == 1 is accepted and submitted as a PLAIN descriptor below, not
+	 * as a one-member batch (a DSA batch descriptor requires at least two).
+	 * Rejecting it made the whole path inert for the caller that motivated
+	 * it: WiredTiger's reconciliation drains its accumulator at every image
+	 * grow, boundary check, split and write, and with large values a single
+	 * copy lands between two of those drains almost every time -- measured
+	 * count=1 on the first and every subsequent flush. A single large copy
+	 * still gets the accelerator and still gets the wait; only the
+	 * fixed-cost amortization that batching adds is absent. */
+	if (unlikely(dto_initialized == 0 || count < 1 || count > DTO_BATCH_MAX ||
 		     thr_dsa_disabled || use_std_lib_calls))
 		return DTO_ASYNC_FALLBACK;
-	wq = get_wq(dst[0]);
+	wq = get_wq_no_agg(dst[0], sizes[0]);
 	if (unlikely(wq == NULL))
 		return DTO_ASYNC_FALLBACK;
 
 	orig_memset(op->descs, 0, sizeof(op->descs[0]) * count);
 	for (int i = 0; i < count; i++) {
 		struct dsa_hw_desc *desc = &op->descs[i];
-		if (sizes[i] == 0 || sizes[i] > wq->max_transfer_size)
+		if (sizes[i] == 0 || sizes[i] > wq->max_transfer_size) {
+			op->count = 0;
 			return DTO_ASYNC_FALLBACK;
+		}
 		desc->opcode = DSA_OPCODE_MEMMOVE;
 		desc->flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
 		if (dto_dsa_bof)
@@ -2317,19 +5107,30 @@ int dto_submit_batch_copy(dto_batch_op *op, void **dst, void **src,
 	}
 	op->count = count;
 	orig_memset(&op->desc, 0, sizeof(op->desc));
-	op->desc.opcode = DSA_OPCODE_BATCH;
-	op->desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
-	op->desc.desc_list_addr = (uint64_t)op->descs;
-	op->desc.desc_count = count;
-	op->desc.completion_addr = (uint64_t)&op->comp;
+	if (count == 1) {
+		/* Same completion record the batch descriptor would have used,
+		 * so dto_batch_poll is unchanged: on failure op->comps[0] was
+		 * zeroed above and never written, so its repair loop redoes
+		 * this copy on the CPU exactly as it would a failed member. */
+		op->desc = op->descs[0];
+		op->desc.completion_addr = (uint64_t)&op->comp;
+	} else {
+		op->desc.opcode = DSA_OPCODE_BATCH;
+		op->desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
+		op->desc.desc_list_addr = (uint64_t)op->descs;
+		op->desc.desc_count = count;
+		op->desc.completion_addr = (uint64_t)&op->comp;
+	}
 	op->comp.status = 0;
 
 	for (int attempt = 0; ; attempt++) {
 		int rc = dsa_submit(wq, &op->desc);
 		if (rc == SUCCESS)
 			return DTO_ASYNC_SUBMITTED;
-		if (rc != RETRY || attempt >= 16)
+		if (rc != RETRY || attempt >= 16) {
+			op->count = 0;
 			return DTO_ASYNC_FALLBACK;
+		}
 		_mm_pause();
 	}
 }
@@ -2357,26 +5158,94 @@ int dto_batch_poll(dto_batch_op *op)
 	return DTO_ASYNC_DONE;
 }
 
+/*
+ * dto_batch_wait --
+ *	Block until the batch's completion record is written. WAITS ONLY:
+ *	dto_batch_poll still has to be called afterwards, or the CPU repair of
+ *	copies the accelerator failed never happens. Returns void so the poll
+ *	loop stays at the call site; see dto.h.
+ */
+__attribute__((visibility("default")))
+void dto_batch_wait(dto_batch_op *op)
+{
+	uint64_t bytes = 0;
+	int i;
+
+	atomic_fetch_add_explicit(&dto_wait_calls_batch, 1,
+	    memory_order_relaxed);
+	if (op->count == 0)		/* never submitted, or fell back */
+		return;
+	if (__atomic_load_n((uint8_t *)&op->comp.status, __ATOMIC_ACQUIRE))
+		return;
+	/* op->desc is a DSA_OPCODE_BATCH descriptor: dto_submit_batch_copy
+	 * zeroes it and then sets only opcode/flags/desc_list_addr/desc_count/
+	 * completion_addr, so its xfer_size field reads 0 -- and for a batch
+	 * that field is a descriptor count in any case, never a byte count.
+	 * The gate needs total bytes, so sum the members. uint64 because 64
+	 * members of up to max_transfer_size each would wrap a uint32. */
+	for (i = 0; i < op->count; i++)
+		bytes += op->sizes[i];
+	if (atomic_exchange_explicit(&dto_wait_logged_batch, 1u,
+	    memory_order_relaxed) == 0)
+		LOG_ERROR("public wait API: first dto_batch_wait, %llu bytes over %d copies (wait method %s)\n",
+		    (unsigned long long)bytes, op->count,
+		    wait_names[wait_method]);
+	atomic_fetch_add_explicit(&dto_wait_entered_batch, 1,
+	    memory_order_relaxed);
+	dto_wait_caller_owned((const volatile uint8_t *)&op->comp.status,
+	    bytes);
+}
+
 __attribute__((visibility("default")))
 int dto_submit_memcpy_crc(dto_async_op *op, void *dest, const void *src,
 			  size_t n, int cache_control)
 {
-	return dto_submit_async_common(op, DSA_OPCODE_COPY_CRC, dest, src, n,
-				       cache_control);
+	return dto_submit_async_common_seeded(op, DSA_OPCODE_COPY_CRC, dest, src, n,
+				       cache_control, DSA_CRC_SEED_FOR_RAW);
+}
+
+/*
+ * dto_submit_memcpy_crc32c --
+ *	Fused copy + CRC32C in the seeded (iSCSI) presentation, matching
+ *	dto_crc32c_with_seed and therefore WiredTiger block/log checksums.
+ *	Read the result with dto_async_crc32c_val, not dto_async_crc_val.
+ */
+__attribute__((visibility("default")))
+int dto_submit_memcpy_crc32c(dto_async_op *op, void *dest, const void *src,
+			     size_t n, uint32_t seed, int cache_control)
+{
+	if (atomic_exchange_explicit(&dto_sub_logged_crc, 1u,
+	    memory_order_relaxed) == 0)
+		LOG_ERROR("public API: first dto_submit_memcpy_crc32c, n=%zu\n", n);
+	return dto_submit_async_common_seeded(op, DSA_OPCODE_COPY_CRC, dest, src, n,
+				       cache_control, seed);
+}
+
+/*
+ * dto_async_crc32c_val --
+ *	The device's CRC value as-is: the seeded presentation.
+ */
+__attribute__((visibility("default")))
+uint32_t dto_async_crc32c_val(const dto_async_op *op)
+{
+	const struct dto_async_op_impl *impl =
+		(const struct dto_async_op_impl *)op;
+	return (uint32_t)impl->comp.crc_val;
 }
 
 __attribute__((visibility("default")))
 int dto_submit_memcpy(dto_async_op *op, void *dest, const void *src,
 		      size_t n, int cache_control)
 {
-	return dto_submit_async_common(op, DSA_OPCODE_MEMMOVE, dest, src, n,
-				       cache_control);
+	return dto_submit_async_common_seeded(op, DSA_OPCODE_MEMMOVE, dest, src, n,
+				       cache_control, DSA_CRC_SEED_FOR_RAW);
 }
 
 __attribute__((visibility("default")))
 int dto_submit_crc(dto_async_op *op, const void *src, size_t n)
 {
-	return dto_submit_async_common(op, DSA_OPCODE_CRCGEN, NULL, src, n, 0);
+	return dto_submit_async_common_seeded(op, DSA_OPCODE_CRCGEN, NULL, src, n, 0,
+		DSA_CRC_SEED_FOR_RAW);
 }
 
 __attribute__((visibility("default")))
@@ -2395,6 +5264,38 @@ int dto_async_poll(dto_async_op *op)
 	return DTO_ASYNC_FAILED;
 }
 
+/*
+ * dto_async_wait --
+ *	Block until the op's completion record is written, honouring
+ *	DTO_WAIT_METHOD. Reports nothing: exactly one place in the library
+ *	classifies a status byte, and that is dto_async_poll, which the caller
+ *	still calls afterwards and which returns precisely what the last
+ *	iteration of a poll loop would have.
+ */
+__attribute__((visibility("default")))
+void dto_async_wait(dto_async_op *op)
+{
+	struct dto_async_op_impl *impl = (struct dto_async_op_impl *)op;
+
+	atomic_fetch_add_explicit(&dto_wait_calls_async, 1,
+	    memory_order_relaxed);
+	if (impl->submitted != DTO_OP_SUBMITTED_MAGIC)
+		return;
+	if (__atomic_load_n((uint8_t *)&impl->comp.status, __ATOMIC_ACQUIRE))
+		return;
+	/* desc.xfer_size is the identical quantity dsa_wait hands the gate for
+	 * an interposed copy: the source length for CRCGEN and the copy length
+	 * for MEMMOVE/COPY_CRC. */
+	if (atomic_exchange_explicit(&dto_wait_logged_async, 1u,
+	    memory_order_relaxed) == 0)
+		LOG_ERROR("public wait API: first dto_async_wait, %u bytes (wait method %s)\n",
+		    impl->desc.xfer_size, wait_names[wait_method]);
+	atomic_fetch_add_explicit(&dto_wait_entered_async, 1,
+	    memory_order_relaxed);
+	dto_wait_caller_owned((const volatile uint8_t *)&impl->comp.status,
+	    impl->desc.xfer_size);
+}
+
 __attribute__((visibility("default")))
 uint64_t dto_async_crc_val(const dto_async_op *op)
 {
@@ -2411,7 +5312,7 @@ __attribute__((visibility("default"))) void dto_memcpy_async(void *dest, const v
 		return;
 	}
 	int result = 0;
-	struct dto_wq *wq = get_wq(dest);
+	struct dto_wq *wq = get_wq(dest, n);
 	if (unlikely(wq == NULL)) {
 		if (cb) cb(args);
 		orig_memcpy(dest, src, n);
@@ -2466,7 +5367,7 @@ __attribute__((visibility("default"))) void dto_memcpy_async(void *dest, const v
 static void dto_memcpymove(void *dest, const void *src, size_t n, bool is_memcpy, int *result)
 {
 
-	struct dto_wq *wq = get_wq(dest);
+	struct dto_wq *wq = get_wq(dest, n);
 	size_t cpu_size, dsa_size;
 
 	if (unlikely(wq == NULL)) {
@@ -2560,7 +5461,7 @@ static void dto_memcpymove(void *dest, const void *src, size_t n, bool is_memcpy
 
 static int dto_memcmp(const void *s1, const void *s2, size_t n, int *result)
 {
-	struct dto_wq *wq = get_wq((void*)s2);
+	struct dto_wq *wq = get_wq((void*)s2, n);
 	int cmp_result = 0;
 	size_t orig_n = n;
 
@@ -2577,6 +5478,8 @@ static int dto_memcmp(const void *s1, const void *s2, size_t n, int *result)
 
 	thr_bytes_completed = 0;
 
+	size_t chunk_base = 0;
+
 	if (n <= wq->max_transfer_size) {
 		thr_desc.src_addr = (uint64_t) s1;
 		thr_desc.src2_addr = (uint64_t) s2;
@@ -2588,8 +5491,9 @@ static int dto_memcmp(const void *s1, const void *s2, size_t n, int *result)
 
 			len = n <= wq->max_transfer_size ? n : wq->max_transfer_size;
 
-			thr_desc.src_addr = (uint64_t) s1 + thr_bytes_completed;
-			thr_desc.src2_addr = (uint64_t) s2 + thr_bytes_completed;
+			chunk_base = thr_bytes_completed;
+			thr_desc.src_addr = (uint64_t) s1 + chunk_base;
+			thr_desc.src2_addr = (uint64_t) s2 + chunk_base;
 			thr_desc.xfer_size = (uint32_t) len;
 			*result = dsa_execute(wq, &thr_desc, &thr_comp.status);
 
@@ -2605,9 +5509,16 @@ static int dto_memcmp(const void *s1, const void *s2, size_t n, int *result)
 	}
 
 	if (thr_comp.result) {
-		/* cmp returned mismatch. determine the return value */
-		uint8_t *t1 = (uint8_t *)s1 + thr_bytes_completed;
-		uint8_t *t2 = (uint8_t *)s2 + thr_bytes_completed;
+		/* Mismatch: the completion record's bytes_completed is the
+		 * count of equal bytes within this descriptor's chunk, i.e.
+		 * the chunk-relative offset of the first differing byte.
+		 * (dsa_wait accumulates the full xfer_size on success, so
+		 * thr_bytes_completed cannot be used to locate the byte.)
+		 */
+		const uint8_t *t1 =
+		    (const uint8_t *)s1 + chunk_base + thr_comp.bytes_completed;
+		const uint8_t *t2 =
+		    (const uint8_t *)s2 + chunk_base + thr_comp.bytes_completed;
 
 		cmp_result = *t1 - *t2;
 		/* Inform the caller than the job is done even though
@@ -3021,7 +5932,7 @@ void dto_batch_copy(void **dst, void **src, size_t *sizes, int count,
 		count = MAX_BATCH_DESCS;
 	}
 
-	struct dto_wq *wq = get_wq(dst[0]);
+	struct dto_wq *wq = get_wq_no_agg(dst[0], sizes[0]);
 	if (unlikely(wq == NULL)) {
 		for (int i = 0; i < count; i++) {
 			if (dst[i] && src[i] && sizes[i] > 0)

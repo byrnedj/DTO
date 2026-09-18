@@ -20,7 +20,7 @@ add_compile_definitions(_GNU_SOURCE)
 target_compile_definitions(dto PRIVATE DTO_STATS_SUPPORT)
 
 # Link libraries
-target_link_libraries(dto accel-config dl numa)
+target_link_libraries(dto accel-config dl numa pthread)
 
 include(CheckCCompilerFlag)
 check_c_compiler_flag("-mwaitpkg" HAS_WAITPKG)
