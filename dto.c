@@ -630,7 +630,15 @@ struct agg_slot {
 	_Atomic uint32_t seq;	/* futex word AND armed flag; odd = armed,
 				 * even = idle. NEVER reset. */
 	_Atomic uint32_t owner;	/* 0 = free, 1 = owned */
-	char pad[64 - 8];
+	/* The status byte this slot's poller reads. Normally &agg_recs[i], so
+	 * the poller dereferences .bss and the lifetime question does not
+	 * arise. A caller-owned wait (dto_async_wait / dto_batch_wait) points
+	 * it at the caller's completion record for the duration of ONE wait
+	 * and restores it on the way out under the agg_shard_hot.inspect
+	 * handshake; see dsa_wait_aggregator(). Written by the owner only,
+	 * ordered ahead of the arm by the arm's own seq_cst RMW. */
+	_Atomic(const volatile uint8_t *) watch;
+	char pad[64 - 16];
 } __attribute__((aligned(64)));
 _Static_assert(sizeof(struct agg_slot) == 64, "agg_slot must be one line");
 
@@ -655,6 +663,12 @@ struct agg_rec {
 
 static struct agg_slot agg_slots[AGG_SLOTS_MAX];
 static struct agg_rec agg_recs[AGG_SLOTS_MAX];
+
+/* The status byte a slot watches when nobody has redirected it. */
+static inline const volatile uint8_t *agg_own_status(uint32_t i)
+{
+	return (const volatile uint8_t *)&agg_recs[i].comp.status;
+}
 
 /* SHARDED POLLERS.
  *
@@ -699,6 +713,11 @@ struct agg_shard_hot {
 	_Atomic uint32_t park;		/* futex word: 1 = this poller parked */
 	_Atomic uint32_t hi;		/* highest claimed slot + 1, >= lo */
 	_Atomic uint64_t hb;		/* ++ at the end of every sweep */
+	/* slot + 1 while this poller is dereferencing a slot's watch pointer
+	 * that is NOT that slot's own static record, 0 otherwise. Only the
+	 * caller-owned wait path reads it, and only on its way out. Written on
+	 * the poller's own line, so the workers' fast path never shares it. */
+	_Atomic uint32_t inspect;
 } __attribute__((aligned(64)));
 _Static_assert(sizeof(struct agg_shard_hot) == 64,
 	       "agg_shard_hot must be one line");
@@ -850,6 +869,8 @@ static void child (void)
 		atomic_store_explicit(&agg_slots[i].seq, 0,
 		    memory_order_relaxed);
 		agg_recs[i].comp.status = 0;
+		atomic_store_explicit(&agg_slots[i].watch, agg_own_status(i),
+		    memory_order_relaxed);
 		/* agg_stats is the only thing cleanup_dto() dumps and it is
 		 * the instrument the bring-up gate reads. Inherited, the
 		 * child's dump would be parent+child summed and labelled with
@@ -1106,6 +1127,11 @@ static int agg_claim_slot(void)
 				    sq + 1, memory_order_relaxed);
 			agg_recs[i].comp.status = 0;
 			thr_compp = &agg_recs[i].comp;	/* device lands here */
+			/* Relaxed: the slot is not armed yet, so no poller can
+			 * be reading it, and the arm of any future wait is a
+			 * seq_cst RMW that orders this ahead of it. */
+			atomic_store_explicit(&agg_slots[i].watch,
+			    agg_own_status(i), memory_order_relaxed);
 			thr_agg_slot = (int32_t)i;
 			/* One byte load, once per thread. The shard that owns
 			 * this slot is a property of the slot, not of the
@@ -1222,7 +1248,8 @@ static inline void agg_kick(struct agg_shard_hot *hot)
 	}
 }
 
-static void dsa_wait_aggregator(const volatile uint8_t *comp, uint32_t xfer)
+static void dsa_wait_aggregator(const volatile uint8_t *comp, uint32_t xfer,
+				int foreign_ok)
 {
 	struct agg_slot *s;
 	struct agg_stat *sv;
@@ -1230,6 +1257,7 @@ static void dsa_wait_aggregator(const volatile uint8_t *comp, uint32_t xfer)
 	struct agg_shard_hot *hot;
 	uint64_t deadline, hb0, dead_since;
 	uint32_t myseq, to_us = agg_to_us, it;
+	int foreign = 0;
 
 	/* Eligibility FIRST, before any spinning. The pointer-identity test is
 	 * what keeps the batch, dto_memset_pages and async paths -- whose
@@ -1248,7 +1276,8 @@ static void dsa_wait_aggregator(const volatile uint8_t *comp, uint32_t xfer)
 	 * aggregator process-wide, which is exactly what sharding is supposed
 	 * to stop being possible. */
 	if (thr_agg_slot < 0 || thr_agg_sh == NULL ||
-	    comp != (const volatile uint8_t *)&thr_compp->status ||
+	    (comp != (const volatile uint8_t *)&thr_compp->status &&
+	     !foreign_ok) ||
 	    !atomic_load_explicit(&thr_agg_sh->started, memory_order_relaxed) ||
 	    atomic_load_explicit(&agg_stop, memory_order_relaxed) ||
 	    __rdtsc() < atomic_load_explicit(&thr_agg_sh->degraded_until,
@@ -1358,6 +1387,16 @@ arm:
 	s = &agg_slots[thr_agg_slot];
 	sv->block++;
 
+	/* Redirect the slot at the caller's record for this one wait. Relaxed
+	 * store: the arm below is a seq_cst RMW that orders it ahead of the
+	 * arm, and a poller only reads watch for a slot it has already
+	 * observed armed. Restored under the inspect handshake after the
+	 * disarm. */
+	if (comp != agg_own_status((uint32_t)thr_agg_slot)) {
+		foreign = 1;
+		atomic_store_explicit(&s->watch, comp, memory_order_relaxed);
+	}
+
 	/* ARM. A full-barrier RMW, not a release store: it is the publishing
 	 * half of the Dekker pair with the poller's park, and a release store
 	 * would not order the following load of this shard's park word. */
@@ -1456,6 +1495,23 @@ arm:
 	 * CASed, this stores the identical value; seq never decreases. */
 	atomic_store_explicit(&s->seq, myseq + 1, memory_order_release);
 
+	/* RETIRE the caller's record. After this store the poller can only
+	 * reach .bss through this slot; the spin closes the one window left,
+	 * where a poller loaded the caller's pointer before the store and has
+	 * not finished dereferencing it. seq_cst on both halves: this store
+	 * must precede the load of inspect in the single total order, or the
+	 * Dekker pair in agg_sweep() does not hold. Bounded in practice by the
+	 * two instructions between the poller's publish and its clear, and it
+	 * cannot deadlock: a poller never waits on a worker. */
+	if (unlikely(foreign)) {
+		atomic_store_explicit(&s->watch,
+		    agg_own_status((uint32_t)thr_agg_slot),
+		    memory_order_seq_cst);
+		while (atomic_load_explicit(&thr_agg_hot->inspect,
+		    memory_order_seq_cst) == (uint32_t)thr_agg_slot + 1)
+			_mm_pause();
+	}
+
 	/* The device still owns the destination buffer until it writes the
 	 * completion record, so this function must never return with the
 	 * status byte still zero -- not on degrade, not on shutdown, not on
@@ -1501,7 +1557,11 @@ static uint32_t agg_sweep(struct agg_shard *sh, struct agg_shard_hot *hot)
 		g[n].i = i;
 		g[n].seq = sq;
 		n++;
-		__builtin_prefetch((const void *)&agg_recs[i].comp.status, 0, 0);
+		/* Prefetch through the watch pointer. A stale value here is
+		 * harmless: prefetch of a bad address is architecturally a
+		 * no-op, and pass B re-loads the pointer before using it. */
+		__builtin_prefetch((const void *)atomic_load_explicit(
+		    &agg_slots[i].watch, memory_order_relaxed), 0, 0);
 	}
 
 	/* Pass B: read status, close the slot, then wake. The order matters
@@ -1512,9 +1572,33 @@ static uint32_t agg_sweep(struct agg_shard *sh, struct agg_shard_hot *hot)
 	for (k = 0; k < n; k++) {
 		uint32_t sq = g[k].seq;
 
+		const volatile uint8_t *w;
+		uint8_t st;
+
 		i = g[k].i;
-		if (((volatile struct dsa_completion_record *)
-		    &agg_recs[i].comp)->status == 0) {
+		w = atomic_load_explicit(&agg_slots[i].watch,
+		    memory_order_acquire);
+		if (likely(w == agg_own_status(i))) {
+			/* Own record: .bss for the life of the process, so it
+			 * can be read with no further ceremony. This is the
+			 * only path an interposed op ever takes. */
+			st = *w;
+		} else {
+			/* Caller-owned record. Publish the slot BEFORE
+			 * re-loading its pointer: a worker retiring one stores
+			 * the own-record pointer back and then reads inspect,
+			 * so if it does not see us here, its store is already
+			 * visible to our re-load and we dereference .bss
+			 * instead. Dekker; both halves seq_cst. */
+			atomic_store_explicit(&hot->inspect, i + 1,
+			    memory_order_seq_cst);
+			w = atomic_load_explicit(&agg_slots[i].watch,
+			    memory_order_seq_cst);
+			st = w ? *w : 0;
+			atomic_store_explicit(&hot->inspect, 0,
+			    memory_order_release);
+		}
+		if (st == 0) {
 			live++;
 			continue;
 		}
@@ -2202,7 +2286,7 @@ static __always_inline void dsa_wait_no_adjust(const volatile uint8_t *comp)
             /* transfer size is not available here; the gate treats 0 as
              * unknown and blocks. Note WAIT_SLEEP below deliberately falls
              * through */
-            dsa_wait_aggregator(comp, 0);
+            dsa_wait_aggregator(comp, 0, 0);
             break;
         case WAIT_SLEEP:
             // This method is not typically used in high-performance scenarios but
@@ -2217,35 +2301,67 @@ static __always_inline void dsa_wait_no_adjust(const volatile uint8_t *comp)
 
 /* Wait for a CALLER-OWNED completion record (the public async and batch ops).
  *
- * These records are deliberately NOT aggregated, and the reason is an
- * ordering one rather than a CAS one. To aggregate them the poller would have
- * to be handed a pointer into the caller's storage, and its sequence is:
- * load seq (odd) -> load the registered pointer -> DEREFERENCE -> CAS. The
- * CAS is issued AFTER the dereference, so a failing CAS suppresses a spurious
- * WAKE but cannot retroactively make the LOAD legal. The hazardous
- * interleaving is precisely the one where the owner is no longer blocked: it
- * sees its status byte, disarms, returns from its wait, returns from the
- * function whose op was a local array in a stack frame, and the thread exits
- * -- glibc's stack cache munmaps past its 40MB limit. The poller can be
- * descheduled between its seq load and the dereference for an unbounded time,
- * so there is no bound on the window from its side. Heap storage does not
- * rescue it either: dto_batch_op_free can return the page to the OS. The
- * poller dereferencing nothing but agg_slots[] and agg_recs[], both .bss for
- * the life of the process, is exactly why the aggregator has no lifetime
- * problems at all; registering caller pointers spends that.
+ * These records ARE aggregated, above the size gate. Getting there needed one
+ * hazard closed. To aggregate them the poller is handed a pointer into the
+ * caller's storage, and its sequence is: load seq (odd) -> load the
+ * registered pointer -> DEREFERENCE -> CAS. The CAS is issued AFTER the
+ * dereference, so a failing CAS suppresses a spurious WAKE but cannot
+ * retroactively make the LOAD legal. The hazardous interleaving is precisely
+ * the one where the owner is no longer blocked: it sees its status byte,
+ * disarms, returns from its wait, returns from the function whose op was a
+ * local array in a stack frame, and the thread exits -- glibc's stack cache
+ * munmaps past its 40MB limit. The poller can be descheduled between its seq
+ * load and the dereference for an unbounded time, so there is no bound on the
+ * window from its side. Heap storage does not rescue it either:
+ * dto_batch_op_free can return the page to the OS.
  *
- * So the size gate is applied HERE, directly, against the same threshold and
- * the same spin cap the interposed path uses: at or below it spin, above it
- * hand the core back through the scheduler. This must never call
- * dsa_wait_aggregator() -- a foreign comp fails its pointer-identity test and
- * falls through to spinyield having already discarded the transfer size,
- * which reaches the right place by accident, with no gate applied and the
- * misleading appearance of using the aggregator. */
+ * The fix is agg_slot.watch plus the agg_shard_hot.inspect handshake. A slot
+ * watches its own .bss record except while one wait redirects it; the poller
+ * publishes the slot it is about to dereference before re-loading the
+ * pointer, and the retiring owner stores the .bss pointer back and then waits
+ * out any poller already inside. Both halves are seq_cst, so the poller
+ * either dereferences .bss or the owner is still there to be waited for. The
+ * interposed path is untouched and pays one compare: its watch always equals
+ * its own record, so it takes the unguarded branch.
+ *
+ * What the caller owes: the completion record must stay mapped until this
+ * function returns. Every in-tree caller satisfies it trivially, since the op
+ * being waited on cannot be destroyed by the thread that is inside its own
+ * wait.
+ *
+ * At or below the gate the op is shorter than a futex round trip and is spun
+ * out here, against the same threshold and spin cap the interposed path
+ * uses. */
 static void dto_wait_caller_owned(const volatile uint8_t *comp, uint64_t bytes)
 {
 	if (wait_method != WAIT_AGGREGATOR) {
 		dsa_wait_no_adjust(comp);
-	} else if (bytes != 0 && bytes <= agg_block_bytes) {
+	} else if (bytes == 0 || bytes > agg_block_bytes) {
+		/* Above the gate (or size unknown): block. The claim is lazy
+		 * here because get_wq_no_agg(), which the caller-owned submits
+		 * use, deliberately does not claim -- a thread that only ever
+		 * uses the public async API would otherwise never own a slot
+		 * and would spinyield forever. Same backoff as get_wq(): -2
+		 * means the table was full, and re-trying on every wait would
+		 * walk all 512 slots each time. */
+		if (unlikely(thr_agg_slot < 0) &&
+		    atomic_load_explicit(&agg_started, memory_order_relaxed)) {
+			if (thr_agg_slot == -1)
+				agg_claim_slot();
+			else if (thr_agg_slot == -2 && --thr_agg_retry == 0) {
+				thr_agg_slot = -1;
+				agg_claim_slot();
+			}
+		}
+		/* Clamped, not truncated: a transfer wider than 32 bits cannot
+		 * reach a descriptor, but a silent wrap here would turn a huge
+		 * op into a small one and put it on the spin side of the
+		 * gate. dsa_wait_aggregator falls back to spinyield on its own
+		 * if this thread has no slot. */
+		dsa_wait_aggregator(comp,
+		    bytes > UINT32_MAX ? UINT32_MAX : (uint32_t)bytes, 1);
+		return;		/* it issues its own acquire fence */
+	} else {
 		/* Sampling the deadline every 16th pause, and why, is lifted
 		 * unchanged from dsa_wait_aggregator's spin loop. */
 		uint64_t deadline = __rdtsc() + agg_spin_cap_cyc;
@@ -2258,8 +2374,6 @@ static void dto_wait_caller_owned(const volatile uint8_t *comp, uint64_t bytes)
 			}
 			_mm_pause();
 		}
-	} else {
-		dsa_wait_spinyield(comp);
 	}
 	/* Order the status byte ahead of the caller's reads of crc_val /
 	 * bytes_completed, exactly as dsa_wait_aggregator's out: does. */
@@ -2488,7 +2602,7 @@ static __always_inline int dsa_wait(struct dto_wq *wq,
 	 * stays selected
 	 * even if auto-tuning is forced back on. */
 	if (wait_method == WAIT_AGGREGATOR)
-		dsa_wait_aggregator(comp, hw->xfer_size);
+		dsa_wait_aggregator(comp, hw->xfer_size, 0);
 	else switch (auto_adjust_knobs) {
             case AUTO_ADJUST_KNOBS:
                 dsa_wait_and_adjust(comp);
@@ -2564,7 +2678,7 @@ static __always_inline int dsa_execute(struct dto_wq *wq,
 	if (!ret) {
 		/* see dsa_wait(): size-gated dispatch, knobs-independent */
 		if (wait_method == WAIT_AGGREGATOR)
-			dsa_wait_aggregator(comp, hw->xfer_size);
+			dsa_wait_aggregator(comp, hw->xfer_size, 0);
 		else switch (auto_adjust_knobs) {
                     case AUTO_ADJUST_KNOBS:
                         dsa_wait_and_adjust(comp);
