@@ -5089,6 +5089,12 @@ static int dto_submit_async_common_seeded(dto_async_op *op, uint32_t opcode,
 	wq = get_wq_no_agg(dest ? dest : (void *)src, n);
 	if (unlikely(wq == NULL))
 		return DTO_ASYNC_FALLBACK;
+	/* A descriptor larger than the work queue's maximum transfer size is
+	 * failed by the device with DSA_COMP_XFER_ERANGE (0x13); the WQ default
+	 * is often 2 MiB while the device allows 2 GiB. Let the caller do it on
+	 * the CPU instead of paying for a rejected descriptor. */
+	if (unlikely(n > wq->max_transfer_size))
+		return DTO_ASYNC_FALLBACK;
 
 	memset(&impl->desc, 0, sizeof(impl->desc));
 	impl->desc.opcode = opcode;
@@ -5196,6 +5202,9 @@ int dto_submit_batch_copy(dto_batch_op *op, void **dst, void **src,
 	wq = get_wq_no_agg(dst[0], sizes[0]);
 	if (unlikely(wq == NULL))
 		return DTO_ASYNC_FALLBACK;
+	for (size_t i = 0; i < count; i++)
+		if (unlikely(sizes[i] > wq->max_transfer_size))
+			return DTO_ASYNC_FALLBACK;
 
 	orig_memset(op->descs, 0, sizeof(op->descs[0]) * count);
 	for (int i = 0; i < count; i++) {
