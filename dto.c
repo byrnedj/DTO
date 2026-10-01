@@ -5136,6 +5136,7 @@ struct dto_batch_op {
 	void *dst[DTO_BATCH_MAX];
 	void *src[DTO_BATCH_MAX];
 	size_t sizes[DTO_BATCH_MAX];
+	uint8_t kind[DTO_BATCH_MAX];	/* enum dto_batch_kind */
 	int count;
 };
 
@@ -5174,59 +5175,89 @@ int dto_submit_batch_copy(dto_batch_op *op, void **dst, void **src,
 			    (unsigned long long)c, count,
 			    (double)atomic_load(&n_members) / (double)c);
 	}
+	dto_batch_member members[DTO_BATCH_MAX];
+
+	if (unlikely(count < 1 || count > DTO_BATCH_MAX)) {
+		op->count = 0;
+		return DTO_ASYNC_FALLBACK;
+	}
+	for (int i = 0; i < count; i++) {
+		members[i].dst = dst[i];
+		members[i].src = src[i];
+		members[i].n = sizes[i];
+		members[i].kind = DTO_BATCH_MEMMOVE;
+		members[i].cache_control = 1;
+	}
+	return dto_submit_batch(op, members, count);
+}
+
+/*
+ * dto_submit_batch --
+ *	Build one DSA batch out of mixed members (see dto.h). The descriptor
+ *	rules per member mirror dto_submit_async_common_seeded: BOF when the
+ *	library allows it, CC only for members with a destination, and the
+ *	raw-CRC seed for the CRC opcodes so dto_batch_crc_val() can return
+ *	plain crc32c(src). Everything else (count==1 as a plain descriptor,
+ *	the max_transfer_size fallback, op->count as the "submitted" flag) is
+ *	unchanged from the copy-only batch it generalizes.
+ */
+__attribute__((visibility("default")))
+int dto_submit_batch(dto_batch_op *op, const dto_batch_member *members,
+		     int count)
+{
 	struct dto_wq *wq;
 
-	/* count == 0 is the exact "nothing was submitted" test: a successful
-	 * submit requires count >= 2, dto_batch_op is opaque to callers, so no
-	 * new field and no ABI change. Clearing it on EVERY fallback return
-	 * also clears a stale count left on a reused op. It fixes a live
-	 * latent bug: the ENQCMD retry loop below can return
-	 * DTO_ASYNC_FALLBACK after op->count and op->comp.status have already
-	 * been set, leaving count > 0 with status 0 -- on which dto_batch_wait
-	 * would block forever and a caller spinning on dto_batch_poll already
-	 * spins forever today. */
 	op->count = 0;
-	/* a DSA batch needs at least two descriptors */
-	/* count == 1 is accepted and submitted as a PLAIN descriptor below, not
-	 * as a one-member batch (a DSA batch descriptor requires at least two).
-	 * Rejecting it made the whole path inert for the caller that motivated
-	 * it: WiredTiger's reconciliation drains its accumulator at every image
-	 * grow, boundary check, split and write, and with large values a single
-	 * copy lands between two of those drains almost every time -- measured
-	 * count=1 on the first and every subsequent flush. A single large copy
-	 * still gets the accelerator and still gets the wait; only the
-	 * fixed-cost amortization that batching adds is absent. */
 	if (unlikely(dto_initialized == 0 || count < 1 || count > DTO_BATCH_MAX ||
 		     thr_dsa_disabled || use_std_lib_calls))
 		return DTO_ASYNC_FALLBACK;
-	wq = get_wq_no_agg(dst[0], sizes[0]);
+	{
+		const dto_batch_member *m0 = &members[0];
+		void *hint = m0->kind == DTO_BATCH_CRC ? (void *)m0->src : m0->dst;
+		wq = get_wq_no_agg(hint ? hint : (void *)m0->src, m0->n);
+	}
 	if (unlikely(wq == NULL))
 		return DTO_ASYNC_FALLBACK;
-	for (size_t i = 0; i < count; i++)
-		if (unlikely(sizes[i] > wq->max_transfer_size))
+	for (int i = 0; i < count; i++)
+		if (unlikely(members[i].n == 0 ||
+			     members[i].n > wq->max_transfer_size ||
+			     members[i].kind > DTO_BATCH_MEMCPY_CRC))
 			return DTO_ASYNC_FALLBACK;
 
 	orig_memset(op->descs, 0, sizeof(op->descs[0]) * count);
 	for (int i = 0; i < count; i++) {
+		const dto_batch_member *m = &members[i];
 		struct dsa_hw_desc *desc = &op->descs[i];
-		if (sizes[i] == 0 || sizes[i] > wq->max_transfer_size) {
-			op->count = 0;
-			return DTO_ASYNC_FALLBACK;
+		const int has_dst = m->kind != DTO_BATCH_CRC;
+
+		switch (m->kind) {
+		case DTO_BATCH_CRC:
+			desc->opcode = DSA_OPCODE_CRCGEN;
+			break;
+		case DTO_BATCH_MEMCPY_CRC:
+			desc->opcode = DSA_OPCODE_COPY_CRC;
+			break;
+		default:
+			desc->opcode = DSA_OPCODE_MEMMOVE;
+			break;
 		}
-		desc->opcode = DSA_OPCODE_MEMMOVE;
 		desc->flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
 		if (dto_dsa_bof)
 			desc->flags |= IDXD_OP_FLAG_BOF;
-		if (dto_dsa_cc && (wq->dsa_gencap & GENCAP_CC_MEMORY))
+		if (has_dst && m->cache_control && dto_dsa_cc &&
+		    (wq->dsa_gencap & GENCAP_CC_MEMORY))
 			desc->flags |= IDXD_OP_FLAG_CC;
-		desc->src_addr = (uint64_t)src[i];
-		desc->dst_addr = (uint64_t)dst[i];
-		desc->xfer_size = (uint32_t)sizes[i];
+		desc->src_addr = (uint64_t)m->src;
+		desc->dst_addr = has_dst ? (uint64_t)m->dst : 0;
+		desc->xfer_size = (uint32_t)m->n;
+		if (m->kind != DTO_BATCH_MEMMOVE)
+			desc->crc_seed = DSA_CRC_SEED_FOR_RAW;
 		desc->completion_addr = (uint64_t)&op->comps[i];
 		op->comps[i].status = 0;
-		op->dst[i] = dst[i];
-		op->src[i] = src[i];
-		op->sizes[i] = sizes[i];
+		op->dst[i] = m->dst;
+		op->src[i] = (void *)m->src;
+		op->sizes[i] = m->n;
+		op->kind[i] = m->kind;
 	}
 	op->count = count;
 	orig_memset(&op->desc, 0, sizeof(op->desc));
@@ -5258,6 +5289,28 @@ int dto_submit_batch_copy(dto_batch_op *op, void **dst, void **src,
 	}
 }
 
+/* Completion record of member i: the batch's own record when the op went
+ * out as a plain descriptor (count == 1), the member's otherwise. */
+static const struct dsa_completion_record *
+dto_batch_member_rec(const dto_batch_op *op, int i)
+{
+	return op->count == 1 ? &op->comp : &op->comps[i];
+}
+
+__attribute__((visibility("default")))
+int dto_batch_member_done(const dto_batch_op *op, int i)
+{
+	if (i < 0 || i >= op->count)
+		return 0;
+	return dto_batch_member_rec(op, i)->status == DSA_COMP_SUCCESS;
+}
+
+__attribute__((visibility("default")))
+uint32_t dto_batch_crc_val(const dto_batch_op *op, int i)
+{
+	return DSA_CRC_VAL_TO_RAW(dto_batch_member_rec(op, i)->crc_val);
+}
+
 __attribute__((visibility("default")))
 int dto_batch_poll(dto_batch_op *op)
 {
@@ -5274,8 +5327,12 @@ int dto_batch_poll(dto_batch_op *op)
 			LOG_ERROR("async batch copy failed with status %x, redoing failed copies on the CPU\n", status);
 		}
 	}
+	/* Repair the COPY part of every failed member on the CPU. A pure CRC
+	 * member has nothing to repair here and its CRC is never recomputed by
+	 * the library (see dto_batch_member_done); the caller owns that. */
 	for (int i = 0; i < op->count; i++) {
-		if (op->comps[i].status != DSA_COMP_SUCCESS)
+		if (dto_batch_member_rec(op, i)->status != DSA_COMP_SUCCESS &&
+		    op->kind[i] != DTO_BATCH_CRC)
 			orig_memcpy(op->dst[i], op->src[i], op->sizes[i]);
 	}
 	return DTO_ASYNC_DONE;

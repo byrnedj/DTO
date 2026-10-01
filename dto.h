@@ -191,6 +191,39 @@ int dto_batch_poll(dto_batch_op *op);
  */
 void dto_batch_wait(dto_batch_op *op);
 
+/* General batch: members may mix plain copies, CRC generation and fused
+ * copy+CRC in one DSA batch descriptor (one ENQCMD, one completion to poll
+ * for up to DTO_BATCH_MAX operations). Same contract as dto_submit_batch_copy:
+ * returns DTO_ASYNC_SUBMITTED, or DTO_ASYNC_FALLBACK when nothing was
+ * submitted and nothing touched (the caller does every member on the CPU);
+ * count == 1 is submitted as a plain descriptor. dto_batch_poll returns
+ * DTO_ASYNC_PENDING or DTO_ASYNC_DONE; on DONE the copy part of every member
+ * the accelerator failed (MEMMOVE and MEMCPY_CRC) has been redone on the CPU,
+ * but NO CRC is recomputed in the library: dto_batch_member_done() reports
+ * which members completed on the device and dto_batch_crc_val() is valid
+ * only for those -- the caller computes the others with its own CRC32C.
+ * CRC values follow dto_async_crc_val: raw crc32c of the member's bytes with
+ * seed 0 (the seed/inversion convention is applied inside). */
+enum dto_batch_kind {
+	DTO_BATCH_MEMMOVE = 0,    /* dst <- src */
+	DTO_BATCH_CRC = 1,        /* crc32c(src); dst ignored */
+	DTO_BATCH_MEMCPY_CRC = 2  /* dst <- src and crc32c(src) */
+};
+typedef struct dto_batch_member {
+	void *dst;
+	const void *src;
+	size_t n;
+	uint8_t kind;          /* enum dto_batch_kind */
+	uint8_t cache_control; /* MEMMOVE / MEMCPY_CRC only */
+} dto_batch_member;
+int dto_submit_batch(dto_batch_op *op, const dto_batch_member *members,
+		     int count);
+/* 1 when member i completed successfully on the device (so its copy was done
+ * by DSA and, for CRC kinds, dto_batch_crc_val(op, i) is valid); 0 otherwise.
+ * Only meaningful after dto_batch_poll returned DTO_ASYNC_DONE. */
+int dto_batch_member_done(const dto_batch_op *op, int i);
+uint32_t dto_batch_crc_val(const dto_batch_op *op, int i);
+
 #ifdef __cplusplus
 }
 #endif
