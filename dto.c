@@ -1119,7 +1119,8 @@ static int dsa_init_from_wq_list(char *wq_list)
 		if (rc)
 			goto fail_wq;
 
-		snprintf(wqs[num_wqs].wq_path, PATH_MAX, "/dev/dsa/%s", wq);
+		snprintf(wqs[num_wqs].wq_path, sizeof(wqs[num_wqs].wq_path),
+			 "/dev/dsa/%s", wq);
 
 		// open DSA WQ
 		wqs[num_wqs].wq_fd = open(wqs[num_wqs].wq_path, O_RDWR);
@@ -2279,7 +2280,7 @@ int dto_async_poll(dto_async_op *op)
 		return DTO_ASYNC_PENDING;
 	if (likely(status == DSA_COMP_SUCCESS))
 		return DTO_ASYNC_DONE;
-	LOG_ERROR("async crc op failed status %x xfersz %x\n", status,
+	LOG_ERROR("async op %x failed status %x xfersz %x\n", impl->desc.opcode, status,
 		  impl->desc.xfer_size);
 	return DTO_ASYNC_FAILED;
 }
@@ -2290,6 +2291,120 @@ uint64_t dto_async_crc_val(const dto_async_op *op)
 	const struct dto_async_op_impl *impl =
 		(const struct dto_async_op_impl *)op;
 	return DSA_CRC_VAL_TO_RAW(impl->comp.crc_val);
+}
+
+/* Shared gate + descriptor skeleton for the async submits below: NULL means
+ * fall back to the CPU (nothing was submitted). */
+static struct dto_wq *dto_async_prepare(dto_async_op *op, const void *hint,
+					size_t n, size_t min_size)
+{
+	struct dto_async_op_impl *impl = (struct dto_async_op_impl *)op;
+	struct dto_wq *wq;
+
+	if (n == 0 || n > UINT32_MAX)
+		return NULL;
+	if (use_std_lib_calls || thr_dsa_disabled || n < min_size)
+		return NULL;
+	wq = get_wq((void *)hint);
+	if (unlikely(wq == NULL))
+		return NULL;
+	if (wq->max_transfer_size && n > wq->max_transfer_size)
+		return NULL;
+
+	orig_memset(&impl->desc, 0, sizeof(impl->desc));
+	impl->desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR | IDXD_OP_FLAG_BOF;
+	impl->desc.completion_addr = (uint64_t)&impl->comp;
+	impl->desc.xfer_size = (uint32_t)n;
+	impl->comp.status = 0;
+	return wq;
+}
+
+static int dto_async_enqueue(dto_async_op *op, struct dto_wq *wq)
+{
+	struct dto_async_op_impl *impl = (struct dto_async_op_impl *)op;
+
+	for (int attempt = 0; ; attempt++) {
+		int rc = dsa_submit(wq, &impl->desc);
+		if (rc == SUCCESS)
+			return DTO_ASYNC_SUBMITTED;
+		if (rc != RETRY || attempt >= 16)
+			return DTO_ASYNC_FALLBACK;
+		_mm_pause();
+	}
+}
+
+__attribute__((visibility("default")))
+int dto_submit_compare(dto_async_op *op, const void *src1, const void *src2,
+		       size_t n)
+{
+	struct dto_async_op_impl *impl = (struct dto_async_op_impl *)op;
+	struct dto_wq *wq = dto_async_prepare(op, src1, n, dsa_min_size);
+
+	if (wq == NULL)
+		return DTO_ASYNC_FALLBACK;
+	impl->desc.opcode = DSA_OPCODE_COMPARE;
+	impl->desc.src_addr = (uint64_t)src1;
+	impl->desc.src2_addr = (uint64_t)src2;
+	return dto_async_enqueue(op, wq);
+}
+
+__attribute__((visibility("default")))
+int dto_submit_memfill(dto_async_op *op, void *dest, uint64_t pattern,
+		       size_t n, int cache_control)
+{
+	struct dto_async_op_impl *impl = (struct dto_async_op_impl *)op;
+	struct dto_wq *wq = dto_async_prepare(op, dest, n, dsa_min_size);
+
+	if (wq == NULL)
+		return DTO_ASYNC_FALLBACK;
+	impl->desc.opcode = DSA_OPCODE_MEMFILL;
+	impl->desc.pattern = pattern;
+	impl->desc.dst_addr = (uint64_t)dest;
+	if (cache_control && (wq->dsa_gencap & GENCAP_CC_MEMORY))
+		impl->desc.flags |= IDXD_OP_FLAG_CC;
+	return dto_async_enqueue(op, wq);
+}
+
+__attribute__((visibility("default")))
+int dto_submit_transl_fetch(dto_async_op *op, const void *addr, size_t n)
+{
+	struct dto_async_op_impl *impl = (struct dto_async_op_impl *)op;
+	/* No size gate: a translation fetch is cheap at any size and the point
+	 * is to run it ahead of data operations on the same range. */
+	struct dto_wq *wq = dto_async_prepare(op, addr, n, 1);
+
+	if (wq == NULL)
+		return DTO_ASYNC_FALLBACK;
+	impl->desc.opcode = DSA_OPCODE_TRANSL_FETCH;
+	impl->desc.transl_fetch_addr = (uint64_t)addr;
+	impl->desc.region_size = (uint32_t)n;
+	impl->desc.region_stride = 0;	/* contiguous region */
+	return dto_async_enqueue(op, wq);
+}
+
+__attribute__((visibility("default")))
+int dto_async_result(const dto_async_op *op)
+{
+	const struct dto_async_op_impl *impl =
+		(const struct dto_async_op_impl *)op;
+	return impl->comp.result;
+}
+
+__attribute__((visibility("default")))
+uint32_t dto_async_bytes_completed(const dto_async_op *op)
+{
+	const struct dto_async_op_impl *impl =
+		(const struct dto_async_op_impl *)op;
+	return impl->comp.bytes_completed;
+}
+
+__attribute__((visibility("default")))
+int dto_async_status(const dto_async_op *op)
+{
+	const struct dto_async_op_impl *impl =
+		(const struct dto_async_op_impl *)op;
+	return __atomic_load_n((uint8_t *)&impl->comp.status, __ATOMIC_ACQUIRE)
+		& DSA_COMP_STATUS_MASK;
 }
 
 __attribute__((visibility("default"))) void dto_memcpy_async(void *dest, const void *src, size_t n, callback_t cb, void* args) {
@@ -2655,6 +2770,7 @@ static int dto_internal_memcmp(const void *s1, const void *s2, size_t n)
 	return 0;
 }
 
+#ifndef DTO_NO_LIBC_INTERPOSE
 void *memset(void *s1, int c, size_t n)
 {
 	int result = 0;
@@ -2876,6 +2992,8 @@ int memcmp(const void *s1, const void *s2, size_t n)
  * is processing. Then waits for completion using the configured wait method.
  * Falls back to memcpy for any failed operations.
  */
+#endif /* DTO_NO_LIBC_INTERPOSE */
+
 __attribute__((visibility("default")))
 void dto_batch_copy(void **dst, void **src, size_t *sizes, int count,
                     void (*callback)(void *), void *callback_arg)

@@ -71,3 +71,26 @@ install(FILES
     "${CMAKE_CURRENT_BINARY_DIR}/DTOConfigVersion.cmake"
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/DTO)
 
+
+# libdto_explicit: the same library without the memcpy/memset/memmove/memcmp
+# interposers, for programs that call the dto_* API explicitly and must not
+# have every large libc copy in the process redirected to DSA.
+option(DTO_BUILD_EXPLICIT "Build libdto_explicit (no libc interposition)" ON)
+if (DTO_BUILD_EXPLICIT)
+  add_library(dto_explicit SHARED dto.c)
+  add_library(DTO::dto_explicit ALIAS dto_explicit)
+  target_include_directories(dto_explicit
+      PUBLIC
+          $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+          $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+  target_compile_definitions(dto_explicit PRIVATE DTO_STATS_SUPPORT DTO_NO_LIBC_INTERPOSE)
+  target_link_libraries(dto_explicit accel-config dl numa)
+  if (HAS_WAITPKG)
+    target_compile_options(dto_explicit PRIVATE -mwaitpkg -march=native)
+  endif()
+  target_compile_options(dto_explicit PRIVATE
+    -fno-builtin-memset -fno-builtin-memcpy -fno-builtin-memmove -fno-builtin-memcmp)
+  install(TARGETS dto_explicit LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+  add_executable(dto-async-test dto-async-test.c)
+  target_link_libraries(dto-async-test PRIVATE DTO::dto_explicit pthread z)
+endif()

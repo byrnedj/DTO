@@ -2,6 +2,9 @@
 #ifndef DTO_H
 #define DTO_H
 
+#include <stddef.h>
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -76,6 +79,33 @@ void dto_memset_pages(void *start_addr, void *end_addr, size_t page_size);
  */
 void dto_batch_copy(void **dst, void **src, size_t *sizes, int count,
                     void (*callback)(void *), void *callback_arg);
+
+/* ---- Async compare / fill / translation fetch ----
+ *
+ * Same lifecycle as the async CRC API above: submit returns
+ * DTO_ASYNC_SUBMITTED or DTO_ASYNC_FALLBACK (nothing was done, caller does
+ * the work on the CPU), dto_async_poll() reports PENDING/DONE/FAILED, and the
+ * accessors below read the completion record once DONE.
+ *
+ * dto_submit_compare: DSA COMPARE of n bytes at src1 against src2.
+ *   dto_async_result() is 0 when equal, 1 when they differ;
+ *   dto_async_bytes_completed() is then the offset of the first difference.
+ *   Comparing a buffer against a zero page classifies it as all-zero.
+ * dto_submit_memfill: DSA MEMFILL of n bytes at dest with the 8-byte pattern.
+ * dto_submit_transl_fetch: DSA Translation Fetch (DSA 2.0, opcode 0x0A) of
+ *   the n bytes at addr: warms the device's address translations for the
+ *   region without moving data. Devices without the opcode complete with
+ *   DSA_COMP_BAD_OPCODE, which dto_async_poll() reports as DTO_ASYNC_FAILED;
+ *   dto_async_status() then reads 0x10.
+ */
+int dto_submit_compare(dto_async_op *op, const void *src1, const void *src2,
+		       size_t n);
+int dto_submit_memfill(dto_async_op *op, void *dest, uint64_t pattern,
+		       size_t n, int cache_control);
+int dto_submit_transl_fetch(dto_async_op *op, const void *addr, size_t n);
+int dto_async_result(const dto_async_op *op);
+uint32_t dto_async_bytes_completed(const dto_async_op *op);
+int dto_async_status(const dto_async_op *op);
 
 #ifdef __cplusplus
 }
