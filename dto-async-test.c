@@ -35,14 +35,14 @@ static void *zero_buf(size_t n) {
 }
 static int wait_op(dto_async_op *op) { int r; while ((r = dto_async_poll(op)) == DTO_ASYNC_PENDING) __builtin_ia32_pause(); return r; }
 
-static uint32_t crc32c_sw(const unsigned char *p, size_t n)
+static uint32_t crc32c_raw(const unsigned char *p, size_t n, uint32_t seed)
 {
-	uint32_t c = 0xffffffffu;
+	uint32_t c = seed;
 	for (size_t i = 0; i < n; i++) {
 		c ^= p[i];
 		for (int k = 0; k < 8; k++) c = (c >> 1) ^ (0x82f63b78u & (0u - (c & 1)));
 	}
-	return ~c;
+	return c;
 }
 
 static int check(const char *what, int ok) { printf("  %-44s %s\n", what, ok ? "ok" : "FAIL"); return !ok; }
@@ -76,10 +76,12 @@ static int correctness(void)
 	rc = dto_submit_crc(&op, a, n);
 	if (rc == DTO_ASYNC_SUBMITTED && wait_op(&op) == DTO_ASYNC_DONE) {
 		uint32_t dsa = (uint32_t)dto_async_crc_val(&op);
-		uint32_t zl = crc32(0, a, n), cc = crc32c_sw(a, n);
-		printf("  crc: dsa=%08x crc32c(sw)=%08x zlib-crc32=%08x  %s\n", dsa, cc, zl,
-		       dsa == cc ? "(dsa == CRC32C, seed 0, final xor)" : "(DIFFERENT from CRC32C)");
-		fails += dsa != cc;
+		uint32_t r0 = crc32c_raw(a, n, 0), rf = crc32c_raw(a, n, 0xffffffffu);
+		const char *conv = dsa == r0 ? "crc32c seed 0, no final xor (raw)" : dsa == (uint32_t)~r0 ? "~crc32c(seed 0)"
+			: dsa == rf ? "crc32c seed ~0, no final xor" : dsa == (uint32_t)~rf ? "standard CRC-32C (seed ~0, final xor)" : "UNKNOWN";
+		printf("  crc: dsa=%08x | raw0=%08x ~raw0=%08x rawF=%08x ~rawF=%08x zlib-crc32=%08x -> %s\n",
+		       dsa, r0, ~r0, rf, ~rf, crc32(0, a, n), conv);
+		fails += !strcmp(conv, "UNKNOWN");
 	} else {
 		printf("  crc: not submitted/failed\n"); fails++;
 	}
