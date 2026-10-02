@@ -107,6 +107,43 @@ int dto_async_result(const dto_async_op *op);
 uint32_t dto_async_bytes_completed(const dto_async_op *op);
 int dto_async_status(const dto_async_op *op);
 
+/* ---- Batched asynchronous operations ----
+ *
+ * One DSA batch descriptor carrying up to `capacity` (<= 1024, the work
+ * queue's max_batch_size) operations: one ENQCMD and one completion to poll
+ * instead of one per operation. Operations are added, the batch is
+ * submitted, dto_batch_poll() reports PENDING until every operation has
+ * finished, then the per-operation accessors read each completion record.
+ *
+ * dto_batch_poll() returns DTO_ASYNC_DONE when all operations succeeded and
+ * DTO_ASYNC_FAILED when the device reports a batch error; in both cases
+ * dto_batch_status(b, i) is the operation's DSA status (1 = success) and the
+ * caller redoes any operation whose status is not 1 on the CPU. A COMPARE
+ * that finds a difference succeeds with dto_batch_result() == 1.
+ *
+ * dto_batch_add_dualcast copies src to dst1 and dst2 in one operation; DSA
+ * requires bits 11:0 of dst1 and dst2 to be equal (e.g. both page aligned).
+ * A batch with a single operation is submitted as a plain descriptor.
+ * add_* return the operation's index, or -1 when the batch is full.
+ */
+typedef struct dto_batch dto_batch;
+
+dto_batch *dto_batch_create(int capacity);
+void dto_batch_destroy(dto_batch *b);
+void dto_batch_reset(dto_batch *b);
+int dto_batch_count(const dto_batch *b);
+int dto_batch_add_compare(dto_batch *b, const void *src1, const void *src2, size_t n);
+int dto_batch_add_memmove(dto_batch *b, void *dst, const void *src, size_t n, int cache_control);
+int dto_batch_add_dualcast(dto_batch *b, void *dst1, void *dst2, const void *src, size_t n,
+			   int cache_control);
+int dto_batch_add_crc(dto_batch *b, const void *src, size_t n);
+int dto_batch_submit(dto_batch *b);
+int dto_batch_poll(dto_batch *b);
+int dto_batch_status(const dto_batch *b, int i);
+int dto_batch_result(const dto_batch *b, int i);
+uint32_t dto_batch_bytes_completed(const dto_batch *b, int i);
+uint32_t dto_batch_crc(const dto_batch *b, int i);
+
 #ifdef __cplusplus
 }
 #endif

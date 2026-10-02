@@ -2407,6 +2407,229 @@ int dto_async_status(const dto_async_op *op)
 		& DSA_COMP_STATUS_MASK;
 }
 
+/* ---- Batched asynchronous operations (see dto.h) ---- */
+#define DTO_BATCH_MAX 1024
+
+struct dto_batch {
+	struct dsa_hw_desc bdesc __attribute__((aligned(64)));
+	struct dsa_completion_record bcomp __attribute__((aligned(32)));
+	struct dsa_hw_desc *descs;		/* 64-byte aligned array */
+	struct dsa_completion_record *comps;	/* 32-byte aligned array */
+	int cap, n, submitted;
+	const void *hint;			/* first operand, for WQ choice */
+};
+
+__attribute__((visibility("default")))
+dto_batch *dto_batch_create(int capacity)
+{
+	struct dto_batch *b;
+
+	if (capacity < 1)
+		return NULL;
+	if (capacity > DTO_BATCH_MAX)
+		capacity = DTO_BATCH_MAX;
+	b = aligned_alloc(64, sizeof(*b));
+	if (!b)
+		return NULL;
+	orig_memset(b, 0, sizeof(*b));
+	b->descs = aligned_alloc(64, sizeof(struct dsa_hw_desc) * capacity);
+	b->comps = aligned_alloc(32, sizeof(struct dsa_completion_record) * capacity);
+	if (!b->descs || !b->comps) {
+		free(b->descs);
+		free(b->comps);
+		free(b);
+		return NULL;
+	}
+	b->cap = capacity;
+	return b;
+}
+
+__attribute__((visibility("default")))
+void dto_batch_destroy(dto_batch *b)
+{
+	if (!b)
+		return;
+	free(b->descs);
+	free(b->comps);
+	free(b);
+}
+
+__attribute__((visibility("default")))
+void dto_batch_reset(dto_batch *b)
+{
+	b->n = 0;
+	b->submitted = 0;
+	b->hint = NULL;
+}
+
+__attribute__((visibility("default")))
+int dto_batch_count(const dto_batch *b)
+{
+	return b->n;
+}
+
+static struct dsa_hw_desc *dto_batch_slot(dto_batch *b, const void *hint, size_t n, int *index)
+{
+	struct dsa_hw_desc *d;
+
+	if (b->submitted || b->n >= b->cap || n == 0 || n > UINT32_MAX)
+		return NULL;
+	*index = b->n++;
+	d = &b->descs[*index];
+	orig_memset(d, 0, sizeof(*d));
+	orig_memset(&b->comps[*index], 0, sizeof(b->comps[*index]));
+	d->flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR | IDXD_OP_FLAG_BOF;
+	d->completion_addr = (uint64_t)&b->comps[*index];
+	d->xfer_size = (uint32_t)n;
+	if (!b->hint)
+		b->hint = hint;
+	return d;
+}
+
+__attribute__((visibility("default")))
+int dto_batch_add_compare(dto_batch *b, const void *src1, const void *src2, size_t n)
+{
+	int i;
+	struct dsa_hw_desc *d = dto_batch_slot(b, src1, n, &i);
+
+	if (!d)
+		return -1;
+	d->opcode = DSA_OPCODE_COMPARE;
+	d->src_addr = (uint64_t)src1;
+	d->src2_addr = (uint64_t)src2;
+	return i;
+}
+
+__attribute__((visibility("default")))
+int dto_batch_add_memmove(dto_batch *b, void *dst, const void *src, size_t n, int cache_control)
+{
+	int i;
+	struct dsa_hw_desc *d = dto_batch_slot(b, dst, n, &i);
+
+	if (!d)
+		return -1;
+	d->opcode = DSA_OPCODE_MEMMOVE;
+	d->src_addr = (uint64_t)src;
+	d->dst_addr = (uint64_t)dst;
+	if (cache_control)
+		d->flags |= IDXD_OP_FLAG_CC;
+	return i;
+}
+
+__attribute__((visibility("default")))
+int dto_batch_add_dualcast(dto_batch *b, void *dst1, void *dst2, const void *src, size_t n,
+			   int cache_control)
+{
+	int i;
+	struct dsa_hw_desc *d;
+
+	if ((((uint64_t)dst1) & 0xfff) != (((uint64_t)dst2) & 0xfff))
+		return -1;
+	d = dto_batch_slot(b, dst1, n, &i);
+	if (!d)
+		return -1;
+	d->opcode = DSA_OPCODE_DUALCAST;
+	d->src_addr = (uint64_t)src;
+	d->dst_addr = (uint64_t)dst1;
+	d->dest2 = (uint64_t)dst2;
+	if (cache_control)
+		d->flags |= IDXD_OP_FLAG_CC;
+	return i;
+}
+
+__attribute__((visibility("default")))
+int dto_batch_add_crc(dto_batch *b, const void *src, size_t n)
+{
+	int i;
+	struct dsa_hw_desc *d = dto_batch_slot(b, src, n, &i);
+
+	if (!d)
+		return -1;
+	d->opcode = DSA_OPCODE_CRCGEN;
+	d->src_addr = (uint64_t)src;
+	d->crc_seed = DSA_CRC_SEED_FOR_RAW;
+	return i;
+}
+
+__attribute__((visibility("default")))
+int dto_batch_submit(dto_batch *b)
+{
+	struct dto_wq *wq;
+	struct dsa_hw_desc *desc;
+
+	if (b->submitted)
+		return DTO_ASYNC_FALLBACK;
+	if (b->n == 0) {
+		b->submitted = 1;
+		return DTO_ASYNC_SUBMITTED;
+	}
+	if (use_std_lib_calls || thr_dsa_disabled)
+		return DTO_ASYNC_FALLBACK;
+	wq = get_wq((void *)b->hint);
+	if (unlikely(wq == NULL))
+		return DTO_ASYNC_FALLBACK;
+	if (b->n == 1) {
+		desc = &b->descs[0];
+	} else {
+		orig_memset(&b->bdesc, 0, sizeof(b->bdesc));
+		orig_memset(&b->bcomp, 0, sizeof(b->bcomp));
+		b->bdesc.opcode = DSA_OPCODE_BATCH;
+		b->bdesc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
+		b->bdesc.desc_list_addr = (uint64_t)b->descs;
+		b->bdesc.desc_count = (uint32_t)b->n;
+		b->bdesc.completion_addr = (uint64_t)&b->bcomp;
+		desc = &b->bdesc;
+	}
+	for (int attempt = 0; ; attempt++) {
+		int rc = dsa_submit(wq, desc);
+		if (rc == SUCCESS) {
+			b->submitted = 1;
+			return DTO_ASYNC_SUBMITTED;
+		}
+		if (rc != RETRY || attempt >= 64)
+			return DTO_ASYNC_FALLBACK;
+		_mm_pause();
+	}
+}
+
+__attribute__((visibility("default")))
+int dto_batch_poll(dto_batch *b)
+{
+	uint8_t status;
+
+	if (b->n == 0)
+		return DTO_ASYNC_DONE;
+	status = __atomic_load_n(b->n == 1 ? (uint8_t *)&b->comps[0].status :
+				 (uint8_t *)&b->bcomp.status, __ATOMIC_ACQUIRE);
+	if (status == 0)
+		return DTO_ASYNC_PENDING;
+	return (status & DSA_COMP_STATUS_MASK) == DSA_COMP_SUCCESS ? DTO_ASYNC_DONE : DTO_ASYNC_FAILED;
+}
+
+__attribute__((visibility("default")))
+int dto_batch_status(const dto_batch *b, int i)
+{
+	return __atomic_load_n((uint8_t *)&b->comps[i].status, __ATOMIC_ACQUIRE) & DSA_COMP_STATUS_MASK;
+}
+
+__attribute__((visibility("default")))
+int dto_batch_result(const dto_batch *b, int i)
+{
+	return b->comps[i].result;
+}
+
+__attribute__((visibility("default")))
+uint32_t dto_batch_bytes_completed(const dto_batch *b, int i)
+{
+	return b->comps[i].bytes_completed;
+}
+
+__attribute__((visibility("default")))
+uint32_t dto_batch_crc(const dto_batch *b, int i)
+{
+	return DSA_CRC_VAL_TO_RAW(b->comps[i].crc_val);
+}
+
 __attribute__((visibility("default"))) void dto_memcpy_async(void *dest, const void *src, size_t n, callback_t cb, void* args) {
 	//submit dsa work if successful, call the callback
 	if (thr_dsa_disabled || use_std_lib_calls) {
