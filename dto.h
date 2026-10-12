@@ -92,6 +92,10 @@ void dto_batch_copy(void **dst, void **src, size_t *sizes, int count,
  *   dto_async_bytes_completed() is then the offset of the first difference.
  *   Comparing a buffer against a zero page classifies it as all-zero.
  * dto_submit_memfill: DSA MEMFILL of n bytes at dest with the 8-byte pattern.
+ * dto_submit_compval: DSA Compare Pattern (COMPVAL) of n bytes at src against
+ *   the repeating 8-byte pattern; result and bytes_completed as for compare.
+ *   With the buffer's own first qword as the pattern it classifies the buffer
+ *   as constant-filled (all-zero when that qword is 0) in one operation.
  * dto_submit_transl_fetch: DSA Translation Fetch (DSA 2.0, opcode 0x0A) of
  *   the n bytes at addr: warms the device's address translations for the
  *   region without moving data. Devices without the opcode complete with
@@ -102,6 +106,8 @@ int dto_submit_compare(dto_async_op *op, const void *src1, const void *src2,
 		       size_t n);
 int dto_submit_memfill(dto_async_op *op, void *dest, uint64_t pattern,
 		       size_t n, int cache_control);
+int dto_submit_compval(dto_async_op *op, const void *src, uint64_t pattern,
+		       size_t n);
 int dto_submit_transl_fetch(dto_async_op *op, const void *addr, size_t n);
 int dto_async_result(const dto_async_op *op);
 uint32_t dto_async_bytes_completed(const dto_async_op *op);
@@ -133,6 +139,7 @@ void dto_batch_destroy(dto_batch *b);
 void dto_batch_reset(dto_batch *b);
 int dto_batch_count(const dto_batch *b);
 int dto_batch_add_compare(dto_batch *b, const void *src1, const void *src2, size_t n);
+int dto_batch_add_compval(dto_batch *b, const void *src, uint64_t pattern, size_t n);
 int dto_batch_add_memmove(dto_batch *b, void *dst, const void *src, size_t n, int cache_control);
 int dto_batch_add_dualcast(dto_batch *b, void *dst1, void *dst2, const void *src, size_t n,
 			   int cache_control);

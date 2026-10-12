@@ -65,6 +65,15 @@ static int correctness(void)
 	fails += check("compare differs -> result 1", rc == DTO_ASYNC_SUBMITTED && wait_op(&op) == DTO_ASYNC_DONE && dto_async_result(&op) == 1);
 	fails += check("  first difference offset reported", dto_async_bytes_completed(&op) == 777777);
 
+	memset(b, 0xcc, n);
+	rc = dto_submit_compval(&op, b, 0xccccccccccccccccull, n);
+	fails += check("compval constant -> equal", rc == DTO_ASYNC_SUBMITTED && wait_op(&op) == DTO_ASYNC_DONE && dto_async_result(&op) == 0);
+	b[4096 * 7 + 3] = 0xcd;
+	rc = dto_submit_compval(&op, b, 0xccccccccccccccccull, n);
+	fails += check("compval differs -> result 1", rc == DTO_ASYNC_SUBMITTED && wait_op(&op) == DTO_ASYNC_DONE && dto_async_result(&op) == 1);
+	fails += check("  first difference offset reported", dto_async_bytes_completed(&op) == 4096 * 7 + 3);
+	rc = dto_submit_compval(&op, z, 0, n);
+	fails += check("compval zero pattern on zero buffer -> equal", rc == DTO_ASYNC_SUBMITTED && wait_op(&op) == DTO_ASYNC_DONE && dto_async_result(&op) == 0);
 	memset(b, 0xa5, n);
 	rc = dto_submit_memfill(&op, b, 0, n, 1);
 	fails += check("memfill zero -> done", rc == DTO_ASYNC_SUBMITTED && wait_op(&op) == DTO_ASYNC_DONE);

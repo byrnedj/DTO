@@ -2349,6 +2349,23 @@ int dto_submit_compare(dto_async_op *op, const void *src1, const void *src2,
 }
 
 __attribute__((visibility("default")))
+int dto_submit_compval(dto_async_op *op, const void *src, uint64_t pattern,
+		       size_t n)
+{
+	struct dto_async_op_impl *impl = (struct dto_async_op_impl *)op;
+	struct dto_wq *wq = dto_async_prepare(op, src, n, dsa_min_size);
+
+	if (wq == NULL)
+		return DTO_ASYNC_FALLBACK;
+	impl->desc.opcode = DSA_OPCODE_COMPVAL;
+	impl->desc.src_addr = (uint64_t)src;
+	/* Compare Pattern keeps its pattern in the second address slot
+	 * (comp_pattern); the first one aliases src_addr (memfill's pattern). */
+	impl->desc.comp_pattern = pattern;
+	return dto_async_enqueue(op, wq);
+}
+
+__attribute__((visibility("default")))
 int dto_submit_memfill(dto_async_op *op, void *dest, uint64_t pattern,
 		       size_t n, int cache_control)
 {
@@ -2497,6 +2514,20 @@ int dto_batch_add_compare(dto_batch *b, const void *src1, const void *src2, size
 	d->opcode = DSA_OPCODE_COMPARE;
 	d->src_addr = (uint64_t)src1;
 	d->src2_addr = (uint64_t)src2;
+	return i;
+}
+
+__attribute__((visibility("default")))
+int dto_batch_add_compval(dto_batch *b, const void *src, uint64_t pattern, size_t n)
+{
+	int i;
+	struct dsa_hw_desc *d = dto_batch_slot(b, src, n, &i);
+
+	if (!d)
+		return -1;
+	d->opcode = DSA_OPCODE_COMPVAL;
+	d->src_addr = (uint64_t)src;
+	d->comp_pattern = pattern;
 	return i;
 }
 
